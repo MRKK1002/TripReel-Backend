@@ -1,37 +1,25 @@
-/**
- * Run once to create the first admin user:
- *   node scripts/createAdmin.js
- */
-require('dotenv').config({ path: require('path').join(__dirname, '../.env') })
+require('dotenv').config()
 const mongoose = require('mongoose')
 const User = require('../models/User')
 
-async function main() {
-    await mongoose.connect(process.env.mongodburl)
-    console.log('✅ Connected to MongoDB')
-
-    const existing = await User.findOne({ email: 'admin@tripreel.com' })
-    if (existing) {
-        console.log('ℹ️  Admin already exists:', existing.email)
-        process.exit(0)
-    }
-
-    const admin = await User.create({
-        name: 'Admin',
-        email: 'admin@tripreel.com',
-        password: 'admin123',
-        role: 'admin',
-        status: 'Active',
+mongoose.connect(process.env.mongodburl).then(async () => {
+  const existing = await User.findOne({ email: 'admin@triplreel.com' })
+  if (existing) {
+    // Just update role
+    existing.role = 'admin'
+    await existing.save()
+    console.log(`✅ Updated existing user to admin: ${existing.email}`)
+  } else {
+    const user = await User.create({
+      name: 'Admin',
+      email: 'admin@triplreel.com',
+      password: 'admin123',
+      role: 'admin',
     })
-
-    console.log('✅ Admin created successfully!')
-    console.log('   Email:   ', admin.email)
-    console.log('   Password: admin123')
-    console.log('   Role:    ', admin.role)
-    process.exit(0)
-}
-
-main().catch(err => {
-    console.error('❌ Error:', err.message)
-    process.exit(1)
+    console.log(`✅ Created admin user: ${user.email}`)
+  }
+  process.exit(0)
+}).catch(err => {
+  console.error(err)
+  process.exit(1)
 })
