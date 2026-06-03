@@ -114,13 +114,14 @@ exports.getMe = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // POST /api/auth/signup/send-otp
-// Body: { name, email, phone }
+// Body: { name, email, phone, state }
 // Returns: { success, otp }   ← OTP returned in response for now (no DLT yet)
 exports.signupSendOtp = async (req, res) => {
   try {
     const name = (req.body.name || "").trim();
     const email = (req.body.email || "").toLowerCase().trim();
     const phone = normalizePhone(req.body.phone);
+    const state = (req.body.state || "").trim();
 
     if (!name || !email || !phone) {
       return res.status(400).json({
@@ -155,7 +156,7 @@ exports.signupSendOtp = async (req, res) => {
       phone,
       code,
       purpose: "signup",
-      payload: { name, email },
+      payload: { name, email, state },
       expiresAt,
     });
 
@@ -222,7 +223,7 @@ exports.signupVerifyOtp = async (req, res) => {
     }
 
     // OTP valid — create the user
-    const { name, email } = record.payload || {};
+    const { name, email, state } = record.payload || {};
     if (!name || !email) {
       await record.deleteOne();
       return res.status(400).json({
@@ -241,7 +242,7 @@ exports.signupVerifyOtp = async (req, res) => {
       });
     }
 
-    const user = await User.create({ name, email, phone });
+    const user = await User.create({ name, email, phone, state: state || "" });
     await record.deleteOne();
 
     const token = signToken(user._id);
@@ -380,13 +381,14 @@ exports.loginVerifyOtp = async (req, res) => {
 // Profile (mobile user self-service)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// PATCH /api/profile  — update own name / email / phone
+// PATCH /api/profile  — update own name / email / phone / state
 exports.updateProfile = async (req, res) => {
   try {
-    const { name, email, phone } = req.body;
+    const { name, email, phone, state } = req.body;
     const update = {};
 
     if (name && name.trim()) update.name = name.trim();
+    if (typeof state !== "undefined") update.state = (state || "").trim();
 
     if (email && email.trim()) {
       const e = email.trim().toLowerCase();
@@ -395,12 +397,10 @@ exports.updateProfile = async (req, res) => {
         _id: { $ne: req.user.id },
       });
       if (conflict) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            message: "Email already in use by another account",
-          });
+        return res.status(400).json({
+          success: false,
+          message: "Email already in use by another account",
+        });
       }
       update.email = e;
     }
@@ -412,12 +412,10 @@ exports.updateProfile = async (req, res) => {
         _id: { $ne: req.user.id },
       });
       if (conflict) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            message: "Phone already in use by another account",
-          });
+        return res.status(400).json({
+          success: false,
+          message: "Phone already in use by another account",
+        });
       }
       update.phone = p;
     }

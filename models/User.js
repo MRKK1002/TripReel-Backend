@@ -40,6 +40,11 @@ const userSchema = new mongoose.Schema(
       type: String,
       default: "",
     },
+    state: {
+      type: String,
+      trim: true,
+      default: "",
+    },
     tripsCount: {
       type: Number,
       default: 0,

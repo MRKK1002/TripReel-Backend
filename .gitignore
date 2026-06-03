@@ -1,8 +1,7 @@
 # Dependencies
 node_modules/
 
-# Uploads (user-generated files)
-uploads/
+
 
 # Environment variables
 .env
@@ -18,4 +17,4 @@ npm-debug.log*
 .DS_Store
 
 # Build output
-dist/
+

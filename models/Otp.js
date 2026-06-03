@@ -21,6 +21,7 @@ const otpSchema = new mongoose.Schema(
     payload: {
       name: { type: String, trim: true },
       email: { type: String, trim: true, lowercase: true },
+      state: { type: String, trim: true },
     },
     attempts: {
       type: Number,
