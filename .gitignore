@@ -1,8 +1,7 @@
 # Dependencies
 node_modules/
 
-# Uploads (user-generated files)
-uploads/
+
 
 # Environment variables
 .env
