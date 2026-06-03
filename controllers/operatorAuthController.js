@@ -57,6 +57,10 @@ exports.login = async (req, res) => {
             return res.status(403).json({ success: false, message: 'Your account has been suspended' })
         }
 
+        if (operator.onboardingState === 'REJECTED') {
+            return res.status(403).json({ success: false, message: 'Your application was rejected. Please contact support.' })
+        }
+
         const token = signToken(operator._id)
 
         res.json({

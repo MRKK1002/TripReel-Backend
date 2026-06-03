@@ -80,7 +80,7 @@ exports.adminGetAllPackages = async (req, res) => {
 // PATCH /api/packages/:id/review  (admin — approve, reject, or request revision)
 exports.reviewPackage = async (req, res) => {
     try {
-        const { action, adminNotes, approvedCategory, isFeatured, isTrending, badge } = req.body
+        const { action, adminNotes } = req.body
         // action: 'approve' | 'reject' | 'needs_revision'
 
         const statusMap = {
@@ -96,21 +96,8 @@ exports.reviewPackage = async (req, res) => {
         const update = {
             status: statusMap[action],
             adminNotes: adminNotes || '',
+            isActive: action === 'approve',
         }
-
-        if (action === 'approve') {
-            update.isActive = true
-            if (approvedCategory) {
-                update.approvedCategory = approvedCategory
-                update.category = approvedCategory
-            }
-        } else {
-            update.isActive = false
-        }
-
-        if (typeof isFeatured === 'boolean') update.isFeatured = isFeatured
-        if (typeof isTrending === 'boolean') update.isTrending = isTrending
-        if (badge) update.badge = badge
 
         const pkg = await Package.findByIdAndUpdate(req.params.id, update, { new: true })
         if (!pkg) return res.status(404).json({ success: false, message: 'Package not found' })
@@ -149,7 +136,7 @@ exports.operatorCreatePackage = async (req, res) => {
     try {
         const body = { ...req.body }
 
-        // Handle uploaded images from multer
+        // slot-0 → image_url (cover), slots 1-3 → images (gallery)
         if (req.files) {
             if (req.files['image_url']?.[0]) {
                 body.image_url = '/uploads/' + req.files['image_url'][0].filename
@@ -179,7 +166,7 @@ exports.operatorCreatePackage = async (req, res) => {
         ;['highlights', 'inclusions', 'exclusions', 'itinerary', 'addons', 'categories', 'videos'].forEach(key => {
             if (typeof body[key] === 'string') body[key] = parseJSON(body[key], [])
         })
-        ;['hotelDetails', 'transportDetails', 'pricing', 'availability', 'locationDetails', 'policies', 'offer'].forEach(key => {
+        ;['hotelDetails', 'transportDetails', 'pricing', 'availability', 'policies', 'offer'].forEach(key => {
             if (typeof body[key] === 'string') body[key] = parseJSON(body[key], {})
         })
 
@@ -223,7 +210,7 @@ exports.operatorUpdatePackage = async (req, res) => {
 
         const body = { ...req.body }
 
-        // Handle uploaded images from multer
+        // slot-0 → image_url (cover), slots 1-3 → images (gallery)
         if (req.files) {
             if (req.files['image_url']?.[0]) {
                 body.image_url = '/uploads/' + req.files['image_url'][0].filename
@@ -253,7 +240,7 @@ exports.operatorUpdatePackage = async (req, res) => {
         ;['highlights', 'inclusions', 'exclusions', 'itinerary', 'addons', 'categories', 'videos'].forEach(key => {
             if (typeof body[key] === 'string') body[key] = parseJSON(body[key], [])
         })
-        ;['hotelDetails', 'transportDetails', 'pricing', 'availability', 'locationDetails', 'policies', 'offer'].forEach(key => {
+        ;['hotelDetails', 'transportDetails', 'pricing', 'availability', 'policies', 'offer'].forEach(key => {
             if (typeof body[key] === 'string') body[key] = parseJSON(body[key], {})
         })
 

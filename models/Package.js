@@ -22,10 +22,6 @@ const packagePricingSchema = new mongoose.Schema(
     {
         adultPrice: { type: Number, default: 0, min: 0 },
         childPrice: { type: Number, default: 0, min: 0 },
-        extraPersonPrice: { type: Number, default: 0, min: 0 },
-        discountPrice: { type: Number, default: 0, min: 0 },
-        gstPercent: { type: Number, default: 0, min: 0 },
-        convenienceFee: { type: Number, default: 0, min: 0 },
     },
     { _id: false }
 )
@@ -61,16 +57,6 @@ const packageAvailabilitySchema = new mongoose.Schema(
     { _id: false }
 )
 
-const packageLocationSchema = new mongoose.Schema(
-    {
-        destinationName: { type: String, trim: true, default: '' },
-        googleMapUrl: { type: String, trim: true, default: '' },
-        pickupPoint: { type: String, trim: true, default: '' },
-        meetingPoint: { type: String, trim: true, default: '' },
-    },
-    { _id: false }
-)
-
 const packagePoliciesSchema = new mongoose.Schema(
     {
         cancellationPolicy: { type: String, trim: true, default: '' },
@@ -102,16 +88,6 @@ const packageSchema = new mongoose.Schema(
             required: [true, 'Location is required'],
             trim: true,
         },
-        subtitle: {
-            type: String,
-            trim: true,
-            default: '',
-        },
-        packageCode: {
-            type: String,
-            trim: true,
-            default: '',
-        },
         tourType: {
             type: String,
             trim: true,
@@ -142,24 +118,13 @@ const packageSchema = new mongoose.Schema(
             trim: true,
             default: '',
         },
-        categories: [{ type: String }],
-        description: {
-            type: String,
-            trim: true,
-            default: '',
-        },
-        fullDescription: {
+        aboutThisTrip: {
             type: String,
             trim: true,
             default: '',
         },
         about: {
             type: String,
-            default: '',
-        },
-        whyChoose: {
-            type: String,
-            trim: true,
             default: '',
         },
         rating: {
@@ -202,7 +167,6 @@ const packageSchema = new mongoose.Schema(
         transportDetails: packageTransportSchema,
         pricing: packagePricingSchema,
         availability: packageAvailabilitySchema,
-        locationDetails: packageLocationSchema,
         policies: packagePoliciesSchema,
         offer: packageOfferSchema,
         image_url: {
