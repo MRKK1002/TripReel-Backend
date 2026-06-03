@@ -19,6 +19,7 @@ app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.use("/api/auth", require("./routes/authRoutes"));
 app.use("/api/profile", require("./routes/profileRoutes"));
+app.use("/api/reviews", require("./routes/reviewRoutes"));
 app.use("/api/upload", require("./routes/uploadRoutes"));
 app.use("/api/users", require("./routes/userRoutes"));
 app.use("/api/banners", require("./routes/bannerRoutes"));
@@ -66,4 +67,3 @@ mongoose
     console.error("❌ MongoDB connection error:", err.message);
     process.exit(1);
   });
-
