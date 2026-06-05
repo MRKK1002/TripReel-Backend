@@ -4,6 +4,8 @@ const Package = require("../models/Package");
 
 // GET /api/packages  (public — only approved packages)
 // Supports ?userCountry=India&userState=Goa for nearby-first Curated sort
+// Supports ?date=2026-06-11 to filter packages that have batches on that date
+// Supports ?guests=3 to filter packages with batches that have enough seats
 exports.getAllPackages = async (req, res) => {
   try {
     const {
@@ -13,10 +15,48 @@ exports.getAllPackages = async (req, res) => {
       sortBy,
       userCountry,
       userState,
+      date,
+      guests,
       page = 1,
       limit = 20,
     } = req.query;
     const query = { isActive: true, status: { $in: ["APPROVED"] } };
+
+    // If date filter provided, find batches on that date first
+    if (date) {
+      const Batch = require("../models/Batch");
+      const searchDate = new Date(date);
+      searchDate.setHours(0, 0, 0, 0);
+      const nextDay = new Date(searchDate);
+      nextDay.setDate(nextDay.getDate() + 1);
+
+      const batchQuery = {
+        isActive: true,
+        startDate: { $lte: nextDay },
+        endDate: { $gte: searchDate },
+      };
+
+      // If guests specified, only batches with enough seats
+      if (guests && Number(guests) > 0) {
+        batchQuery.$expr = {
+          $gte: [
+            { $subtract: ["$totalSeats", "$bookedSeats"] },
+            Number(guests),
+          ],
+        };
+      }
+
+      const matchingBatches = await Batch.find(batchQuery).select("packageId");
+      const packageIds = [
+        ...new Set(matchingBatches.map((b) => b.packageId.toString())),
+      ];
+
+      if (packageIds.length === 0) {
+        return res.json({ success: true, total: 0, page: 1, packages: [] });
+      }
+
+      query._id = { $in: packageIds };
+    }
 
     if (search) {
       query.$or = [
@@ -25,6 +65,7 @@ exports.getAllPackages = async (req, res) => {
         { city: { $regex: search, $options: "i" } },
         { state: { $regex: search, $options: "i" } },
         { country: { $regex: search, $options: "i" } },
+        { departureCity: { $regex: search, $options: "i" } },
       ];
     }
     if (category) {
@@ -112,26 +153,31 @@ exports.getAllPackages = async (req, res) => {
 };
 
 // GET /api/packages/popular  (public — ranked by booking count + rating)
-// Logic: packages with more bookings rank first; among packages with 0 bookings
-// (nobody rated yet), higher avgRating wins; ties broken by reviewCount.
+// Logic: Popular = packages that have traction (bookings or good ratings).
+// Qualifies if: bookingCount >= 1 OR (avgRating >= 4.0 AND reviewCount >= 1)
+// Ranked by combined score. Max 10 results.
 exports.getPopularPackages = async (req, res) => {
   try {
-    const limit = Math.min(Number(req.query.limit) || 10, 50);
-    const query = { isActive: true, status: "APPROVED" };
+    const limit = Math.min(Number(req.query.limit) || 10, 10);
 
-    // Use an aggregation so we can compute a combined popularityScore:
-    // score = (bookingCount * 2) + (avgRating * 10) + (reviewCount * 0.5)
-    // This ensures a package with many bookings but no ratings still shows up,
-    // and a package with great ratings but 0 bookings still ranks reasonably.
     const packages = await Package.aggregate([
-      { $match: query },
+      {
+        $match: {
+          isActive: true,
+          status: "APPROVED",
+          $or: [
+            { bookingCount: { $gte: 1 } },
+            { avgRating: { $gte: 4.0 }, reviewCount: { $gte: 1 } },
+          ],
+        },
+      },
       {
         $addFields: {
           popularityScore: {
             $add: [
-              { $multiply: [{ $ifNull: ["$bookingCount", 0] }, 2] },
+              { $multiply: [{ $ifNull: ["$bookingCount", 0] }, 3] },
               { $multiply: [{ $ifNull: ["$avgRating", 0] }, 10] },
-              { $multiply: [{ $ifNull: ["$reviewCount", 0] }, 0.5] },
+              { $multiply: [{ $ifNull: ["$reviewCount", 0] }, 1] },
             ],
           },
         },
@@ -534,6 +580,44 @@ exports.operatorDeletePackage = async (req, res) => {
         .status(404)
         .json({ success: false, message: "Package not found or not yours" });
     res.json({ success: true, message: "Package deleted" });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// PATCH /api/packages/admin/:id/suspend — toggle isActive
+exports.adminTogglePackageSuspend = async (req, res) => {
+  try {
+    const pkg = await Package.findById(req.params.id);
+    if (!pkg)
+      return res
+        .status(404)
+        .json({ success: false, message: "Package not found" });
+    pkg.isActive = !pkg.isActive;
+    await pkg.save();
+    res.json({
+      success: true,
+      message: pkg.isActive ? "Package activated" : "Package suspended",
+      package: pkg,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// GET /api/packages/operator/:id/reviews — get all reviews for an operator's packages
+exports.operatorGetReviews = async (req, res) => {
+  try {
+    const Review = require("../models/Review");
+    const operatorPackages = await Package.find({
+      operatorId: req.operator._id,
+    }).select("_id title");
+    const packageIds = operatorPackages.map((p) => p._id);
+    const reviews = await Review.find({ packageId: { $in: packageIds } })
+      .populate("userId", "name avatar")
+      .populate("packageId", "title")
+      .sort({ createdAt: -1 });
+    res.json({ success: true, total: reviews.length, reviews });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }

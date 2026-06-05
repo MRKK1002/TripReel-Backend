@@ -11,6 +11,8 @@ const {
   operatorCreatePackage,
   operatorUpdatePackage,
   operatorDeletePackage,
+  adminTogglePackageSuspend,
+  operatorGetReviews,
 } = require("../controllers/packageController");
 const { protect, restrictTo } = require("../middleware/authMiddleware");
 const { operatorProtect } = require("../middleware/operatorAuthMiddleware");
@@ -24,6 +26,7 @@ const packageUpload = upload.fields([
 
 // ── Operator routes (must come before /:id to avoid conflicts) ────────────────
 router.get("/operator/mine", operatorProtect, operatorGetMyPackages);
+router.get("/operator/reviews", operatorProtect, operatorGetReviews);
 router.post("/operator", operatorProtect, packageUpload, operatorCreatePackage);
 router.put(
   "/operator/:id",
@@ -36,6 +39,12 @@ router.delete("/operator/:id", operatorProtect, operatorDeletePackage);
 // ── Admin routes ──────────────────────────────────────────────────────────────
 router.get("/admin/all", protect, restrictTo("admin"), adminGetAllPackages);
 router.patch("/:id/review", protect, restrictTo("admin"), reviewPackage);
+router.patch(
+  "/:id/suspend",
+  protect,
+  restrictTo("admin"),
+  adminTogglePackageSuspend,
+);
 router.delete("/:id", protect, restrictTo("admin"), deletePackage);
 
 // ── Public routes ─────────────────────────────────────────────────────────────

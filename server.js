@@ -47,6 +47,8 @@ app.use("/api/settings", require("./routes/platformSettingsRoutes"));
 app.use("/api/wallet", require("./routes/walletRoutes"));
 app.use("/api/cron", require("./routes/cronRoutes"));
 app.use("/api/coupons", require("./routes/couponRoutes"));
+app.use("/api/admin/revenue", require("./routes/revenueRoutes"));
+app.use("/api/reports", require("./routes/reportRoutes"));
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {

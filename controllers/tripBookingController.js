@@ -443,3 +443,167 @@ exports.operatorGetMyBookings = async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 };
+
+// ── User cancels their own booking ───────────────────────────────────────────
+// POST /api/trip-bookings/:id/cancel
+exports.cancelBooking = async (req, res) => {
+  try {
+    const { reason } = req.body;
+    const booking = await TripBooking.findById(req.params.id);
+
+    if (!booking) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Booking not found" });
+    }
+
+    // Only the booking owner can cancel
+    if (booking.userId.toString() !== req.user._id.toString()) {
+      return res
+        .status(403)
+        .json({ success: false, message: "Not authorized" });
+    }
+
+    // Can only cancel CONFIRMED or PENDING bookings
+    if (!["CONFIRMED", "PENDING"].includes(booking.status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot cancel a ${booking.status.toLowerCase()} booking`,
+      });
+    }
+
+    // Calculate refund based on days before trip start
+    const startDate = booking.snapshot?.startDate;
+    let refundPercent = 0;
+    let refundAmount = 0;
+
+    if (startDate) {
+      const now = new Date();
+      const tripStart = new Date(startDate);
+      const daysBeforeTrip = Math.ceil(
+        (tripStart - now) / (1000 * 60 * 60 * 24),
+      );
+
+      // Get refund slabs from platform settings
+      let slabs = [
+        { daysBeforeTrip: 7, refundPercent: 90 },
+        { daysBeforeTrip: 3, refundPercent: 50 },
+        { daysBeforeTrip: 0, refundPercent: 0 },
+      ];
+
+      try {
+        const slabsSetting = await getSetting("cancellation_refund_slabs");
+        if (Array.isArray(slabsSetting) && slabsSetting.length > 0) {
+          slabs = slabsSetting;
+        }
+      } catch {}
+
+      // Sort slabs descending by daysBeforeTrip
+      slabs.sort((a, b) => b.daysBeforeTrip - a.daysBeforeTrip);
+
+      // Find which slab applies
+      for (const slab of slabs) {
+        if (daysBeforeTrip >= slab.daysBeforeTrip) {
+          refundPercent = slab.refundPercent;
+          break;
+        }
+      }
+
+      refundAmount = Math.round(
+        (booking.pricing.totalAmount * refundPercent) / 100,
+      );
+    }
+
+    // Update booking
+    booking.status = "CANCELLED";
+    booking.cancelReason = reason || "Cancelled by user";
+    booking.cancelledBy = "user";
+    booking.cancelledAt = new Date();
+    booking.refundPercent = refundPercent;
+    booking.refundAmount = refundAmount;
+    await booking.save();
+
+    // Release seats on the batch
+    await Batch.findByIdAndUpdate(booking.batchId, {
+      $inc: { bookedSeats: -booking.seats },
+    });
+
+    // Decrement bookingCount on the package
+    await Package.findByIdAndUpdate(booking.packageId, {
+      $inc: { bookingCount: -1 },
+    });
+
+    res.json({
+      success: true,
+      message: "Booking cancelled successfully",
+      refundPercent,
+      refundAmount,
+      booking,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// GET /api/trip-bookings/:id/refund-preview — preview refund before cancelling
+exports.getRefundPreview = async (req, res) => {
+  try {
+    const booking = await TripBooking.findById(req.params.id);
+    if (!booking) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Booking not found" });
+    }
+
+    if (booking.userId.toString() !== req.user._id.toString()) {
+      return res
+        .status(403)
+        .json({ success: false, message: "Not authorized" });
+    }
+
+    const startDate = booking.snapshot?.startDate;
+    let refundPercent = 0;
+    let daysBeforeTrip = 0;
+
+    if (startDate) {
+      const now = new Date();
+      const tripStart = new Date(startDate);
+      daysBeforeTrip = Math.ceil((tripStart - now) / (1000 * 60 * 60 * 24));
+
+      let slabs = [
+        { daysBeforeTrip: 7, refundPercent: 90 },
+        { daysBeforeTrip: 3, refundPercent: 50 },
+        { daysBeforeTrip: 0, refundPercent: 0 },
+      ];
+
+      try {
+        const slabsSetting = await getSetting("cancellation_refund_slabs");
+        if (Array.isArray(slabsSetting) && slabsSetting.length > 0) {
+          slabs = slabsSetting;
+        }
+      } catch {}
+
+      slabs.sort((a, b) => b.daysBeforeTrip - a.daysBeforeTrip);
+      for (const slab of slabs) {
+        if (daysBeforeTrip >= slab.daysBeforeTrip) {
+          refundPercent = slab.refundPercent;
+          break;
+        }
+      }
+    }
+
+    const refundAmount = Math.round(
+      (booking.pricing.totalAmount * refundPercent) / 100,
+    );
+
+    res.json({
+      success: true,
+      daysBeforeTrip,
+      refundPercent,
+      refundAmount,
+      totalPaid: booking.pricing.totalAmount,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};

@@ -124,6 +124,18 @@ const tripBookingSchema = new mongoose.Schema(
       enum: ["user", "admin", "system", ""],
       default: "",
     },
+    cancelledAt: {
+      type: Date,
+      default: null,
+    },
+    refundPercent: {
+      type: Number,
+      default: 0,
+    },
+    refundAmount: {
+      type: Number,
+      default: 0,
+    },
   },
   { timestamps: true },
 );

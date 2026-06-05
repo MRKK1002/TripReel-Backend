@@ -458,3 +458,19 @@ exports.uploadAvatar = async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 };
+
+// PATCH /api/admin/users/:id/suspend — admin toggles user active status
+exports.adminToggleUserSuspend = async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id);
+    if (!user)
+      return res
+        .status(404)
+        .json({ success: false, message: "User not found" });
+    user.status = user.status === "Suspended" ? "Active" : "Suspended";
+    await user.save();
+    res.json({ success: true, message: `User ${user.status}`, user });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};

@@ -31,7 +31,7 @@ const reelSchema = new mongoose.Schema(
     badge: {
       type: String,
       enum: ["Popular", "Trending", "New", "Featured", ""],
-      default: "Popular",
+      default: "",
     },
     video: {
       type: String,
