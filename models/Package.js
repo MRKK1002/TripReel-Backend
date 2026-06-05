@@ -176,7 +176,7 @@ const packageSchema = new mongoose.Schema(
     badge: {
       type: String,
       enum: ["Popular", "Trending", "New", ""],
-      default: "Popular",
+      default: "",
     },
     isFeatured: { type: Boolean, default: false },
     isTrending: { type: Boolean, default: false },
