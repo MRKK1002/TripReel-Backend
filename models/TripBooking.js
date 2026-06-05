@@ -12,6 +12,9 @@ const pricingSchema = new mongoose.Schema(
     gstAmount: { type: Number, default: 0 },
     // What the user pays
     totalAmount: { type: Number, default: 0 },
+    // Discount applied via coupon
+    discountAmount: { type: Number, default: 0 },
+    couponCode: { type: String, default: "" },
     // What the operator receives (totalAmount - platformFeeAmount)
     operatorAmount: { type: Number, default: 0 },
   },

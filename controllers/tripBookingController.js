@@ -80,12 +80,10 @@ exports.createBooking = async (req, res) => {
     const { packageId, batchId, seats = 1, travelerNames = [] } = req.body;
 
     if (!packageId || !batchId) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "packageId and batchId are required",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "packageId and batchId are required",
+      });
     }
 
     const numSeats = Math.max(1, Number(seats) || 1);
@@ -101,12 +99,10 @@ exports.createBooking = async (req, res) => {
     const now = new Date();
 
     if (batch.bookingDeadline < now) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "Booking deadline has passed for this batch",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "Booking deadline has passed for this batch",
+      });
     }
     if (batch.startDate <= now) {
       return res
@@ -114,12 +110,10 @@ exports.createBooking = async (req, res) => {
         .json({ success: false, message: "This trip has already started" });
     }
     if (String(batch.packageId) !== String(packageId)) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "Batch does not belong to this package",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "Batch does not belong to this package",
+      });
     }
 
     const available = batch.totalSeats - batch.bookedSeats;
@@ -137,23 +131,19 @@ exports.createBooking = async (req, res) => {
       status: { $in: ["PENDING", "CONFIRMED"] },
     });
     if (existing) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "You have already booked this batch",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "You have already booked this batch",
+      });
     }
 
     // ── Fetch package ──────────────────────────────────────────────────────
     const pkg = await Package.findById(packageId);
     if (!pkg || !pkg.isActive || pkg.status !== "APPROVED") {
-      return res
-        .status(404)
-        .json({
-          success: false,
-          message: "Package not found or not available",
-        });
+      return res.status(404).json({
+        success: false,
+        message: "Package not found or not available",
+      });
     }
 
     // ── Get live platform settings ─────────────────────────────────────────
@@ -167,6 +157,61 @@ exports.createBooking = async (req, res) => {
       platformFeePercent,
       gstPercent,
     });
+
+    // ── Apply coupon if provided ───────────────────────────────────────────
+    const couponCode = (req.body.couponCode || "").trim().toUpperCase();
+    let discountAmount = 0;
+    let appliedCouponId = null;
+
+    if (couponCode) {
+      const Coupon = require("../models/Coupon");
+      const now = new Date();
+      const coupon = await Coupon.findOne({
+        batchId,
+        code: couponCode,
+        isActive: true,
+        validFrom: { $lte: now },
+        validUntil: { $gte: now },
+      });
+
+      if (coupon) {
+        // Check usage limit
+        const withinUsage =
+          coupon.usageLimit === 0 || coupon.usedCount < coupon.usageLimit;
+        // Check min guests
+        const meetsGuests =
+          coupon.minGuests === 0 || numSeats >= coupon.minGuests;
+        // Check min order
+        const meetsOrder =
+          coupon.minOrderAmount === 0 ||
+          pricing.subtotal >= coupon.minOrderAmount;
+
+        if (withinUsage && meetsGuests && meetsOrder) {
+          if (coupon.type === "percentage") {
+            discountAmount = Math.round(
+              (pricing.subtotal * coupon.value) / 100,
+            );
+            if (coupon.maxDiscount > 0 && discountAmount > coupon.maxDiscount) {
+              discountAmount = coupon.maxDiscount;
+            }
+          } else {
+            discountAmount = Math.min(coupon.value, pricing.subtotal);
+          }
+          appliedCouponId = coupon._id;
+          // Increment usage
+          coupon.usedCount += 1;
+          await coupon.save();
+        }
+      }
+    }
+
+    // Update pricing with discount
+    if (discountAmount > 0) {
+      pricing.discountAmount = discountAmount;
+      pricing.couponCode = couponCode;
+      pricing.totalAmount = pricing.totalAmount - discountAmount;
+      pricing.operatorAmount = pricing.totalAmount - pricing.platformFeeAmount;
+    }
 
     // ── Build snapshot ─────────────────────────────────────────────────────
     const snapshot = {
@@ -294,12 +339,10 @@ exports.updateBookingStatus = async (req, res) => {
     const { status, cancelReason } = req.body;
     const allowed = ["CONFIRMED", "CANCELLED", "COMPLETED"];
     if (!allowed.includes(status)) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: `status must be one of: ${allowed.join(", ")}`,
-        });
+      return res.status(400).json({
+        success: false,
+        message: `status must be one of: ${allowed.join(", ")}`,
+      });
     }
 
     const booking = await TripBooking.findById(req.params.id);
@@ -313,20 +356,16 @@ exports.updateBookingStatus = async (req, res) => {
 
     // Guard against invalid transitions
     if (prevStatus === "COMPLETED") {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "Completed bookings cannot be changed",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "Completed bookings cannot be changed",
+      });
     }
     if (prevStatus === "CANCELLED") {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "Cancelled bookings cannot be changed",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "Cancelled bookings cannot be changed",
+      });
     }
 
     booking.status = status;

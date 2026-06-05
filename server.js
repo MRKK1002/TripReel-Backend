@@ -46,6 +46,7 @@ app.use("/api/operator-bookings", require("./routes/operatorBookingRoutes"));
 app.use("/api/settings", require("./routes/platformSettingsRoutes"));
 app.use("/api/wallet", require("./routes/walletRoutes"));
 app.use("/api/cron", require("./routes/cronRoutes"));
+app.use("/api/coupons", require("./routes/couponRoutes"));
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {

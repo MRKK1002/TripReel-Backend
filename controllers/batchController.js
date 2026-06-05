@@ -26,7 +26,8 @@ exports.getBatchesForPackage = async (req, res) => {
     const batches = await Batch.find({
       packageId,
       isActive: true,
-      endDate: { $gte: now }, // exclude fully completed ones from public view
+      bookingDeadline: { $gte: now }, // only show batches still open for booking
+      endDate: { $gte: now }, // exclude fully completed ones
     }).sort({ startDate: 1 });
 
     res.json({ success: true, count: batches.length, batches });
@@ -94,12 +95,10 @@ exports.createBatch = async (req, res) => {
     let deadline = toDate(bookingDeadline);
 
     if (!start || !end) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "startDate and endDate are required",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "startDate and endDate are required",
+      });
     }
 
     const now = new Date();
@@ -156,12 +155,10 @@ exports.cloneBatch = async (req, res) => {
     let deadline = toDate(bookingDeadline);
 
     if (!start || !end) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "New startDate and endDate are required for clone",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "New startDate and endDate are required for clone",
+      });
     }
 
     const now = new Date();
