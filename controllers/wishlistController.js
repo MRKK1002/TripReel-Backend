@@ -30,7 +30,7 @@ exports.getAllWishlists = async (req, res) => {
 exports.getMyWishlists = async (req, res) => {
     try {
         const wishlists = await Wishlist.find({ user: req.user.id })
-            .populate('packages', 'title image_url price')
+            .populate('packages', 'title image_url images price location')
             .sort({ createdAt: -1 })
         res.json({ success: true, count: wishlists.length, wishlists })
     } catch (err) {
@@ -56,7 +56,7 @@ exports.addPackageToWishlist = async (req, res) => {
             { _id: req.params.id, user: req.user.id },
             { $addToSet: { packages: packageId } },
             { new: true }
-        ).populate('packages', 'title image_url price')
+        ).populate('packages', 'title image_url images price location')
 
         if (!wishlist) return res.status(404).json({ success: false, message: 'Wishlist not found' })
         res.json({ success: true, wishlist })
@@ -72,7 +72,7 @@ exports.removePackageFromWishlist = async (req, res) => {
             { _id: req.params.id, user: req.user.id },
             { $pull: { packages: req.params.packageId } },
             { new: true }
-        ).populate('packages', 'title image_url price')
+        ).populate('packages', 'title image_url images price location')
 
         if (!wishlist) return res.status(404).json({ success: false, message: 'Wishlist not found' })
         res.json({ success: true, wishlist })
