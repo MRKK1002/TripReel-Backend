@@ -12,12 +12,10 @@ exports.register = async (req, res) => {
     const { contactName, email, phone, password } = req.body;
 
     if (!password || password.length < 8) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "Password must be at least 8 characters",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "Password must be at least 8 characters",
+      });
     }
 
     const existing = await Operator.findOne({ email });
@@ -76,27 +74,21 @@ exports.login = async (req, res) => {
     }
 
     if (operator.onboardingState === "REJECTED") {
-      return res
-        .status(403)
-        .json({
-          success: false,
-          message: "Your application was rejected. Please contact support.",
-        });
+      return res.status(403).json({
+        success: false,
+        message: "Your application was rejected. Please contact support.",
+      });
     }
 
     const token = signToken(operator._id);
 
+    // Return full operator data (exclude password)
+    const fullOperator = await Operator.findById(operator._id);
+
     res.json({
       success: true,
       token,
-      operator: {
-        _id: operator._id,
-        contactName: operator.contactName,
-        businessName: operator.businessName,
-        email: operator.email,
-        phone: operator.phone,
-        onboardingState: operator.onboardingState,
-      },
+      operator: fullOperator,
     });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
