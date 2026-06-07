@@ -68,16 +68,7 @@ exports.login = async (req, res) => {
     }
 
     if (operator.onboardingState === "SUSPENDED") {
-      return res
-        .status(403)
-        .json({ success: false, message: "Your account has been suspended" });
-    }
-
-    if (operator.onboardingState === "REJECTED") {
-      return res.status(403).json({
-        success: false,
-        message: "Your application was rejected. Please contact support.",
-      });
+      // Allow login but they'll see suspended status page
     }
 
     const token = signToken(operator._id);

@@ -54,6 +54,11 @@ const userSchema = new mongoose.Schema(
       type: Number,
       default: 0,
     },
+    // Firebase Cloud Messaging token for push notifications
+    fcmToken: {
+      type: String,
+      default: "",
+    },
   },
   { timestamps: true },
 );

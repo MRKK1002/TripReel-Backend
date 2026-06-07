@@ -3,10 +3,16 @@ const mongoose = require("mongoose");
 const cors = require("cors");
 const dotenv = require("dotenv");
 const path = require("path");
+const http = require("http");
 
 dotenv.config();
 
 const app = express();
+const server = http.createServer(app);
+
+// Initialize WebSocket
+const { initSocket } = require("./config/socket");
+initSocket(server);
 
 // ── Middleware ────────────────────────────────────────────────────────────────
 app.use(cors());
@@ -49,6 +55,9 @@ app.use("/api/cron", require("./routes/cronRoutes"));
 app.use("/api/coupons", require("./routes/couponRoutes"));
 app.use("/api/admin/revenue", require("./routes/revenueRoutes"));
 app.use("/api/reports", require("./routes/reportRoutes"));
+app.use("/api/notifications", require("./routes/notificationRoutes"));
+app.use("/api/chat", require("./routes/chatRoutes"));
+app.use("/api/sidebar-counts", require("./routes/sidebarCountsRoutes"));
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
@@ -72,21 +81,23 @@ mongoose
   .connect(MONGO_URI)
   .then(() => {
     console.log("✅ MongoDB connected");
-    app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+    server.listen(PORT, () =>
+      console.log(`🚀 Server running on port ${PORT} (WebSocket enabled)`),
+    );
 
-    // ── Schedule daily cron job at midnight ────────────────────────────────
+    // ── Schedule cron jobs ─────────────────────────────────────────────────
     const cron = require("node-cron");
     const { runCronJobs } = require("./controllers/cronController");
 
-    // Runs every day at 00:00 server time
-    cron.schedule("0 0 * * *", async () => {
+    // Runs every 6 hours (00:00, 06:00, 12:00, 18:00) for timely notifications
+    cron.schedule("0 */6 * * *", async () => {
       try {
         const result = await runCronJobs();
         console.log(
-          `✅ Cron: ${result.completed} completed, ${result.cancelled} cancelled`,
+          `\u2705 Cron: ${result.completed} completed, ${result.cancelled} cancelled, ${result.reminders || 0} reminders, ${result.reviewReminders || 0} review reminders`,
         );
       } catch (err) {
-        console.error("❌ Cron error:", err.message);
+        console.error("\u274C Cron error:", err.message);
       }
     });
 

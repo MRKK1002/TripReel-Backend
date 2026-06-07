@@ -3,6 +3,7 @@ const Batch = require("../models/Batch");
 const Package = require("../models/Package");
 const OperatorWallet = require("../models/OperatorWallet");
 const WalletTransaction = require("../models/WalletTransaction");
+const { notifyUser } = require("./notificationController");
 const { getSetting } = require("./platformSettingsController");
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -238,6 +239,71 @@ exports.createBooking = async (req, res) => {
       $inc: { bookingCount: numSeats },
     });
     // NOTE: Wallet credit happens via cron 2 days after trip endDate (not now)
+
+    // Auto-create chat conversation for this booking
+    const Conversation = require("../models/Conversation");
+    const Message = require("../models/Message");
+    const endDate = new Date(batch.endDate);
+    const expiresAt = new Date(endDate.getTime() + 2 * 24 * 60 * 60 * 1000); // endDate + 2 days
+    const startFmt = new Date(batch.startDate).toLocaleDateString("en-IN", {
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+    });
+    const endFmt = new Date(batch.endDate).toLocaleDateString("en-IN", {
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+    });
+
+    const conversation = await Conversation.create({
+      bookingId: booking._id,
+      userId: req.user._id,
+      operatorId: pkg.operatorId,
+      packageTitle: pkg.title,
+      packageImage: pkg.image_url || "",
+      startsAt: new Date(),
+      expiresAt,
+      lastMessage: "New booking received",
+      lastMessageAt: new Date(),
+      lastSenderType: "system",
+    });
+
+    // Auto-send booking summary as first message (visible to operator)
+    const summaryText = `📋 New Booking!\n\n🎯 Package: ${pkg.title}\n📅 Dates: ${startFmt} — ${endFmt}\n👥 Travelers: ${booking.seats}\n🆔 Booking ID: ${booking.bookingId}\n👤 Name: ${req.user.name || "User"}\n📱 Phone: ${req.user.phone || "—"}\n\nChat is active until ${new Date(expiresAt).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" })}`;
+
+    await Message.create({
+      conversationId: conversation._id,
+      senderId: req.user._id,
+      senderType: "user",
+      senderName: "System",
+      text: summaryText,
+    });
+
+    // Send push notification to user
+    notifyUser(
+      req.user._id,
+      "Booking Confirmed! 🎉",
+      `Your trip to ${pkg.title} is confirmed. ${booking.seats} seat${booking.seats > 1 ? "s" : ""} booked.`,
+      { type: "booking_confirmed", bookingId: booking._id.toString() },
+    );
+
+    // Notify operator about new booking
+    const { notifyOperator } = require("./notificationController");
+    const { notifyAdmin } = require("./notificationController");
+    notifyOperator(
+      pkg.operatorId,
+      "New Booking! 🎊",
+      `${req.user.name || "A user"} booked ${pkg.title} — ${booking.seats} seat${booking.seats > 1 ? "s" : ""}. ₹${booking.pricing.operatorAmount.toLocaleString("en-IN")} earning.`,
+      { type: "new_booking", bookingId: booking._id.toString() },
+    );
+
+    // Notify admin about new booking
+    notifyAdmin(
+      "New Booking",
+      `${req.user.name || "User"} booked ${pkg.title} — ₹${booking.pricing.totalAmount.toLocaleString("en-IN")}`,
+      { type: "new_booking", bookingId: booking._id.toString() },
+    );
 
     res.status(201).json({ success: true, booking });
   } catch (err) {
@@ -532,6 +598,26 @@ exports.cancelBooking = async (req, res) => {
     await Package.findByIdAndUpdate(booking.packageId, {
       $inc: { bookingCount: -1 },
     });
+
+    // Notify user about cancellation
+    const snap = booking.snapshot || {};
+    notifyUser(
+      booking.userId,
+      "Booking Cancelled",
+      refundAmount > 0
+        ? `Your booking for ${snap.packageTitle || "trip"} has been cancelled. ₹${refundAmount.toLocaleString("en-IN")} refund will be processed.`
+        : `Your booking for ${snap.packageTitle || "trip"} has been cancelled.`,
+      { type: "booking_cancelled", bookingId: booking._id.toString() },
+    );
+
+    // Notify operator about cancellation
+    const { notifyOperator } = require("./notificationController");
+    notifyOperator(
+      booking.operatorId,
+      "Booking Cancelled",
+      `A booking for ${snap.packageTitle || "your package"} (${booking.seats} seat${booking.seats > 1 ? "s" : ""}) was cancelled by user.`,
+      { type: "booking_cancelled", bookingId: booking._id.toString() },
+    );
 
     res.json({
       success: true,

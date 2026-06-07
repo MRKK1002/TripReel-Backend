@@ -1,4 +1,54 @@
 const Package = require("../models/Package");
+const Batch = require("../models/Batch");
+
+// Helper: Attach nearest upcoming batch price to each package
+async function enrichWithBatchPrice(packages) {
+  if (!packages || packages.length === 0) return packages;
+
+  const now = new Date();
+  const packageIds = packages.map((p) => p._id || p);
+
+  // Find the nearest upcoming active batch for each package
+  const nearestBatches = await Batch.aggregate([
+    {
+      $match: {
+        packageId: { $in: packageIds },
+        isActive: true,
+        startDate: { $gt: now },
+      },
+    },
+    { $sort: { startDate: 1 } },
+    {
+      $group: {
+        _id: "$packageId",
+        adultPrice: { $first: "$adultPrice" },
+        childPrice: { $first: "$childPrice" },
+        startDate: { $first: "$startDate" },
+      },
+    },
+  ]);
+
+  const priceMap = {};
+  nearestBatches.forEach((b) => {
+    priceMap[b._id.toString()] = {
+      batchPrice: b.adultPrice,
+      childPrice: b.childPrice || 0,
+      nextBatchDate: b.startDate,
+    };
+  });
+
+  // Attach batch price to each package
+  return packages.map((pkg) => {
+    const obj = pkg.toJSON ? pkg.toJSON() : { ...pkg };
+    const id = (obj._id || "").toString();
+    if (priceMap[id]) {
+      obj.batchPrice = priceMap[id].batchPrice;
+      obj.batchChildPrice = priceMap[id].childPrice;
+      obj.nextBatchDate = priceMap[id].nextBatchDate;
+    }
+    return obj;
+  });
+}
 
 // ── Public / shared ───────────────────────────────────────────────────────────
 
@@ -130,7 +180,13 @@ exports.getAllPackages = async (req, res) => {
       ]);
 
       const total = await Package.countDocuments(query);
-      return res.json({ success: true, total, page: Number(page), packages });
+      const enriched = await enrichWithBatchPrice(packages);
+      return res.json({
+        success: true,
+        total,
+        page: Number(page),
+        packages: enriched,
+      });
     }
 
     // Default sort without location context
@@ -146,7 +202,9 @@ exports.getAllPackages = async (req, res) => {
       Package.countDocuments(query),
     ]);
 
-    res.json({ success: true, total, page: Number(page), packages });
+    // Enrich packages with nearest upcoming batch price
+    const enriched = await enrichWithBatchPrice(packages);
+    res.json({ success: true, total, page: Number(page), packages: enriched });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -186,7 +244,11 @@ exports.getPopularPackages = async (req, res) => {
       { $limit: limit },
     ]);
 
-    res.json({ success: true, total: packages.length, packages });
+    res.json({
+      success: true,
+      total: packages.length,
+      packages: await enrichWithBatchPrice(packages),
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -270,6 +332,33 @@ exports.reviewPackage = async (req, res) => {
       return res
         .status(404)
         .json({ success: false, message: "Package not found" });
+
+    // Notify operator about package review result
+    if (pkg.operatorId) {
+      const { notifyOperator } = require("./notificationController");
+      if (action === "approve") {
+        notifyOperator(
+          pkg.operatorId,
+          "Package Approved! ✅",
+          `Your package "${pkg.title}" has been approved and is now live.`,
+          { type: "package_approved", packageId: pkg._id.toString() },
+        );
+      } else if (action === "reject") {
+        notifyOperator(
+          pkg.operatorId,
+          "Package Rejected",
+          `Your package "${pkg.title}" was rejected. ${adminNotes || "Please review and resubmit."}`,
+          { type: "package_rejected", packageId: pkg._id.toString() },
+        );
+      } else if (action === "needs_revision") {
+        notifyOperator(
+          pkg.operatorId,
+          "Package Needs Revision",
+          `Your package "${pkg.title}" needs changes. ${adminNotes || "Check admin notes."}`,
+          { type: "package_revision", packageId: pkg._id.toString() },
+        );
+      }
+    }
 
     res.json({ success: true, package: pkg });
   } catch (err) {
@@ -433,6 +522,14 @@ exports.operatorCreatePackage = async (req, res) => {
       isActive: false,
     });
     res.status(201).json({ success: true, package: pkg });
+
+    // Notify admin: new package for review
+    const { notifyAdmin } = require("./notificationController");
+    notifyAdmin(
+      "Package Submitted for Review",
+      `Operator submitted "${pkg.title}" for approval.`,
+      { type: "general", packageId: pkg._id.toString() },
+    );
   } catch (err) {
     res.status(400).json({ success: false, message: err.message });
   }
@@ -563,6 +660,19 @@ exports.operatorUpdatePackage = async (req, res) => {
       { new: true, runValidators: true },
     );
     res.json({ success: true, package: updated });
+
+    // Notify admin if package was re-submitted for review
+    if (nextStatus === "PENDING") {
+      const { notifyAdmin } = require("./notificationController");
+      const label = wasApproved
+        ? "Package Re-submitted for Review"
+        : "Package Submitted for Review";
+      notifyAdmin(
+        label,
+        `"${updated.title}" ${wasApproved ? "(was approved, edited)" : ""} needs admin review.`,
+        { type: "general", packageId: updated._id.toString() },
+      );
+    }
   } catch (err) {
     res.status(400).json({ success: false, message: err.message });
   }

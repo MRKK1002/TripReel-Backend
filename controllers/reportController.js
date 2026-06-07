@@ -34,6 +34,14 @@ exports.createReport = async (req, res) => {
   try {
     const report = await Report.create({ ...req.body, userId: req.user._id });
     res.status(201).json({ success: true, report });
+
+    // Notify admin about new report
+    const { notifyAdmin } = require("./notificationController");
+    notifyAdmin(
+      "New User Report",
+      `${req.user.name || "User"} reported: "${report.subject}"`,
+      { type: "general" },
+    );
   } catch (err) {
     res.status(400).json({ success: false, message: err.message });
   }
@@ -80,6 +88,18 @@ exports.updateReport = async (req, res) => {
       return res
         .status(404)
         .json({ success: false, message: "Report not found" });
+
+    // Notify user when report status changes to resolved
+    if (req.body.status === "resolved" && report.userId) {
+      const { notifyUser } = require("./notificationController");
+      notifyUser(
+        report.userId,
+        "Issue Resolved ✅",
+        `Your reported issue "${report.subject}" has been resolved.${req.body.adminNote ? " Note: " + req.body.adminNote : ""}`,
+        { type: "report_resolved", reportId: report._id.toString() },
+      );
+    }
+
     res.json({ success: true, report });
   } catch (err) {
     res.status(400).json({ success: false, message: err.message });

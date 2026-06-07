@@ -54,6 +54,24 @@ async function runCronJobs() {
           });
 
           results.walletReleased++;
+
+          // Notify user: trip completed, rate it
+          const { notifyUser } = require("./notificationController");
+          const { notifyOperator } = require("./notificationController");
+          const snap = booking.snapshot || {};
+          notifyUser(
+            booking.userId,
+            "Trip Completed! ⭐",
+            `Your trip to ${snap.packageTitle || "destination"} is complete. Rate your experience!`,
+            { type: "trip_completed", bookingId: booking._id.toString() },
+          );
+          // Notify operator: wallet credited
+          notifyOperator(
+            booking.operatorId,
+            "Wallet Credited 💰",
+            `₹${booking.pricing.operatorAmount.toLocaleString("en-IN")} credited for booking ${booking.bookingId}.`,
+            { type: "wallet_credited", bookingId: booking._id.toString() },
+          );
         }
       } catch (e) {
         results.errors.push(`Auto-complete ${booking.bookingId}: ${e.message}`);
@@ -80,6 +98,151 @@ async function runCronJobs() {
     }
   } catch (err) {
     results.errors.push(`Cron error: ${err.message}`);
+  }
+
+  // ── Job 3: Trip countdown notifications (7d, 3d, 1d, today) ────────────
+  try {
+    const { notifyUser } = require("./notificationController");
+    const confirmedForReminders = await TripBooking.find({
+      status: "CONFIRMED",
+    }).populate("batchId", "startDate");
+
+    for (const booking of confirmedForReminders) {
+      try {
+        const startDate = booking.batchId?.startDate;
+        if (!startDate) continue;
+
+        const start = new Date(startDate);
+        const todayStart = new Date(
+          now.getFullYear(),
+          now.getMonth(),
+          now.getDate(),
+        );
+        const diffMs = start.getTime() - todayStart.getTime();
+        const daysUntil = Math.round(diffMs / (1000 * 60 * 60 * 24));
+        const snap = booking.snapshot || {};
+        const tripName = snap.packageTitle || "your destination";
+
+        if (daysUntil === 7) {
+          notifyUser(
+            booking.userId,
+            "1 Week to Go! \uD83C\uDF1F",
+            `Your trip to ${tripName} is in 7 days! Time to start planning what to pack.`,
+            {
+              type: "trip_reminder",
+              bookingId: booking._id.toString(),
+              screen: "BookingDetails",
+            },
+          );
+          results.reminders = (results.reminders || 0) + 1;
+        } else if (daysUntil === 3) {
+          notifyUser(
+            booking.userId,
+            "3 Days to Go! \uD83C\uDF92",
+            `Your trip to ${tripName} is in 3 days! Pack your bags and get ready.`,
+            {
+              type: "trip_reminder",
+              bookingId: booking._id.toString(),
+              screen: "BookingDetails",
+            },
+          );
+          results.reminders = (results.reminders || 0) + 1;
+        } else if (daysUntil === 1) {
+          notifyUser(
+            booking.userId,
+            "Trip Starts Tomorrow! \uD83C\uDF34",
+            `Pack your bags! Your trip to ${tripName} starts tomorrow. Check your booking for details.`,
+            {
+              type: "trip_reminder",
+              bookingId: booking._id.toString(),
+              screen: "BookingDetails",
+            },
+          );
+          results.reminders = (results.reminders || 0) + 1;
+        } else if (daysUntil === 0) {
+          notifyUser(
+            booking.userId,
+            "Your Trip is TODAY! \uD83D\uDE80",
+            `Today is the day! Your trip to ${tripName} starts today. Have an amazing journey!`,
+            {
+              type: "trip_reminder",
+              bookingId: booking._id.toString(),
+              screen: "BookingDetails",
+            },
+          );
+          results.reminders = (results.reminders || 0) + 1;
+        }
+      } catch {}
+    }
+  } catch (err) {
+    results.errors.push(`Reminder job: ${err.message}`);
+  }
+
+  // ── Job 4: Review reminders (Day 1, 2, 3 after trip completion) ──────────
+  try {
+    const { notifyUser } = require("./notificationController");
+    const completedBookings = await TripBooking.find({
+      status: "COMPLETED",
+      hasReviewed: false,
+    }).populate("batchId", "endDate");
+
+    for (const booking of completedBookings) {
+      try {
+        const endDate = booking.batchId?.endDate;
+        if (!endDate) continue;
+
+        const end = new Date(endDate);
+        const todayStart = new Date(
+          now.getFullYear(),
+          now.getMonth(),
+          now.getDate(),
+        );
+        const diffMs = todayStart.getTime() - end.getTime();
+        const daysSinceEnd = Math.round(diffMs / (1000 * 60 * 60 * 24));
+        const snap = booking.snapshot || {};
+        const tripName = snap.packageTitle || "your trip";
+
+        if (daysSinceEnd === 1) {
+          notifyUser(
+            booking.userId,
+            "How was your trip? \u2B50",
+            `Your trip to ${tripName} just ended! Share your experience and help other travelers.`,
+            {
+              type: "trip_completed",
+              bookingId: booking._id.toString(),
+              screen: "ReviewScreen",
+            },
+          );
+          results.reviewReminders = (results.reviewReminders || 0) + 1;
+        } else if (daysSinceEnd === 2) {
+          notifyUser(
+            booking.userId,
+            "We'd love your feedback! \uD83D\uDCDD",
+            `Haven't reviewed your trip to ${tripName} yet? Your review helps other travelers make better choices.`,
+            {
+              type: "trip_completed",
+              bookingId: booking._id.toString(),
+              screen: "ReviewScreen",
+            },
+          );
+          results.reviewReminders = (results.reviewReminders || 0) + 1;
+        } else if (daysSinceEnd === 3) {
+          notifyUser(
+            booking.userId,
+            "Last reminder: Rate your trip \uD83C\uDFC6",
+            `Final reminder! Rate your experience at ${tripName}. It only takes 30 seconds.`,
+            {
+              type: "trip_completed",
+              bookingId: booking._id.toString(),
+              screen: "ReviewScreen",
+            },
+          );
+          results.reviewReminders = (results.reviewReminders || 0) + 1;
+        }
+      } catch {}
+    }
+  } catch (err) {
+    results.errors.push(`Review reminder job: ${err.message}`);
   }
 
   return results;
