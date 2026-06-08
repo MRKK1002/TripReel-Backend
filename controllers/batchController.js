@@ -129,6 +129,19 @@ exports.createBatch = async (req, res) => {
       label: (label || "").trim(),
     });
 
+    // Alert wishlisted users about new batch
+    const { alertWishlistedUsers } = require("./wishlistAlertController");
+    const fmtDate = (d) =>
+      new Date(d).toLocaleDateString("en-IN", {
+        day: "2-digit",
+        month: "short",
+      });
+    alertWishlistedUsers(
+      packageId,
+      "New dates available!",
+      `${pkg.title} has new dates: ${fmtDate(start)} - ${fmtDate(end)}. Book now!`,
+    );
+
     res.status(201).json({ success: true, batch });
   } catch (err) {
     res.status(400).json({ success: false, message: err.message });
@@ -230,6 +243,7 @@ exports.updateBatch = async (req, res) => {
       label,
     } = req.body;
 
+    const oldPrice = batch.adultPrice;
     if (startDate) batch.startDate = toDate(startDate) || batch.startDate;
     if (endDate) batch.endDate = toDate(endDate) || batch.endDate;
     if (bookingDeadline) {
@@ -249,6 +263,21 @@ exports.updateBatch = async (req, res) => {
     }
 
     await batch.save();
+
+    // If price changed, alert wishlisted users
+    if (adultPrice !== undefined && Number(adultPrice) !== oldPrice) {
+      const { alertWishlistedUsers } = require("./wishlistAlertController");
+      const Package = require("../models/Package");
+      const pkg = await Package.findById(batch.packageId).select("title");
+      if (Number(adultPrice) < oldPrice) {
+        alertWishlistedUsers(
+          batch.packageId,
+          "Price dropped!",
+          `${pkg?.title || "A trip you saved"} is now Rs.${Number(adultPrice).toLocaleString("en-IN")}/person (was Rs.${oldPrice.toLocaleString("en-IN")}). Book now!`,
+        );
+      }
+    }
+
     res.json({ success: true, batch });
   } catch (err) {
     res.status(400).json({ success: false, message: err.message });

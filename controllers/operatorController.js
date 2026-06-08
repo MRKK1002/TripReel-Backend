@@ -77,7 +77,7 @@ exports.transitionState = async (req, res) => {
       // Deactivate all operator's packages so they don't show in app
       await Package.updateMany(
         { operatorId: operator._id, isActive: true },
-        { isActive: false, _suspendedByAdmin: true },
+        { isActive: false, adminNotes: "SUSPENDED_BY_ADMIN" },
       );
       // Send notification to operator
       await Notification.create({
@@ -97,8 +97,8 @@ exports.transitionState = async (req, res) => {
     ) {
       // Reactivate packages that were suspended by admin
       await Package.updateMany(
-        { operatorId: operator._id, _suspendedByAdmin: true },
-        { isActive: true, $unset: { _suspendedByAdmin: "" } },
+        { operatorId: operator._id, adminNotes: "SUSPENDED_BY_ADMIN" },
+        { isActive: true, adminNotes: "" },
       );
       // Send notification to operator
       await Notification.create({

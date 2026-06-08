@@ -71,12 +71,10 @@ exports.validateCoupon = async (req, res) => {
 
     // Check usage limit
     if (coupon.usageLimit > 0 && coupon.usedCount >= coupon.usageLimit) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "This coupon has reached its usage limit",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "This coupon has reached its usage limit",
+      });
     }
 
     // Check minimum guests
@@ -179,15 +177,23 @@ exports.createCoupon = async (req, res) => {
       description: (description || "").trim(),
     });
 
+    // Alert wishlisted users about new coupon
+    const { alertWishlistedUsers } = require("./wishlistAlertController");
+    const discountText =
+      type === "percentage" ? `${value}% off` : `Rs.${value} off`;
+    alertWishlistedUsers(
+      batch.packageId,
+      `New coupon: ${code.trim().toUpperCase()}`,
+      `Use code ${code.trim().toUpperCase()} for ${discountText}! Limited time offer.`,
+    );
+
     res.status(201).json({ success: true, coupon });
   } catch (err) {
     if (err.code === 11000) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "A coupon with this code already exists for this batch",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "A coupon with this code already exists for this batch",
+      });
     }
     res.status(400).json({ success: false, message: err.message });
   }

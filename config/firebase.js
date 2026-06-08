@@ -37,7 +37,7 @@ async function sendNotification(fcmToken, title, body, data = {}) {
         notification: {
           sound: "default",
           channelId: "tripreel_notifications",
-          icon: "ic_launcher",
+          icon: "ic_notification",
           color: "#1F8A70",
           ...(data.imageUrl ? { imageUrl: data.imageUrl } : {}),
         },
@@ -71,7 +71,7 @@ async function sendMulticast(fcmTokens, title, body, data = {}) {
         notification: {
           sound: "default",
           channelId: "tripreel_notifications",
-          icon: "ic_launcher",
+          icon: "ic_notification",
           color: "#1F8A70",
           ...(data.imageUrl ? { imageUrl: data.imageUrl } : {}),
         },

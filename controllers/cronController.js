@@ -245,6 +245,104 @@ async function runCronJobs() {
     results.errors.push(`Review reminder job: ${err.message}`);
   }
 
+  // ── Job 5: Wishlist urgency alerts (low seats, deadline tomorrow) ──────────
+  try {
+    const { notifyUser } = require("./notificationController");
+    const Wishlist = require("../models/Wishlist");
+    const Notification = require("../models/Notification");
+
+    const wishlists = await Wishlist.find({}).populate("packages", "_id title");
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const tomorrow = new Date(today.getTime() + 24 * 60 * 60 * 1000);
+
+    for (const wishlist of wishlists) {
+      const userId = wishlist.user;
+
+      // Check how many alerts sent today (max 2 per user)
+      const todayAlerts = await Notification.countDocuments({
+        recipientId: userId,
+        type: "offer",
+        createdAt: { $gte: today },
+      });
+      if (todayAlerts >= 2) continue;
+
+      for (const pkg of wishlist.packages || []) {
+        if (todayAlerts >= 2) break;
+        const packageId = pkg._id || pkg;
+        const packageTitle = pkg.title || "a package you saved";
+
+        // Find upcoming active batches for this package
+        const upcomingBatches = await Batch.find({
+          packageId,
+          isActive: true,
+          startDate: { $gt: now },
+        });
+
+        for (const batch of upcomingBatches) {
+          if (todayAlerts >= 2) break;
+          const seatsLeft = (batch.totalSeats || 0) - (batch.bookedSeats || 0);
+          const deadlineDate = batch.bookingDeadline
+            ? new Date(batch.bookingDeadline)
+            : null;
+
+          // Low seats alert (5 or fewer)
+          if (seatsLeft > 0 && seatsLeft <= 5) {
+            const alreadySent = await Notification.findOne({
+              recipientId: userId,
+              type: "offer",
+              body: { $regex: `${seatsLeft} seat` },
+              createdAt: { $gte: today },
+            });
+            if (!alreadySent) {
+              notifyUser(
+                userId,
+                `Only ${seatsLeft} seats left!`,
+                `${packageTitle} has only ${seatsLeft} seats remaining. Book now before it's full!`,
+                {
+                  type: "offer",
+                  packageId: packageId.toString(),
+                  screen: "PackageDetail",
+                },
+              );
+              results.urgencyAlerts = (results.urgencyAlerts || 0) + 1;
+              break;
+            }
+          }
+
+          // Booking deadline tomorrow
+          if (
+            deadlineDate &&
+            deadlineDate >= today &&
+            deadlineDate < tomorrow
+          ) {
+            const alreadySent = await Notification.findOne({
+              recipientId: userId,
+              type: "offer",
+              body: { $regex: "deadline" },
+              createdAt: { $gte: today },
+            });
+            if (!alreadySent) {
+              notifyUser(
+                userId,
+                "Booking deadline tomorrow!",
+                `Last chance to book ${packageTitle}! Booking closes tomorrow.`,
+                {
+                  type: "offer",
+                  packageId: packageId.toString(),
+                  screen: "PackageDetail",
+                },
+              );
+              results.urgencyAlerts = (results.urgencyAlerts || 0) + 1;
+              break;
+            }
+          }
+        }
+      }
+    }
+  } catch (err) {
+    results.errors.push(`Urgency alerts job: ${err.message}`);
+  }
+
   return results;
 }
 

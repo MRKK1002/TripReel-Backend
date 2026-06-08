@@ -58,6 +58,7 @@ app.use("/api/reports", require("./routes/reportRoutes"));
 app.use("/api/notifications", require("./routes/notificationRoutes"));
 app.use("/api/chat", require("./routes/chatRoutes"));
 app.use("/api/sidebar-counts", require("./routes/sidebarCountsRoutes"));
+app.use("/api/campaigns", require("./routes/campaignRoutes"));
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
@@ -89,12 +90,24 @@ mongoose
     const cron = require("node-cron");
     const { runCronJobs } = require("./controllers/cronController");
 
-    // Runs every 6 hours (00:00, 06:00, 12:00, 18:00) for timely notifications
-    cron.schedule("0 */6 * * *", async () => {
+    // Runs at 10:00 AM daily (IST) for trip reminders + midnight for auto-complete
+    cron.schedule("0 10 * * *", async () => {
       try {
         const result = await runCronJobs();
         console.log(
-          `\u2705 Cron: ${result.completed} completed, ${result.cancelled} cancelled, ${result.reminders || 0} reminders, ${result.reviewReminders || 0} review reminders`,
+          `\u2705 Cron (10AM): ${result.completed} completed, ${result.cancelled} cancelled, ${result.reminders || 0} reminders, ${result.reviewReminders || 0} review reminders`,
+        );
+      } catch (err) {
+        console.error("\u274C Cron error:", err.message);
+      }
+    });
+
+    // Also run at midnight for auto-complete and cancellations
+    cron.schedule("0 0 * * *", async () => {
+      try {
+        const result = await runCronJobs();
+        console.log(
+          `\u2705 Cron (midnight): ${result.completed} completed, ${result.cancelled} cancelled`,
         );
       } catch (err) {
         console.error("\u274C Cron error:", err.message);

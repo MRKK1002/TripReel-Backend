@@ -58,8 +58,10 @@ exports.adminSendNotification = async (req, res) => {
       return res.json({ success: true });
     }
 
-    // Send to ALL users
-    const users = await User.find({}).select("_id fcmToken");
+    // Send to ALL users (exclude admins)
+    const users = await User.find({ role: { $ne: "admin" } }).select(
+      "_id fcmToken",
+    );
     const tokens = [];
 
     for (const user of users) {
@@ -169,10 +171,20 @@ exports.getOperatorNotifications = async (req, res) => {
 exports.markAllRead = async (req, res) => {
   try {
     const userId = req.user?._id || req.operator?._id;
-    await Notification.updateMany(
-      { recipientId: userId, read: false },
-      { read: true },
-    );
+    const isAdmin = req.user?.role === "admin";
+
+    // For admin, mark ALL admin notifications as read (not just by recipientId)
+    if (isAdmin) {
+      await Notification.updateMany(
+        { recipientType: "admin", read: false },
+        { read: true },
+      );
+    } else {
+      await Notification.updateMany(
+        { recipientId: userId, read: false },
+        { read: true },
+      );
+    }
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
