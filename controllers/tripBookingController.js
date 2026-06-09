@@ -355,9 +355,6 @@ exports.getBookingById = async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 };
-
-// ── Admin ─────────────────────────────────────────────────────────────────────
-
 // GET /api/trip-bookings  — admin: all bookings
 exports.adminGetAllBookings = async (req, res) => {
   try {
