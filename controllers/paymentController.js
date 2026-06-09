@@ -1,6 +1,9 @@
 const Razorpay = require("razorpay");
 const crypto = require("crypto");
-const { sendBookingConfirmation, sendPaymentReceipt } = require("../utils/sendMail");
+const {
+  sendBookingConfirmation,
+  sendPaymentReceipt,
+} = require("../utils/sendMail");
 
 // Initialize lazily so dotenv has time to load
 let razorpay;
@@ -123,12 +126,14 @@ exports.verifyPayment = async (req, res) => {
       const fakeRes = {
         status: (code) => ({
           json: (data) => {
-            if (code >= 400) reject(data);
+            if (code >= 400)
+              reject(new Error(data.message || "Booking creation failed"));
             else resolve(data);
           },
         }),
+        json: (data) => resolve(data),
       };
-      tripBookingController.createBooking(fakeReq, fakeRes);
+      tripBookingController.createBooking(fakeReq, fakeRes).catch(reject);
     });
 
     res.status(200).json({
@@ -138,63 +143,7 @@ exports.verifyPayment = async (req, res) => {
       paymentId: razorpay_payment_id,
     });
 
-    // Send confirmation emails (non-blocking — don't fail the response)
-    const userEmail = req.user.email;
-    const userName = req.user.name || "Traveler";
-    const amountInRupees = order.amount / 100;
-
-    if (userEmail) {
-      // Fetch package name for email
-      let packageName = "Trip";
-      try {
-        const Package = require("../models/Package");
-        const pkg = await Package.findById(packageId);
-        if (pkg) packageName = pkg.title || pkg.name || "Trip";
-      } catch {}
-
-      const Batch = require("../models/Batch");
-      let batchDate = "Upcoming";
-      try {
-        const batchDoc = await Batch.findById(batchId);
-        if (batchDoc?.startDate) {
-          batchDate = new Date(batchDoc.startDate).toLocaleDateString("en-IN", {
-            day: "2-digit",
-            month: "short",
-            year: "numeric",
-          });
-        }
-      } catch {}
-
-      // Send booking confirmation
-      sendBookingConfirmation({
-        to: userEmail,
-        userName,
-        bookingDetails: {
-          packageName,
-          batchDate,
-          seats: Number(seats) || 1,
-          totalAmount: amountInRupees,
-          paymentId: razorpay_payment_id,
-        },
-      }).catch((err) => console.error("Booking email failed:", err.message));
-
-      // Send payment receipt
-      sendPaymentReceipt({
-        to: userEmail,
-        userName,
-        paymentDetails: {
-          amount: amountInRupees,
-          paymentId: razorpay_payment_id,
-          orderId: razorpay_order_id,
-          packageName,
-          date: new Date().toLocaleDateString("en-IN", {
-            day: "2-digit",
-            month: "short",
-            year: "numeric",
-          }),
-        },
-      }).catch((err) => console.error("Receipt email failed:", err.message));
-    }
+    // Email is already sent by createBooking — no need to send again here
   } catch (err) {
     console.error("Payment verification error:", err);
     res.status(500).json({

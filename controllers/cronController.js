@@ -158,6 +158,24 @@ async function runCronJobs() {
               screen: "BookingDetails",
             },
           );
+          // Send email reminder
+          try {
+            const User = require("../models/User");
+            const user = await User.findById(booking.userId).select(
+              "name email",
+            );
+            if (user?.email) {
+              const { sendTripReminder } = require("../utils/sendMail");
+              sendTripReminder({
+                to: user.email,
+                userName: user.name || "Traveler",
+                tripDetails: {
+                  packageName: tripName,
+                  batchDate: snap.batchLabel || "",
+                },
+              });
+            }
+          } catch {}
           results.reminders = (results.reminders || 0) + 1;
         } else if (daysUntil === 0) {
           notifyUser(
@@ -213,6 +231,21 @@ async function runCronJobs() {
               screen: "ReviewScreen",
             },
           );
+          // Send review request email
+          try {
+            const User = require("../models/User");
+            const user = await User.findById(booking.userId).select(
+              "name email",
+            );
+            if (user?.email) {
+              const { sendReviewRequest } = require("../utils/sendMail");
+              sendReviewRequest({
+                to: user.email,
+                userName: user.name || "Traveler",
+                tripDetails: { packageName: tripName },
+              });
+            }
+          } catch {}
           results.reviewReminders = (results.reviewReminders || 0) + 1;
         } else if (daysSinceEnd === 2) {
           notifyUser(

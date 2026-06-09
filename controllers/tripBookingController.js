@@ -305,6 +305,44 @@ exports.createBooking = async (req, res) => {
       { type: "new_booking", bookingId: booking._id.toString() },
     );
 
+    // Send booking confirmation email
+    try {
+      const { sendBookingConfirmation } = require("../utils/sendMail");
+      const { Operator } = require("../models/Operator");
+      const operator = await Operator.findById(pkg.operatorId).select(
+        "businessName contactName phone",
+      );
+      const fmtDate = (d) =>
+        d
+          ? new Date(d).toLocaleDateString("en-IN", {
+              day: "2-digit",
+              month: "short",
+              year: "numeric",
+            })
+          : "-";
+      sendBookingConfirmation({
+        to: req.user.email,
+        userName: req.user.name || "Traveler",
+        bookingDetails: {
+          bookingId: booking.bookingId,
+          userName: req.user.name || "Traveler",
+          packageName: pkg.title,
+          packageLocation: pkg.location,
+          batchDate: `${fmtDate(batch.startDate)} - ${fmtDate(batch.endDate)}`,
+          seats: booking.seats,
+          totalAmount: booking.pricing.totalAmount,
+          travelers: req.body.travelers || booking.travelers || [],
+          itinerary: pkg.itinerary || [],
+          inclusions: pkg.inclusions || [],
+          operatorName: operator?.businessName || operator?.contactName,
+          operatorPhone: operator?.phone,
+          paymentId: req.body.paymentId || "",
+        },
+      });
+    } catch (emailErr) {
+      console.warn("Booking email failed:", emailErr.message);
+    }
+
     res.status(201).json({ success: true, booking });
   } catch (err) {
     res.status(400).json({ success: false, message: err.message });
@@ -615,6 +653,30 @@ exports.cancelBooking = async (req, res) => {
       `A booking for ${snap.packageTitle || "your package"} (${booking.seats} seat${booking.seats > 1 ? "s" : ""}) was cancelled by user.`,
       { type: "booking_cancelled", bookingId: booking._id.toString() },
     );
+
+    // Send cancellation email to user
+    try {
+      const { sendMail } = require("../utils/sendMail");
+      const User = require("../models/User");
+      const user = await User.findById(booking.userId).select("name email");
+      if (user?.email) {
+        sendMail({
+          to: user.email,
+          subject: `Booking Cancelled - ${snap.packageTitle || "Trip"}`,
+          text: `Hi ${user.name}, your booking ${booking.bookingId} has been cancelled.${refundAmount > 0 ? ` Refund of Rs.${refundAmount} (${refundPercent}%) will be processed.` : ""}`,
+          html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;"><h2 style="color:#EF4444;">Booking Cancelled</h2><p>Hi <strong>${user.name}</strong>,</p><p>Your booking <strong>${booking.bookingId}</strong> for <strong>${snap.packageTitle || "trip"}</strong> has been cancelled.</p>${refundAmount > 0 ? `<p style="background:#F0FDF4;padding:12px;border-radius:8px;color:#065F46;"><strong>Refund:</strong> Rs.${refundAmount.toLocaleString("en-IN")} (${refundPercent}%) will be processed within 5-7 business days.</p>` : ""}<p style="color:#6B7280;font-size:13px;">If you have questions, contact us via the app.</p><p>Team TripReel</p></div>`,
+        });
+      }
+    } catch {}
+
+    // Close chat window for this booking
+    try {
+      const Conversation = require("../models/Conversation");
+      await Conversation.updateMany(
+        { bookingId: booking._id },
+        { isActive: false },
+      );
+    } catch {}
 
     res.json({
       success: true,

@@ -62,6 +62,8 @@ exports.getPublicSettings = async (req, res) => {
       "default_cancellation_policy",
       "default_refund_policy",
       "default_terms",
+      "splash_image_url",
+      "splash_images",
     ];
     const docs = await PlatformSettings.find({ key: { $in: keys } });
     const result = {};

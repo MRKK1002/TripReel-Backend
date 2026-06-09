@@ -59,6 +59,7 @@ app.use("/api/notifications", require("./routes/notificationRoutes"));
 app.use("/api/chat", require("./routes/chatRoutes"));
 app.use("/api/sidebar-counts", require("./routes/sidebarCountsRoutes"));
 app.use("/api/campaigns", require("./routes/campaignRoutes"));
+app.use("/api/app-screens", require("./routes/appScreenRoutes"));
 app.use("/api/payments", require("./routes/paymentRoutes"));
 
 // ── Health check ──────────────────────────────────────────────────────────────
