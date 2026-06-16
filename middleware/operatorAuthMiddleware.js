@@ -26,9 +26,13 @@ exports.operatorProtect = async (req, res, next) => {
     }
 
     if (operator.onboardingState === "SUSPENDED") {
-      // Allow access to auth/me, notifications, and profile but block other operations
-      // The frontend will show the suspended status page
-      // Only block write operations at route level, not here
+      // Suspended operators can only read (GET) — block all write operations
+      if (req.method !== "GET") {
+        return res.status(403).json({
+          success: false,
+          message: "Your account is suspended. You cannot perform this action.",
+        });
+      }
     }
 
     req.operator = operator;

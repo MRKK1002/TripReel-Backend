@@ -30,7 +30,11 @@ exports.getAllWishlists = async (req, res) => {
 exports.getMyWishlists = async (req, res) => {
   try {
     const wishlists = await Wishlist.find({ user: req.user.id })
-      .populate("packages", "title image_url images price location")
+      .populate({
+        path: "packages",
+        select: "title image_url images price location isActive",
+        match: { isActive: true },
+      })
       .sort({ createdAt: -1 });
     res.json({ success: true, count: wishlists.length, wishlists });
   } catch (err) {
