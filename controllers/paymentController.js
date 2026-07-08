@@ -26,6 +26,9 @@ exports.createOrder = async (req, res) => {
     const {
       packageId,
       batchId,
+      bookingMode,
+      flexStartDate,
+      flexAvailabilityId,
       seats,
       adults,
       children,
@@ -33,10 +36,12 @@ exports.createOrder = async (req, res) => {
       addonDays,
     } = req.body;
 
-    if (!packageId || !batchId) {
+    const isFlexible = bookingMode === "flexible";
+
+    if (!packageId || (!batchId && !isFlexible)) {
       return res.status(400).json({
         success: false,
-        message: "packageId and batchId are required",
+        message: "packageId and batchId (or bookingMode=flexible) are required",
       });
     }
 
@@ -47,7 +52,9 @@ exports.createOrder = async (req, res) => {
       authoritativeAmount =
         await tripBookingController.computeAuthoritativePricing({
           packageId,
-          batchId,
+          batchId: isFlexible ? null : batchId,
+          bookingMode: isFlexible ? "flexible" : "batch",
+          flexAvailabilityId: isFlexible ? flexAvailabilityId : undefined,
           seats,
           adults,
           children,
@@ -78,7 +85,10 @@ exports.createOrder = async (req, res) => {
       receipt: `tripreel_${Date.now()}`,
       notes: {
         packageId: String(packageId),
-        batchId: String(batchId),
+        batchId: batchId ? String(batchId) : "",
+        bookingMode: isFlexible ? "flexible" : "batch",
+        flexStartDate: flexStartDate || "",
+        flexAvailabilityId: flexAvailabilityId || "",
         seats: String(seats || 1),
         adults: adults != null ? String(adults) : "",
         children: children != null ? String(children) : "0",
@@ -210,6 +220,9 @@ exports.verifyPayment = async (req, res) => {
       body: {
         packageId,
         batchId,
+        bookingMode: notes.bookingMode || "batch",
+        flexStartDate: notes.flexStartDate || undefined,
+        flexAvailabilityId: notes.flexAvailabilityId || undefined,
         seats: Number(seats) || 1,
         adults: notes.adults ? Number(notes.adults) : undefined,
         children: notes.children ? Number(notes.children) : 0,
@@ -218,8 +231,6 @@ exports.verifyPayment = async (req, res) => {
         paymentId: razorpay_payment_id,
         razorpayOrderId: razorpay_order_id,
         addonDays,
-        // Meeting time/place chosen by the user — metadata only (not priced),
-        // safe to take from the client request body.
         addonSchedule: req.body.addonSchedule || null,
       },
     };

@@ -201,6 +201,19 @@ const packageSchema = new mongoose.Schema(
       min: 0,
     },
     videos: [{ type: String }],
+    // Sample work from photographer / reelmaker — managed by admin
+    sampleMedia: [
+      {
+        url: { type: String, required: true },
+        type: { type: String, enum: ["photo", "video"], default: "video" },
+        category: {
+          type: String,
+          enum: ["photographer", "reelmaker"],
+          default: "reelmaker",
+        },
+        thumbnail: { type: String },
+      },
+    ],
     hotelDetails: packageHotelSchema,
     transportDetails: packageTransportSchema,
     pricing: packagePricingSchema,

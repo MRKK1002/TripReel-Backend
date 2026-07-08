@@ -64,6 +64,8 @@ function calcPricing({
 async function computeAuthoritativePricing({
   packageId,
   batchId,
+  bookingMode,
+  flexAvailabilityId,
   seats,
   adults,
   children,
@@ -71,12 +73,31 @@ async function computeAuthoritativePricing({
   addonDays,
 }) {
   const numSeats = Math.max(1, Number(seats) || 1);
-  const batch = await Batch.findById(batchId);
-  if (!batch || !batch.isActive) throw new Error("Batch not found or inactive");
   const pkg = await Package.findById(packageId);
   if (!pkg) throw new Error("Package not found");
-  if (String(batch.packageId) !== String(packageId))
-    throw new Error("Batch does not belong to this package");
+
+  let adultPrice, childPrice;
+
+  if (bookingMode === "flexible") {
+    // Flexible booking — get pricing from FlexibleAvailability record
+    const FlexibleAvailability = require("../models/FlexibleAvailability");
+    const flex = await FlexibleAvailability.findById(flexAvailabilityId);
+    if (!flex || !flex.isActive)
+      throw new Error("Flexible availability not found or inactive");
+    if (String(flex.packageId) !== String(packageId))
+      throw new Error("Flexible availability does not belong to this package");
+    adultPrice = flex.adultPrice;
+    childPrice = flex.childPrice || 0;
+  } else {
+    // Batch booking — existing flow
+    const batch = await Batch.findById(batchId);
+    if (!batch || !batch.isActive)
+      throw new Error("Batch not found or inactive");
+    if (String(batch.packageId) !== String(packageId))
+      throw new Error("Batch does not belong to this package");
+    adultPrice = batch.adultPrice;
+    childPrice = batch.childPrice || 0;
+  }
 
   // Resolve adult / child split (backward compatible — default all to adults)
   const numAdults = adults != null ? Math.max(0, Number(adults)) : numSeats;
@@ -104,7 +125,7 @@ async function computeAuthoritativePricing({
   const code = (couponCode || "").trim().toUpperCase();
   let discountAmount = 0;
   const fareSubtotalRaw = Math.round(
-    batch.adultPrice * numAdults + (batch.childPrice || 0) * numChildren,
+    adultPrice * numAdults + (childPrice || 0) * numChildren,
   );
   if (code) {
     const Coupon = require("../models/Coupon");
@@ -136,8 +157,8 @@ async function computeAuthoritativePricing({
   }
 
   const pricing = calcPricing({
-    adultPrice: batch.adultPrice,
-    childPrice: batch.childPrice || 0,
+    adultPrice,
+    childPrice: childPrice || 0,
     adults: numAdults,
     children: numChildren,
     seats: numSeats,
@@ -389,15 +410,16 @@ exports.createBooking = async (req, res) => {
 
     const { packageId, batchId, seats = 1 } = req.body;
 
-    if (!packageId || !batchId) {
+    if (!packageId || (!batchId && req.body.bookingMode !== "flexible")) {
       return res.status(400).json({
         success: false,
-        message: "packageId and batchId are required",
+        message: "packageId and batchId (or bookingMode=flexible) are required",
       });
     }
 
+    const isFlexible = req.body.bookingMode === "flexible";
+
     const numSeats = Math.max(1, Number(seats) || 1);
-    // Adult / child split for pricing (backward compatible — defaults to all adults)
     const hasSplit = req.body.adults != null;
     const numAdults = hasSplit
       ? Math.max(0, Number(req.body.adults) || 0)
@@ -405,60 +427,87 @@ exports.createBooking = async (req, res) => {
     const numChildren = hasSplit
       ? Math.max(0, Number(req.body.children) || 0)
       : 0;
-    const batch = await Batch.findById(batchId);
-    if (!batch || !batch.isActive) {
-      return res
-        .status(404)
-        .json({ success: false, message: "Batch not found or not available" });
-    }
 
-    const now = new Date();
+    let batch = null;
+    let flexRecord = null;
+    let adultPrice, childPrice, operatorId;
 
-    if (batch.bookingDeadline < now) {
-      return res.status(400).json({
-        success: false,
-        message: "Booking deadline has passed for this batch",
-      });
+    if (isFlexible) {
+      // ── Flexible booking — validate flex availability ──────────────────────
+      const FlexibleAvailability = require("../models/FlexibleAvailability");
+      flexRecord = await FlexibleAvailability.findById(
+        req.body.flexAvailabilityId,
+      );
+      if (!flexRecord || !flexRecord.isActive) {
+        return res.status(404).json({
+          success: false,
+          message: "Flexible availability not found or inactive",
+        });
+      }
+      if (String(flexRecord.packageId) !== String(packageId)) {
+        return res.status(400).json({
+          success: false,
+          message: "Flex record does not belong to this package",
+        });
+      }
+      adultPrice = flexRecord.adultPrice;
+      childPrice = flexRecord.childPrice || 0;
+      operatorId = flexRecord.operatorId;
+    } else {
+      // ── Batch booking — existing flow ──────────────────────────────────────
+      batch = await Batch.findById(batchId);
+      if (!batch || !batch.isActive) {
+        return res.status(404).json({
+          success: false,
+          message: "Batch not found or not available",
+        });
+      }
+      const now = new Date();
+      if (batch.bookingDeadline < now) {
+        return res.status(400).json({
+          success: false,
+          message: "Booking deadline has passed for this batch",
+        });
+      }
+      if (batch.startDate <= now) {
+        return res
+          .status(400)
+          .json({ success: false, message: "This trip has already started" });
+      }
+      if (String(batch.packageId) !== String(packageId)) {
+        return res.status(400).json({
+          success: false,
+          message: "Batch does not belong to this package",
+        });
+      }
+      const available = batch.totalSeats - batch.bookedSeats;
+      if (numSeats > available) {
+        return res.status(400).json({
+          success: false,
+          message: `Only ${available} seat${available !== 1 ? "s" : ""} available`,
+        });
+      }
+      const seatReserved = await Batch.findOneAndUpdate(
+        {
+          _id: batchId,
+          $expr: {
+            $lte: [{ $add: ["$bookedSeats", numSeats] }, "$totalSeats"],
+          },
+        },
+        { $inc: { bookedSeats: numSeats } },
+        { new: true },
+      );
+      if (!seatReserved) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Not enough seats available — someone else may have booked just now.",
+        });
+      }
+      adultPrice = batch.adultPrice;
+      childPrice = batch.childPrice || 0;
+      operatorId = batch.operatorId;
     }
-    if (batch.startDate <= now) {
-      return res
-        .status(400)
-        .json({ success: false, message: "This trip has already started" });
-    }
-    if (String(batch.packageId) !== String(packageId)) {
-      return res.status(400).json({
-        success: false,
-        message: "Batch does not belong to this package",
-      });
-    }
-
-    const available = batch.totalSeats - batch.bookedSeats;
-    if (numSeats > available) {
-      return res.status(400).json({
-        success: false,
-        message: `Only ${available} seat${available !== 1 ? "s" : ""} available`,
-      });
-    }
-
-    // Atomic seat reservation: only succeeds if enough seats remain at DB level
-    // (prevents two concurrent bookings from overselling)
-    const seatReserved = await Batch.findOneAndUpdate(
-      {
-        _id: batchId,
-        $expr: { $lte: [{ $add: ["$bookedSeats", numSeats] }, "$totalSeats"] },
-      },
-      { $inc: { bookedSeats: numSeats } },
-      { new: true },
-    );
-    if (!seatReserved) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Not enough seats available — someone else may have booked just now.",
-      });
-    }
-
-    // User CAN book same batch multiple times (e.g. adding more friends later)
 
     // ── Fetch package ──────────────────────────────────────────────────────
     const pkg = await Package.findById(packageId);
@@ -498,7 +547,7 @@ exports.createBooking = async (req, res) => {
     let discountAmount = 0;
     let appliedCouponId = null;
     const fareSubtotalRaw = Math.round(
-      batch.adultPrice * numAdults + (batch.childPrice || 0) * numChildren,
+      adultPrice * numAdults + (childPrice || 0) * numChildren,
     );
 
     if (couponCode) {
@@ -551,8 +600,8 @@ exports.createBooking = async (req, res) => {
 
     // ── Calculate pricing (snapshotted forever) ────────────────────────────
     const pricing = calcPricing({
-      adultPrice: batch.adultPrice,
-      childPrice: batch.childPrice || 0,
+      adultPrice,
+      childPrice: childPrice || 0,
       adults: numAdults,
       children: numChildren,
       seats: numSeats,
@@ -569,18 +618,30 @@ exports.createBooking = async (req, res) => {
       packageTitle: pkg.title,
       packageLocation: pkg.location,
       packageImageUrl: pkg.image_url || "",
-      batchLabel: batch.label || "",
-      startDate: batch.startDate,
-      endDate: batch.endDate,
-      adultPrice: batch.adultPrice,
+      batchLabel: batch ? batch.label || "" : "Flexible",
+      startDate: isFlexible
+        ? req.body.flexStartDate || new Date()
+        : batch.startDate,
+      endDate: isFlexible
+        ? (() => {
+            const d = new Date(req.body.flexStartDate || Date.now());
+            d.setDate(d.getDate() + (pkg.itinerary?.length || 5) - 1);
+            return d;
+          })()
+        : batch.endDate,
+      adultPrice,
     };
 
     // ── Create booking — auto-confirmed (payment simulated) ──────────────────
     const booking = await TripBooking.create({
       userId: req.user._id,
       packageId,
-      batchId,
-      operatorId: batch.operatorId,
+      batchId: isFlexible ? undefined : batchId,
+      bookingMode: isFlexible ? "flexible" : "batch",
+      flexStartDate: isFlexible ? req.body.flexStartDate : undefined,
+      flexEndDate: isFlexible ? snapshot.endDate : undefined,
+      flexAvailabilityId: isFlexible ? req.body.flexAvailabilityId : undefined,
+      operatorId,
       seats: numSeats,
       status: "CONFIRMED", // auto-confirmed — no admin approval needed
       travelers: Array.isArray(req.body.travelers)

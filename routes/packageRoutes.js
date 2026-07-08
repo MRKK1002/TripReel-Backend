@@ -40,6 +40,28 @@ router.delete("/operator/:id", operatorProtect, operatorDeletePackage);
 router.get("/admin/all", protect, restrictTo("admin"), adminGetAllPackages);
 router.patch("/:id/review", protect, restrictTo("admin"), reviewPackage);
 router.patch(
+  "/:id/sample-media",
+  protect,
+  restrictTo("admin"),
+  async (req, res) => {
+    try {
+      const Package = require("../models/Package");
+      const pkg = await Package.findByIdAndUpdate(
+        req.params.id,
+        { sampleMedia: req.body.sampleMedia || [] },
+        { new: true },
+      );
+      if (!pkg)
+        return res
+          .status(404)
+          .json({ success: false, message: "Package not found" });
+      res.json({ success: true, sampleMedia: pkg.sampleMedia });
+    } catch (err) {
+      res.status(500).json({ success: false, message: err.message });
+    }
+  },
+);
+router.patch(
   "/:id/suspend",
   protect,
   restrictTo("admin"),

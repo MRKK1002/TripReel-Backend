@@ -78,8 +78,21 @@ const tripBookingSchema = new mongoose.Schema(
     batchId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Batch",
-      required: true,
+      required: false, // not required for flexible bookings
       index: true,
+    },
+    // "batch" (default) or "flexible" — determines booking source
+    bookingMode: {
+      type: String,
+      enum: ["batch", "flexible"],
+      default: "batch",
+    },
+    // For flexible bookings — the chosen start date and matched availability record
+    flexStartDate: { type: Date },
+    flexEndDate: { type: Date },
+    flexAvailabilityId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "FlexibleAvailability",
     },
     operatorId: {
       type: mongoose.Schema.Types.ObjectId,

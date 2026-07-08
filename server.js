@@ -62,6 +62,10 @@ app.use("/api/operators", require("./routes/operatorRoutes"));
 
 // ── New booking system (Phase 1) ──────────────────────────────────────────────
 app.use("/api/batches", require("./routes/batchRoutes"));
+app.use(
+  "/api/flexible-availability",
+  require("./routes/flexibleAvailabilityRoutes"),
+);
 app.use("/api/trip-bookings", require("./routes/tripBookingRoutes"));
 app.use("/api/operator-bookings", require("./routes/operatorBookingRoutes"));
 app.use("/api/settings", require("./routes/platformSettingsRoutes"));

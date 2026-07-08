@@ -37,7 +37,40 @@ async function enrichWithBatchPrice(packages) {
     };
   });
 
-  // Attach batch price to each package
+  // Find cheapest active flexible availability for each package
+  const FlexibleAvailability = require("../models/FlexibleAvailability");
+  const flexData = await FlexibleAvailability.aggregate([
+    {
+      $match: {
+        packageId: { $in: packageIds },
+        isActive: true,
+        endDate: { $gte: now },
+      },
+    },
+    { $sort: { adultPrice: 1 } },
+    {
+      $group: {
+        _id: "$packageId",
+        flexAdultPrice: { $first: "$adultPrice" },
+        flexChildPrice: { $first: "$childPrice" },
+        flexStartDate: { $first: "$startDate" },
+        flexEndDate: { $last: "$endDate" },
+      },
+    },
+  ]);
+
+  const flexMap = {};
+  flexData.forEach((f) => {
+    flexMap[f._id.toString()] = {
+      flexAdultPrice: f.flexAdultPrice,
+      flexChildPrice: f.flexChildPrice || 0,
+      flexStartDate: f.flexStartDate,
+      flexEndDate: f.flexEndDate,
+      hasFlexibility: true,
+    };
+  });
+
+  // Attach batch price + flex info to each package
   return packages.map((pkg) => {
     const obj = pkg.toJSON ? pkg.toJSON() : { ...pkg };
     const id = (obj._id || "").toString();
@@ -45,6 +78,13 @@ async function enrichWithBatchPrice(packages) {
       obj.batchPrice = priceMap[id].batchPrice;
       obj.batchChildPrice = priceMap[id].childPrice;
       obj.nextBatchDate = priceMap[id].nextBatchDate;
+    }
+    if (flexMap[id]) {
+      obj.flexAdultPrice = flexMap[id].flexAdultPrice;
+      obj.flexChildPrice = flexMap[id].flexChildPrice;
+      obj.flexStartDate = flexMap[id].flexStartDate;
+      obj.flexEndDate = flexMap[id].flexEndDate;
+      obj.hasFlexibility = true;
     }
     return obj;
   });
@@ -75,9 +115,11 @@ exports.getAllPackages = async (req, res) => {
     const query = { isActive: true, status: { $in: ["APPROVED"] } };
 
     // Date range filter: dateFrom/dateTo or single date
+    // Check BOTH batches and flexible availability for matching dates
     const hasRange = dateFrom || dateTo;
     if (date || hasRange) {
       const Batch = require("../models/Batch");
+      const FlexibleAvailability = require("../models/FlexibleAvailability");
 
       const istOffset = 5.5 * 60 * 60 * 1000;
       const toISTDayStart = (str) => {
@@ -93,18 +135,17 @@ exports.getAllPackages = async (req, res) => {
 
       let startFilter;
       if (hasRange) {
-        // Range: batches that START anywhere in [dateFrom, dateTo]
         startFilter = {};
         if (dateFrom) startFilter.$gte = toISTDayStart(dateFrom);
         if (dateTo) startFilter.$lt = toISTDayEnd(dateTo);
       } else {
-        // Single day: batches that START on exactly that day
         startFilter = {
           $gte: toISTDayStart(date),
           $lt: toISTDayEnd(date),
         };
       }
 
+      // Find packages with matching batches
       const batchQuery = { isActive: true, startDate: startFilter };
       if (guests && Number(guests) > 0) {
         batchQuery.$expr = {
@@ -114,15 +155,34 @@ exports.getAllPackages = async (req, res) => {
           ],
         };
       }
-
       const matchingBatches = await Batch.find(batchQuery).select("packageId");
-      const packageIds = [
-        ...new Set(matchingBatches.map((b) => b.packageId.toString())),
-      ];
-      if (packageIds.length === 0) {
+      const batchPkgIds = matchingBatches.map((b) => b.packageId.toString());
+
+      // Find packages with flexible availability covering the searched date(s)
+      const flexQuery = { isActive: true };
+      if (hasRange) {
+        // Flex range overlaps with search range
+        flexQuery.startDate = {
+          $lte: dateTo ? toISTDayEnd(dateTo) : new Date(),
+        };
+        flexQuery.endDate = {
+          $gte: dateFrom ? toISTDayStart(dateFrom) : new Date(),
+        };
+      } else {
+        // Flex range covers the single date
+        flexQuery.startDate = { $lte: toISTDayEnd(date) };
+        flexQuery.endDate = { $gte: toISTDayStart(date) };
+      }
+      const matchingFlex =
+        await FlexibleAvailability.find(flexQuery).select("packageId");
+      const flexPkgIds = matchingFlex.map((f) => f.packageId.toString());
+
+      // Union of both
+      const allPkgIds = [...new Set([...batchPkgIds, ...flexPkgIds])];
+      if (allPkgIds.length === 0) {
         return res.json({ success: true, total: 0, page: 1, packages: [] });
       }
-      query._id = { $in: packageIds };
+      query._id = { $in: allPkgIds };
     }
 
     if (search) {

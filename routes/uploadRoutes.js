@@ -52,6 +52,31 @@ router.post("/", protect, restrictTo("admin"), (req, res) => {
   }
 });
 
+// POST /api/upload/demo-media — upload image/video for demo media (admin only)
+router.post(
+  "/demo-media",
+  protect,
+  restrictTo("admin"),
+  upload.single("file"),
+  (req, res) => {
+    try {
+      if (!req.file) {
+        return res
+          .status(400)
+          .json({ success: false, message: "File required" });
+      }
+      const relativePath = path.relative(
+        path.join(__dirname, "../uploads"),
+        req.file.path,
+      );
+      const url = `${getBaseUrl()}/uploads/${relativePath.replace(/\\/g, "/")}`;
+      res.json({ success: true, url });
+    } catch (err) {
+      res.status(500).json({ success: false, message: err.message });
+    }
+  },
+);
+
 // POST /api/upload/chat — multipart image upload for chat (any logged-in user)
 router.post("/chat", protect, upload.single("image"), (req, res) => {
   try {

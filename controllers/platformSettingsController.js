@@ -64,6 +64,7 @@ exports.getPublicSettings = async (req, res) => {
       "default_terms",
       "splash_image_url",
       "splash_images",
+      "sample_demo_media",
     ];
     const docs = await PlatformSettings.find({ key: { $in: keys } });
     const result = {};
@@ -117,7 +118,11 @@ exports.updateSetting = async (req, res) => {
 
     const numVal = Number(value);
     const numericKeys = ["platform_fee_percent", "gst_percent"];
-    const arrayKeys = ["cancellation_refund_slabs"];
+    const arrayKeys = [
+      "cancellation_refund_slabs",
+      "sample_demo_media",
+      "splash_images",
+    ];
 
     let finalValue = value;
 
@@ -129,12 +134,10 @@ exports.updateSetting = async (req, res) => {
         });
       }
       if (numVal > 100) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            message: "Percentage value cannot exceed 100%",
-          });
+        return res.status(400).json({
+          success: false,
+          message: "Percentage value cannot exceed 100%",
+        });
       }
       finalValue = numVal;
     } else if (arrayKeys.includes(req.params.key)) {
