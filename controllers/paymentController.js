@@ -74,9 +74,15 @@ exports.createOrder = async (req, res) => {
     const amountInPaise = Math.round(authoritativeAmount * 100);
 
     // Store the booking context in notes so verify uses the SAME data that was priced
+    // Razorpay notes have a 512 char limit per value — compress addonDays
     let addonDaysStr = "";
     try {
-      addonDaysStr = addonDays ? JSON.stringify(addonDays) : "";
+      if (addonDays && Object.keys(addonDays).length > 0) {
+        // Compact format: "addonName:0,1,2|otherAddon:1,3"
+        addonDaysStr = Object.entries(addonDays)
+          .map(([name, days]) => `${name}:${(days || []).join(",")}`)
+          .join("|");
+      }
     } catch {}
 
     const options = {
@@ -94,7 +100,7 @@ exports.createOrder = async (req, res) => {
         children: children != null ? String(children) : "0",
         userId: req.user._id.toString(),
         couponCode: couponCode || "",
-        addonDays: addonDaysStr.slice(0, 480), // notes value cap
+        addonDays: addonDaysStr, // compact format fits in Razorpay notes
       },
     };
 
@@ -131,6 +137,16 @@ exports.verifyPayment = async (req, res) => {
       razorpay_signature,
       orderId,
     } = req.body;
+
+    console.log("[VERIFY DEBUG] Received:", {
+      razorpay_order_id,
+      razorpay_payment_id,
+      hasSignature: !!razorpay_signature,
+      orderId,
+      bodyKeys: Object.keys(req.body),
+      hasAddonDays: !!req.body.addonDays,
+      addonDays: req.body.addonDays,
+    });
 
     if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
       return res.status(400).json({
@@ -207,19 +223,43 @@ exports.verifyPayment = async (req, res) => {
     // Use addonDays from the order notes (priced server-side), not the client body
     let addonDays = null;
     try {
-      addonDays = notes.addonDays ? JSON.parse(notes.addonDays) : null;
+      if (notes.addonDays) {
+        // Try JSON first (legacy), then compact format "name:0,1|name2:2,3"
+        try {
+          addonDays = JSON.parse(notes.addonDays);
+        } catch {
+          // Parse compact format
+          addonDays = {};
+          notes.addonDays.split("|").forEach((part) => {
+            const [name, daysStr] = part.split(":");
+            if (name && daysStr) {
+              addonDays[name] = daysStr.split(",").map(Number);
+            }
+          });
+        }
+      }
     } catch {
       addonDays = null;
     }
 
     // Now create the actual booking using the existing tripBookingController logic
     const tripBookingController = require("./tripBookingController");
+    console.log("[VERIFY DEBUG] Creating booking with:", {
+      packageId: notes.packageId,
+      batchId: notes.batchId,
+      bookingMode: notes.bookingMode,
+      seats: notes.seats,
+      adults: notes.adults,
+      children: notes.children,
+      addonDays,
+      flexAvailabilityId: notes.flexAvailabilityId,
+    });
     const fakeReq = {
       user: req.user,
       _paymentVerified: true, // SECURITY: marks this as a payment-verified booking
       body: {
         packageId,
-        batchId,
+        batchId: batchId || null,
         bookingMode: notes.bookingMode || "batch",
         flexStartDate: notes.flexStartDate || undefined,
         flexAvailabilityId: notes.flexAvailabilityId || undefined,
@@ -259,7 +299,7 @@ exports.verifyPayment = async (req, res) => {
 
     // Email is already sent by createBooking — no need to send again here
   } catch (err) {
-    console.error("Payment verification error:", err);
+    console.error("[VERIFY DEBUG] FULL ERROR:", err.message, err.stack);
     res.status(500).json({
       success: false,
       message: err.message || "Payment verification failed",

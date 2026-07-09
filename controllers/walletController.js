@@ -250,7 +250,7 @@ exports.requestWithdrawal = async (req, res) => {
       amountRupees: amount,
       mode: method === "vpa" ? "UPI" : "IMPS",
       referenceId,
-      narration: "TripReel payout",
+      narration: "Trip Reel payout",
     });
 
     withdrawal.payoutId = payout.id || "";

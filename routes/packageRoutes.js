@@ -11,6 +11,7 @@ const {
   operatorCreatePackage,
   operatorUpdatePackage,
   operatorDeletePackage,
+  operatorToggleActive,
   adminTogglePackageSuspend,
   operatorGetReviews,
 } = require("../controllers/packageController");
@@ -35,6 +36,11 @@ router.put(
   operatorUpdatePackage,
 );
 router.delete("/operator/:id", operatorProtect, operatorDeletePackage);
+router.patch(
+  "/operator/:id/toggle-active",
+  operatorProtect,
+  operatorToggleActive,
+);
 
 // ── Admin routes ──────────────────────────────────────────────────────────────
 router.get("/admin/all", protect, restrictTo("admin"), adminGetAllPackages);

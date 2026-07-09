@@ -83,7 +83,7 @@ app.use("/api/payments", require("./routes/paymentRoutes"));
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
-  res.json({ message: "TripReel API is running", status: "OK" });
+  res.json({ message: "Trip Reel API is running", status: "OK" });
 });
 
 // ── Global error handler ──────────────────────────────────────────────────────
@@ -133,6 +133,7 @@ mongoose
       runWishlistAlerts,
       runSnapjaDispatch,
       runSnapjaStatusSync,
+      runSnapjaAutoCancel,
       runCronJobs,
     } = require("./controllers/cronController");
 
@@ -170,9 +171,9 @@ mongoose
       { timezone: "Asia/Kolkata" },
     );
 
-    // Every 3 hours — dispatch held Snapja addon money for locked-in bookings
+    // Every 5 minutes — dispatch Snapja addon bookings immediately after user books
     cron.schedule(
-      "0 */3 * * *",
+      "*/5 * * * *",
       async () => {
         try {
           const result = await runSnapjaDispatch();
@@ -183,6 +184,24 @@ mongoose
           }
         } catch (err) {
           console.error("❌ Cron Snapja dispatch error:", err.message);
+        }
+      },
+      { timezone: "Asia/Kolkata" },
+    );
+
+    // 11:55 PM IST daily — auto-cancel unassigned Snapja addons 1 day before trip
+    cron.schedule(
+      "55 23 * * *",
+      async () => {
+        try {
+          const result = await runSnapjaAutoCancel();
+          if (result.cancelled) {
+            console.log(
+              `✅ Cron (Snapja auto-cancel): ${result.cancelled} addons cancelled (no creator assigned, trip tomorrow)`,
+            );
+          }
+        } catch (err) {
+          console.error("❌ Cron Snapja auto-cancel error:", err.message);
         }
       },
       { timezone: "Asia/Kolkata" },

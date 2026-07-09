@@ -35,7 +35,7 @@ function generateBookingPdf(bookingDetails) {
       .fontSize(24)
       .fillColor("#FFFFFF")
       .font("Helvetica-Bold")
-      .text("TripReel", leftM, 25);
+      .text("Trip Reel", leftM, 25);
     doc
       .fontSize(11)
       .fillColor("rgba(255,255,255,0.8)")
@@ -267,7 +267,7 @@ function generateBookingPdf(bookingDetails) {
       .fillColor("#9CA3AF")
       .font("Helvetica")
       .text(
-        "TripReel | Your Travel Partner | support@tripreel.com",
+        "Trip Reel | Your Travel Partner | support@tripreel.com",
         leftM,
         footerY + 8,
         { width: contentW, align: "center" },

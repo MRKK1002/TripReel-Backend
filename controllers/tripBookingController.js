@@ -282,14 +282,18 @@ async function processCancellationRefund(
 
   // ── Compute the split ──────────────────────────────────────────────────────
   const fareRefund = Math.round((netFare * refundPercent) / 100);
-  const gstRefund = Math.round((gst * refundPercent) / 100);
-  // Addon: refundable only while still held (not yet dispatched to Snapja)
-  const addonRefundable = !booking.addonDispatched;
+  // Split GST: portion on fare vs portion on addons
+  const gstOnFare =
+    netFare > 0 ? Math.round((gst * netFare) / (netFare + addon)) : 0;
+  const gstOnAddon = gst - gstOnFare;
+  const gstFareRefund = Math.round((gstOnFare * refundPercent) / 100);
+  // Addon: always fully refundable (with its GST)
+  const addonRefundable = true; // addons always get full refund on cancellation
   const addonRefund = fullRefund
-    ? addon // operator/admin cancel → always refund addon (platform absorbs if dispatched)
-    : addonRefundable
-      ? addon
-      : 0;
+    ? addon // operator/admin cancel → always refund addon
+    : addon; // user cancel → also full refund on addons
+  const gstAddonRefund = addonRefund > 0 ? gstOnAddon : 0;
+  const gstRefund = gstFareRefund + gstAddonRefund;
 
   const retainedFare = netFare - fareRefund;
   const platformFeeOnRetained = fullRefund
@@ -675,14 +679,19 @@ exports.createBooking = async (req, res) => {
     // Auto-create chat conversation for this booking
     const Conversation = require("../models/Conversation");
     const Message = require("../models/Message");
-    const endDate = new Date(batch.endDate);
-    const expiresAt = new Date(endDate.getTime() + 2 * 24 * 60 * 60 * 1000); // endDate + 2 days
-    const startFmt = new Date(batch.startDate).toLocaleDateString("en-IN", {
+    const tripEnd = isFlexible
+      ? new Date(snapshot.endDate)
+      : new Date(batch.endDate);
+    const tripStart = isFlexible
+      ? new Date(snapshot.startDate)
+      : new Date(batch.startDate);
+    const expiresAt = new Date(tripEnd.getTime() + 2 * 24 * 60 * 60 * 1000); // endDate + 2 days
+    const startFmt = tripStart.toLocaleDateString("en-IN", {
       day: "2-digit",
       month: "short",
       year: "numeric",
     });
-    const endFmt = new Date(batch.endDate).toLocaleDateString("en-IN", {
+    const endFmt = tripEnd.toLocaleDateString("en-IN", {
       day: "2-digit",
       month: "short",
       year: "numeric",
@@ -760,7 +769,9 @@ exports.createBooking = async (req, res) => {
           userName: req.user.name || "Traveler",
           packageName: pkg.title,
           packageLocation: pkg.location,
-          batchDate: `${fmtDate(batch.startDate)} - ${fmtDate(batch.endDate)}`,
+          batchDate: batch
+            ? `${fmtDate(batch.startDate)} - ${fmtDate(batch.endDate)}`
+            : `${fmtDate(snapshot.startDate)} - ${fmtDate(snapshot.endDate)}`,
           seats: booking.seats,
           totalAmount: booking.pricing.totalAmount,
           travelers: req.body.travelers || booking.travelers || [],
@@ -932,7 +943,7 @@ exports.updateBookingStatus = async (req, res) => {
       const snap = booking.snapshot || {};
       notifyUser(
         booking.userId,
-        "Booking Cancelled by TripReel",
+        "Booking Cancelled by Trip Reel",
         `Your booking for ${snap.packageTitle || "trip"} was cancelled. A full refund of ₹${summary.refundAmount.toLocaleString("en-IN")} is being processed.`,
         { type: "booking_cancelled", bookingId: booking._id.toString() },
       );
@@ -1120,7 +1131,7 @@ exports.cancelBooking = async (req, res) => {
           to: user.email,
           subject: `Booking Cancelled - ${snap.packageTitle || "Trip"}`,
           text: `Hi ${user.name}, your booking ${booking.bookingId} has been cancelled.${summary.refundAmount > 0 ? ` Refund of Rs.${summary.refundAmount} (${summary.refundPercent}%) is being processed.` : ""}`,
-          html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;"><h2 style="color:#EF4444;">Booking Cancelled</h2><p>Hi <strong>${user.name}</strong>,</p><p>Your booking <strong>${booking.bookingId}</strong> for <strong>${snap.packageTitle || "trip"}</strong> has been cancelled.</p>${summary.refundAmount > 0 ? `<p style="background:#F0FDF4;padding:12px;border-radius:8px;color:#065F46;"><strong>Refund:</strong> Rs.${summary.refundAmount.toLocaleString("en-IN")} (${summary.refundPercent}%) is being processed to your original payment method within 5-7 business days.</p>` : ""}<p style="color:#6B7280;font-size:13px;">If you have questions, contact us via the app.</p><p>Team TripReel</p></div>`,
+          html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;"><h2 style="color:#EF4444;">Booking Cancelled</h2><p>Hi <strong>${user.name}</strong>,</p><p>Your booking <strong>${booking.bookingId}</strong> for <strong>${snap.packageTitle || "trip"}</strong> has been cancelled.</p>${summary.refundAmount > 0 ? `<p style="background:#F0FDF4;padding:12px;border-radius:8px;color:#065F46;"><strong>Refund:</strong> Rs.${summary.refundAmount.toLocaleString("en-IN")} (${summary.refundPercent}%) is being processed to your original payment method within 5-7 business days.</p>` : ""}<p style="color:#6B7280;font-size:13px;">If you have questions, contact us via the app.</p><p>Team Trip Reel</p></div>`,
         });
       }
     } catch {}
@@ -1191,8 +1202,15 @@ exports.getRefundPreview = async (req, res) => {
     const addon = Number(p.addonAmount) || 0;
 
     const fareRefund = Math.round((netFare * refundPercent) / 100);
-    const gstRefund = Math.round((gst * refundPercent) / 100);
-    const addonRefund = !booking.addonDispatched ? addon : 0;
+    // Split GST: portion on fare vs portion on addons
+    const gstOnFare =
+      netFare > 0 ? Math.round((gst * netFare) / (netFare + addon)) : 0;
+    const gstOnAddon = gst - gstOnFare;
+    const gstFareRefund = Math.round((gstOnFare * refundPercent) / 100);
+    // Addons always get full refund (+ their GST)
+    const addonRefund = addon;
+    const gstAddonRefund = addonRefund > 0 ? gstOnAddon : 0;
+    const gstRefund = gstFareRefund + gstAddonRefund;
     const refundAmount = fareRefund + gstRefund + addonRefund;
 
     res.json({
@@ -1534,18 +1552,25 @@ exports.syncSnapjaStatus = async (req, res) => {
             } catch {}
           }
         }
-        // Update creator info if assigned
-        if (b.creator && !snap.creatorName) {
-          snapjaBookings[key].creatorName =
-            b.creator.name || b.creator.display_name || "";
-          // Snapja GET returns the photo as `picture`.
-          snapjaBookings[key].creatorPhoto =
+        // Update creator info if assigned (always sync latest)
+        if (b.creator) {
+          const newName = b.creator.name || b.creator.display_name || "";
+          const newPhone = b.creator.phone || "";
+          const newPhoto =
             b.creator.picture ||
             b.creator.profile_image ||
             b.creator.avatar ||
             "";
-          snapjaBookings[key].creatorPhone = b.creator.phone || "";
-          updated = true;
+          if (
+            newName !== (snap.creatorName || "") ||
+            newPhone !== (snap.creatorPhone || "") ||
+            newPhoto !== (snap.creatorPhoto || "")
+          ) {
+            snapjaBookings[key].creatorName = newName;
+            snapjaBookings[key].creatorPhone = newPhone;
+            snapjaBookings[key].creatorPhoto = newPhoto;
+            updated = true;
+          }
         }
         // Update OTP if refreshed
         if (b.otp && b.otp !== snap.otp) {
@@ -1553,6 +1578,20 @@ exports.syncSnapjaStatus = async (req, res) => {
           if (b.otp_expires_at)
             snapjaBookings[key].otpExpiresAt = b.otp_expires_at;
           updated = true;
+        }
+        // Pull deliverables (photos/videos)
+        if (
+          b.deliverables &&
+          Array.isArray(b.deliverables) &&
+          b.deliverables.length > 0
+        ) {
+          const existingCount = (snap.deliverables || []).length;
+          if (b.deliverables.length > existingCount) {
+            snapjaBookings[key].deliverables = b.deliverables;
+            snapjaBookings[key].deliveredAt =
+              snapjaBookings[key].deliveredAt || new Date().toISOString();
+            updated = true;
+          }
         }
       } catch {}
     }

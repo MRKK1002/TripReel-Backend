@@ -11,12 +11,12 @@ const transporter = nodemailer.createTransport({
 });
 
 // Anti-spam: proper headers
-const FROM_NAME = "TripReel";
+const FROM_NAME = "Trip Reel";
 const FROM_EMAIL = process.env.SMTP_USER;
 const REPLY_TO = "support@tripreel.com";
 
 /**
- * Base email wrapper with TripReel branding
+ * Base email wrapper with Trip Reel branding
  */
 function wrapInTemplate(content) {
   return `
@@ -29,7 +29,7 @@ function wrapInTemplate(content) {
 <table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;">
   <!-- Header -->
   <tr><td style="background:linear-gradient(135deg,#1F8A70,#16a34a);padding:24px 30px;border-radius:12px 12px 0 0;text-align:center;">
-    <h1 style="color:#fff;margin:0;font-size:22px;font-weight:700;letter-spacing:-0.5px;">TripReel</h1>
+    <h1 style="color:#fff;margin:0;font-size:22px;font-weight:700;letter-spacing:-0.5px;">Trip Reel</h1>
     <p style="color:rgba(255,255,255,0.8);margin:4px 0 0;font-size:12px;">Your Travel Partner</p>
   </td></tr>
   <!-- Body -->
@@ -39,9 +39,9 @@ function wrapInTemplate(content) {
   <!-- Footer -->
   <tr><td style="padding:20px 30px;text-align:center;border-radius:0 0 12px 12px;">
     <p style="font-size:11px;color:#9CA3AF;margin:0;">
-      TripReel | Your Travel Partner<br/>
-      This email was sent to you because you have an account with TripReel.<br/>
-      &copy; ${new Date().getFullYear()} TripReel. All rights reserved.
+      Trip Reel | Your Travel Partner<br/>
+      This email was sent to you because you have an account with Trip Reel.<br/>
+      &copy; ${new Date().getFullYear()} Trip Reel. All rights reserved.
     </p>
   </td></tr>
 </table>
@@ -64,7 +64,7 @@ const sendMail = async ({ to, subject, text, html, attachments }) => {
     html,
     attachments: attachments || [],
     headers: {
-      "X-Mailer": "TripReel Mailer",
+      "X-Mailer": "Trip Reel Mailer",
       "List-Unsubscribe": `<mailto:${REPLY_TO}?subject=unsubscribe>`,
     },
   };
@@ -207,8 +207,8 @@ const sendBookingConfirmation = async ({ to, userName, bookingDetails }) => {
         : ""
     }
 
-    <p style="font-size:14px;color:#4B5563;">View your complete booking details in the <strong>My Trips</strong> section of the TripReel app.</p>
-    <p style="font-size:14px;color:#4B5563;margin-top:16px;">Happy travels!<br/><strong>Team TripReel</strong></p>
+    <p style="font-size:14px;color:#4B5563;">View your complete booking details in the <strong>My Trips</strong> section of the Trip Reel app.</p>
+    <p style="font-size:14px;color:#4B5563;margin-top:16px;">Happy travels!<br/><strong>Team Trip Reel</strong></p>
   `;
 
   // Generate PDF attachment
@@ -218,7 +218,7 @@ const sendBookingConfirmation = async ({ to, userName, bookingDetails }) => {
     const pdfBuffer = await generateBookingPdf(bookingDetails);
     attachments = [
       {
-        filename: `TripReel_Booking_${bookingId || "confirmation"}.pdf`,
+        filename: `Trip_Reel_Booking_${bookingId || "confirmation"}.pdf`,
         content: pdfBuffer,
         contentType: "application/pdf",
       },
@@ -256,7 +256,7 @@ const sendPaymentReceipt = async ({ to, userName, paymentDetails }) => {
       </table>
     </div>
 
-    <p style="font-size:14px;color:#4B5563;">Thank you for choosing TripReel!<br/><strong>Team TripReel</strong></p>
+    <p style="font-size:14px;color:#4B5563;">Thank you for choosing Trip Reel!<br/><strong>Team Trip Reel</strong></p>
   `;
 
   return sendMail({
@@ -303,7 +303,7 @@ const sendTripReminder = async ({ to, userName, tripDetails }) => {
       <li>Fully charged phone</li>
     </ul>
 
-    <p style="font-size:14px;color:#4B5563;margin-top:16px;">Have a wonderful trip!<br/><strong>Team TripReel</strong></p>
+    <p style="font-size:14px;color:#4B5563;margin-top:16px;">Have a wonderful trip!<br/><strong>Team Trip Reel</strong></p>
   `;
 
   return sendMail({
@@ -331,16 +331,16 @@ const sendReviewRequest = async ({ to, userName, tripDetails }) => {
       <p style="font-size:32px;margin:0;">&#11088; &#11088; &#11088; &#11088; &#11088;</p>
     </div>
 
-    <p style="font-size:14px;color:#4B5563;">Open the TripReel app and go to <strong>My Trips</strong> to leave your review. It only takes 30 seconds!</p>
+    <p style="font-size:14px;color:#4B5563;">Open the Trip Reel app and go to <strong>My Trips</strong> to leave your review. It only takes 30 seconds!</p>
 
-    <p style="font-size:14px;color:#4B5563;margin-top:20px;">Thank you!<br/><strong>Team TripReel</strong></p>
+    <p style="font-size:14px;color:#4B5563;margin-top:20px;">Thank you!<br/><strong>Team Trip Reel</strong></p>
   `;
 
   return sendMail({
     to,
     subject: `How was ${packageName}? Share your experience`,
     html: wrapInTemplate(content),
-    text: `Hi ${userName}, how was your trip to ${packageName}? Open the TripReel app to leave a review!`,
+    text: `Hi ${userName}, how was your trip to ${packageName}? Open the Trip Reel app to leave a review!`,
   });
 };
 

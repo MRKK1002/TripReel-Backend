@@ -69,6 +69,28 @@ router.post("/", operatorProtect, async (req, res) => {
         .json({ success: false, message: "endDate must be after startDate" });
     }
 
+    // Reject past dates
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    if (new Date(startDate) < today) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Start date cannot be in the past" });
+    }
+
+    // Check for overlapping date ranges on the same package
+    const overlap = await FlexibleAvailability.findOne({
+      packageId,
+      startDate: { $lt: new Date(endDate) },
+      endDate: { $gt: new Date(startDate) },
+    });
+    if (overlap) {
+      return res.status(400).json({
+        success: false,
+        message: `This range overlaps with an existing range (${overlap.startDate.toLocaleDateString("en-IN")} – ${overlap.endDate.toLocaleDateString("en-IN")}). Please choose different dates.`,
+      });
+    }
+
     const item = await FlexibleAvailability.create({
       packageId,
       operatorId: req.operator._id,
@@ -108,6 +130,20 @@ router.put("/:id", operatorProtect, async (req, res) => {
       return res
         .status(400)
         .json({ success: false, message: "endDate must be after startDate" });
+    }
+
+    // Check for overlapping date ranges (exclude self)
+    const overlap = await FlexibleAvailability.findOne({
+      packageId: item.packageId,
+      _id: { $ne: item._id },
+      startDate: { $lt: item.endDate },
+      endDate: { $gt: item.startDate },
+    });
+    if (overlap) {
+      return res.status(400).json({
+        success: false,
+        message: `This range overlaps with an existing range (${overlap.startDate.toLocaleDateString("en-IN")} – ${overlap.endDate.toLocaleDateString("en-IN")}). Please choose different dates.`,
+      });
     }
 
     await item.save();

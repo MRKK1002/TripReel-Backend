@@ -50,7 +50,7 @@ async function rzpxRequest(path, body, idempotencyKey) {
 // Create (or reuse) a contact for the operator
 async function createContact({ name, email, contact, referenceId }) {
   return rzpxRequest("/contacts", {
-    name: name || "TripReel Operator",
+    name: name || "Trip Reel Operator",
     email: email || undefined,
     contact: contact || undefined,
     type: "vendor",
@@ -105,7 +105,7 @@ async function createPayout({
       purpose: "payout",
       queue_if_low_balance: true,
       reference_id: referenceId,
-      narration: (narration || "TripReel Payout").slice(0, 30),
+      narration: (narration || "Trip Reel Payout").slice(0, 30),
     },
     referenceId, // idempotency key — same reference never pays twice
   );

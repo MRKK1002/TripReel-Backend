@@ -124,6 +124,12 @@ const packageSchema = new mongoose.Schema(
       trim: true,
       default: "",
     },
+    // How this package accepts bookings: "batch" (fixed group departures) or "flexible" (date availability ranges)
+    bookingMode: {
+      type: String,
+      enum: ["batch", "flexible"],
+      default: "batch",
+    },
     durationDays: {
       type: Number,
       min: 0,

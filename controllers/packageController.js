@@ -722,8 +722,8 @@ exports.operatorUpdatePackage = async (req, res) => {
     const nextStatus = submissionMode === "DRAFT" ? "DRAFT" : "PENDING";
     const resetNotes = nextStatus === "PENDING";
 
-    // If package was previously APPROVED, keep it visible (isActive=true)
-    // while the edit goes for re-review. Otherwise hide it.
+    // If package was previously APPROVED, keep its current isActive state
+    // (respect operator's disable choice). Otherwise hide it until approved.
     const wasApproved = pkg.status === "APPROVED";
 
     const updated = await Package.findByIdAndUpdate(
@@ -732,7 +732,7 @@ exports.operatorUpdatePackage = async (req, res) => {
         ...body,
         status: nextStatus,
         adminNotes: resetNotes ? "" : pkg.adminNotes,
-        isActive: wasApproved ? true : false,
+        isActive: wasApproved ? pkg.isActive : false,
       },
       { new: true, runValidators: true },
     );
@@ -767,6 +767,53 @@ exports.operatorDeletePackage = async (req, res) => {
         .status(404)
         .json({ success: false, message: "Package not found or not yours" });
     res.json({ success: true, message: "Package deleted" });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// PATCH /api/packages/operator/:id/toggle-active — operator disable/enable their package
+// Cannot disable if there are active bookings on upcoming batches or active flex ranges
+exports.operatorToggleActive = async (req, res) => {
+  try {
+    const pkg = await Package.findOne({
+      _id: req.params.id,
+      operatorId: req.operator._id,
+    });
+    if (!pkg)
+      return res
+        .status(404)
+        .json({ success: false, message: "Package not found or not yours" });
+
+    // If trying to disable, check for active bookings
+    if (pkg.isActive) {
+      const now = new Date();
+      const TripBooking = require("../models/TripBooking");
+
+      // Check for confirmed bookings on upcoming/ongoing batches or flex dates
+      const activeBookings = await TripBooking.countDocuments({
+        packageId: pkg._id,
+        status: { $in: ["CONFIRMED", "PENDING"] },
+        tripEndDate: { $gte: now },
+      });
+
+      if (activeBookings > 0) {
+        return res.status(400).json({
+          success: false,
+          message: `Cannot disable — ${activeBookings} active booking${activeBookings > 1 ? "s" : ""} exist for upcoming trips. Wait until all trips are completed or cancel them first.`,
+        });
+      }
+    }
+
+    pkg.isActive = !pkg.isActive;
+    await pkg.save();
+    res.json({
+      success: true,
+      message: pkg.isActive
+        ? "Package is now active and visible to users"
+        : "Package disabled — hidden from users",
+      package: pkg,
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }

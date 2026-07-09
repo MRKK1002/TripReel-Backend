@@ -3,19 +3,18 @@ const Batch = require("../models/Batch");
 
 // ── Public / User ─────────────────────────────────────────────────────────────
 
-// GET /api/coupons?batchId=X — available coupons for a batch (app shows these)
+// GET /api/coupons?batchId=X or ?packageId=X — available coupons (app shows these)
 exports.getCouponsForBatch = async (req, res) => {
   try {
-    const { batchId } = req.query;
-    if (!batchId) {
+    const { batchId, packageId } = req.query;
+    if (!batchId && !packageId) {
       return res
         .status(400)
-        .json({ success: false, message: "batchId is required" });
+        .json({ success: false, message: "batchId or packageId is required" });
     }
 
     const now = new Date();
-    const coupons = await Coupon.find({
-      batchId,
+    const query = {
       isActive: true,
       validFrom: { $lte: now },
       validUntil: { $gte: now },
@@ -23,7 +22,17 @@ exports.getCouponsForBatch = async (req, res) => {
         { usageLimit: 0 }, // unlimited
         { $expr: { $lt: ["$usedCount", "$usageLimit"] } },
       ],
-    }).select(
+    };
+
+    if (batchId) {
+      query.batchId = batchId;
+    } else {
+      // For flex packages — get package-level coupons (batchId is null)
+      query.packageId = packageId;
+      query.batchId = null;
+    }
+
+    const coupons = await Coupon.find(query).select(
       "code type value maxDiscount minGuests minOrderAmount description validUntil",
     );
 
@@ -36,20 +45,29 @@ exports.getCouponsForBatch = async (req, res) => {
 // POST /api/coupons/validate — validate a coupon code for a booking
 exports.validateCoupon = async (req, res) => {
   try {
-    const { batchId, code, guests = 1, subtotal = 0 } = req.body;
+    const { batchId, packageId, code, guests = 1, subtotal = 0 } = req.body;
 
-    if (!batchId || !code) {
-      return res
-        .status(400)
-        .json({ success: false, message: "batchId and code are required" });
+    if (!code || (!batchId && !packageId)) {
+      return res.status(400).json({
+        success: false,
+        message: "code and (batchId or packageId) are required",
+      });
     }
 
     const now = new Date();
-    const coupon = await Coupon.findOne({
-      batchId,
+    const query = {
       code: code.trim().toUpperCase(),
       isActive: true,
-    });
+    };
+
+    if (batchId) {
+      query.batchId = batchId;
+    } else {
+      query.packageId = packageId;
+      query.batchId = null;
+    }
+
+    const coupon = await Coupon.findOne(query);
 
     if (!coupon) {
       return res
@@ -126,11 +144,12 @@ exports.validateCoupon = async (req, res) => {
 
 // ── Operator ──────────────────────────────────────────────────────────────────
 
-// POST /api/coupons — operator creates a coupon for their batch
+// POST /api/coupons — operator creates a coupon for their batch or package
 exports.createCoupon = async (req, res) => {
   try {
     const {
       batchId,
+      packageId,
       code,
       type,
       value,
@@ -143,10 +162,17 @@ exports.createCoupon = async (req, res) => {
       description,
     } = req.body;
 
-    if (!batchId || !code || !type || value === undefined || !validUntil) {
+    if (!code || !type || value === undefined || !validUntil) {
       return res.status(400).json({
         success: false,
-        message: "batchId, code, type, value, and validUntil are required",
+        message: "code, type, value, and validUntil are required",
+      });
+    }
+
+    if (!batchId && !packageId) {
+      return res.status(400).json({
+        success: false,
+        message: "Either batchId or packageId is required",
       });
     }
 
@@ -164,21 +190,38 @@ exports.createCoupon = async (req, res) => {
       });
     }
 
-    // Verify batch belongs to this operator
-    const batch = await Batch.findOne({
-      _id: batchId,
-      operatorId: req.operator._id,
-    });
-    if (!batch) {
-      return res
-        .status(404)
-        .json({ success: false, message: "Batch not found or not yours" });
+    let resolvedPackageId = packageId;
+
+    if (batchId) {
+      // Verify batch belongs to this operator
+      const batch = await Batch.findOne({
+        _id: batchId,
+        operatorId: req.operator._id,
+      });
+      if (!batch) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Batch not found or not yours" });
+      }
+      resolvedPackageId = batch.packageId;
+    } else {
+      // Verify package belongs to this operator
+      const Package = require("../models/Package");
+      const pkg = await Package.findOne({
+        _id: packageId,
+        operatorId: req.operator._id,
+      });
+      if (!pkg) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Package not found or not yours" });
+      }
     }
 
     const coupon = await Coupon.create({
-      batchId,
+      batchId: batchId || null,
       operatorId: req.operator._id,
-      packageId: batch.packageId,
+      packageId: resolvedPackageId,
       code: code.trim().toUpperCase(),
       type,
       value: Number(value),
@@ -196,7 +239,7 @@ exports.createCoupon = async (req, res) => {
     const discountText =
       type === "percentage" ? `${value}% off` : `Rs.${value} off`;
     alertWishlistedUsers(
-      batch.packageId,
+      resolvedPackageId,
       `New coupon: ${code.trim().toUpperCase()}`,
       `Use code ${code.trim().toUpperCase()} for ${discountText}! Limited time offer.`,
     );
@@ -206,7 +249,7 @@ exports.createCoupon = async (req, res) => {
     if (err.code === 11000) {
       return res.status(400).json({
         success: false,
-        message: "A coupon with this code already exists for this batch",
+        message: "A coupon with this code already exists for this package",
       });
     }
     res.status(400).json({ success: false, message: err.message });

@@ -2,11 +2,11 @@ const mongoose = require("mongoose");
 
 const couponSchema = new mongoose.Schema(
   {
-    // Which batch this coupon belongs to
+    // Which batch this coupon belongs to (null for package-level flex coupons)
     batchId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Batch",
-      required: true,
+      default: null,
       index: true,
     },
     operatorId: {
@@ -101,7 +101,8 @@ const couponSchema = new mongoose.Schema(
 );
 
 // Compound index for quick lookups
-couponSchema.index({ batchId: 1, code: 1 }, { unique: true });
+couponSchema.index({ packageId: 1, code: 1 }, { unique: true });
+couponSchema.index({ batchId: 1, isActive: 1 });
 couponSchema.index({ packageId: 1, isActive: 1 });
 
 module.exports = mongoose.model("Coupon", couponSchema);

@@ -58,14 +58,20 @@ async function runSnapjaDispatch() {
       addonDispatched: { $ne: true },
     }).populate("batchId", "startDate");
 
+    console.log(
+      `[SNAPJA DISPATCH] Found ${bookings.length} bookings to dispatch`,
+    );
+
     for (const booking of bookings) {
       try {
-        const startDate = booking.batchId?.startDate;
+        // Get trip start date from batch or flex snapshot
+        const startDate =
+          booking.batchId?.startDate ||
+          booking.snapshot?.startDate ||
+          booking.tripStartDate;
         if (!startDate) continue;
-        // Dispatch only once the booking is non-refundable (no-refund window)
-        const pct = await refundPercentForDate(startDate);
-        if (pct > 0) continue; // still refundable — keep holding
-        if (new Date(startDate) < new Date()) continue; // trip already started/passed
+        // Dispatch immediately — creator needs time to prepare/accept
+        if (new Date(startDate) < new Date()) continue; // skip if trip already started
 
         const pkg = await Package.findById(booking.packageId).select(
           "itinerary location title",
@@ -120,10 +126,10 @@ async function runSnapjaDispatch() {
                   date: actualDate.toISOString().split("T")[0],
                   time,
                   booking_type: "scheduled",
-                  customer_name: user?.name || "TripReel User",
+                  customer_name: user?.name || "Trip Reel User",
                   customer_phone: user?.phone || "",
                   customer_email: user?.email || "",
-                  notes: `TripReel: ${pkg?.title || "Trip"} — ${addonName} — Day ${dayIdx + 1} — Booking ${booking.bookingId}`,
+                  notes: `Trip Reel: ${pkg?.title || "Trip"} — ${addonName} — Day ${dayIdx + 1} — Booking ${booking.bookingId}`,
                   timezone: "Asia/Kolkata",
                   auto_confirm_payment: true,
                 }),
@@ -189,6 +195,95 @@ async function runSnapjaDispatch() {
 exports.runSnapjaDispatch = runSnapjaDispatch;
 
 /**
+ * Job: Auto-cancel unassigned Snapja addon bookings 1 day before trip starts.
+ * Runs at 11:55 PM IST daily. If no creator was assigned for an addon-day,
+ * cancel it on Snapja, flag for refund, and notify the user.
+ */
+async function runSnapjaAutoCancel() {
+  const results = { cancelled: 0, errors: [] };
+  try {
+    // Find bookings where trip starts TOMORROW and addons are dispatched but not all assigned
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    tomorrow.setHours(0, 0, 0, 0);
+    const dayAfterTomorrow = new Date(tomorrow);
+    dayAfterTomorrow.setDate(dayAfterTomorrow.getDate() + 1);
+
+    const bookings = await TripBooking.find({
+      status: "CONFIRMED",
+      addonDispatched: true,
+      snapjaBookings: { $exists: true, $ne: null },
+    }).populate("batchId", "startDate");
+
+    for (const booking of bookings) {
+      try {
+        const startDate =
+          booking.batchId?.startDate || booking.snapshot?.startDate;
+        if (!startDate) continue;
+
+        const tripStart = new Date(startDate);
+        tripStart.setHours(0, 0, 0, 0);
+
+        // Only process if trip starts tomorrow
+        if (tripStart < tomorrow || tripStart >= dayAfterTomorrow) continue;
+
+        let updated = false;
+        const snapjaBookings = JSON.parse(
+          JSON.stringify(booking.snapjaBookings || {}),
+        );
+
+        for (const [key, snap] of Object.entries(snapjaBookings)) {
+          // Skip if already assigned (has creator) or already refunded
+          if (snap.creatorName || snap.refundFlagged) continue;
+          if (!snap.bookingId) continue;
+
+          // No creator assigned and trip is tomorrow — cancel on Snapja
+          console.log(
+            `[SNAPJA AUTO-CANCEL] Cancelling ${key} for booking ${booking.bookingId} — no creator assigned, trip tomorrow`,
+          );
+
+          // Try to cancel on Snapja
+          try {
+            await fetch(`${SNAPJA_API}/${snap.bookingId}`, {
+              method: "DELETE",
+              headers: { "X-API-Key": SNAPJA_API_KEY },
+            });
+          } catch {}
+
+          // Flag for refund
+          snapjaBookings[key].refundFlagged = true;
+          snapjaBookings[key].refundReason = "auto_cancelled_no_assignment";
+          snapjaBookings[key].status = "cancelled";
+          updated = true;
+          results.cancelled++;
+        }
+
+        if (updated) {
+          booking.snapjaBookings = snapjaBookings;
+          booking.markModified("snapjaBookings");
+          await booking.save();
+
+          // Notify user
+          const { notifyUser } = require("./notificationController");
+          notifyUser(
+            booking.userId,
+            "Add-on Service Cancelled",
+            `We couldn't assign a creator before your trip tomorrow. A full refund for the add-on will be processed.`,
+            { type: "general", bookingId: booking._id.toString() },
+          );
+        }
+      } catch (e) {
+        results.errors.push(`Auto-cancel ${booking.bookingId}: ${e.message}`);
+      }
+    }
+  } catch (err) {
+    results.errors.push(`Snapja auto-cancel error: ${err.message}`);
+  }
+  return results;
+}
+exports.runSnapjaAutoCancel = runSnapjaAutoCancel;
+
+/**
  * Job: sync Snapja booking statuses (check if creator assigned, status changed)
  * Runs periodically to update our records without waiting for user to open the screen.
  */
@@ -198,21 +293,34 @@ async function runSnapjaStatusSync() {
     // Find dispatched bookings that have snapjaBookings data and trip hasn't ended
     const bookings = await TripBooking.find({
       addonDispatched: true,
-      snapjaBookings: { $ne: null, $ne: {} },
+      snapjaBookings: { $exists: true, $ne: null, $not: { $eq: {} } },
       status: { $in: ["CONFIRMED", "COMPLETED"] },
     }).populate("batchId", "endDate");
 
     for (const booking of bookings) {
-      // Skip if trip already ended more than 3 days ago
-      const endDate = booking.batchId?.endDate;
+      // Skip if trip already ended more than 3 days ago (check batch endDate OR tripEndDate for flex)
+      const endDate = booking.batchId?.endDate || booking.tripEndDate;
       if (
         endDate &&
         new Date(endDate) < new Date(Date.now() - 3 * 24 * 60 * 60 * 1000)
       )
         continue;
+      // But DON'T skip if deliverables haven't been fetched yet (keep polling for uploads)
+      const hasUndelivered = Object.values(booking.snapjaBookings || {}).some(
+        (s) =>
+          s.creatorName && !(s.deliverables?.length > 0) && !s.refundFlagged,
+      );
+      if (endDate && new Date(endDate) < new Date() && !hasUndelivered)
+        continue;
 
       let updated = false;
-      const snapjaBookings = { ...booking.snapjaBookings };
+      // Deep copy so we can compare old vs new for notifications
+      const oldSnapjaBookings = JSON.parse(
+        JSON.stringify(booking.snapjaBookings || {}),
+      );
+      const snapjaBookings = JSON.parse(
+        JSON.stringify(booking.snapjaBookings || {}),
+      );
 
       for (const [key, snap] of Object.entries(snapjaBookings)) {
         if (!snap.bookingId) continue;
@@ -258,17 +366,24 @@ async function runSnapjaStatusSync() {
               } catch {}
             }
           }
-          if (b.creator && !snapjaBookings[key].creatorName) {
-            snapjaBookings[key].creatorName =
-              b.creator.name || b.creator.display_name || "";
-            // Snapja's GET /tripreel/bookings/:id returns the photo as `picture`.
-            snapjaBookings[key].creatorPhoto =
+          if (b.creator) {
+            const newName = b.creator.name || b.creator.display_name || "";
+            const newPhone = b.creator.phone || "";
+            const newPhoto =
               b.creator.picture ||
               b.creator.profile_image ||
               b.creator.avatar ||
               "";
-            snapjaBookings[key].creatorPhone = b.creator.phone || "";
-            updated = true;
+            if (
+              newName !== (snap.creatorName || "") ||
+              newPhone !== (snap.creatorPhone || "") ||
+              newPhoto !== (snap.creatorPhoto || "")
+            ) {
+              snapjaBookings[key].creatorName = newName;
+              snapjaBookings[key].creatorPhone = newPhone;
+              snapjaBookings[key].creatorPhoto = newPhoto;
+              updated = true;
+            }
           }
           if (b.otp && b.otp !== snap.otp) {
             snapjaBookings[key].otp = b.otp;
@@ -276,6 +391,40 @@ async function runSnapjaStatusSync() {
               snapjaBookings[key].otpExpiresAt = b.otp_expires_at;
             updated = true;
           }
+
+          // Pull deliverables (photos/videos) from Snapja
+          if (
+            b.deliverables &&
+            Array.isArray(b.deliverables) &&
+            b.deliverables.length > 0
+          ) {
+            const existingCount = (snap.deliverables || []).length;
+            if (b.deliverables.length > existingCount) {
+              snapjaBookings[key].deliverables = b.deliverables;
+              snapjaBookings[key].deliveredAt =
+                snapjaBookings[key].deliveredAt || new Date().toISOString();
+              updated = true;
+
+              // Notify user about new deliverables
+              if (existingCount === 0) {
+                try {
+                  const { notifyUser } = require("./notificationController");
+                  const isReel = key.toLowerCase().includes("reel");
+                  const mediaType = isReel ? "videos" : "photos";
+                  notifyUser(
+                    booking.userId,
+                    `Your ${mediaType} are ready! 🎉`,
+                    `Your ${mediaType} from the trip have been delivered. Open booking details to view and download.`,
+                    {
+                      type: "deliverable_ready",
+                      bookingId: booking._id.toString(),
+                    },
+                  );
+                } catch {}
+              }
+            }
+          }
+
           results.synced++;
         } catch (e) {
           results.errors.push(`${booking.bookingId} ${key}: ${e.message}`);
@@ -289,16 +438,12 @@ async function runSnapjaStatusSync() {
         results.updated++;
 
         // Notify user if creator was just assigned
-        const newCreators = Object.values(snapjaBookings).filter(
-          (s) =>
-            s.creatorName &&
-            !Object.values(booking.snapjaBookings || {}).find(
-              (o) => o.bookingId === s.bookingId && o.creatorName,
-            ),
+        const newCreators = Object.entries(snapjaBookings).filter(
+          ([k, s]) => s.creatorName && !oldSnapjaBookings[k]?.creatorName,
         );
         if (newCreators.length > 0) {
           const { notifyUser } = require("./notificationController");
-          const names = newCreators.map((c) => c.creatorName).join(", ");
+          const names = newCreators.map(([, c]) => c.creatorName).join(", ");
           notifyUser(
             booking.userId,
             "Photographer Assigned! 📷",
