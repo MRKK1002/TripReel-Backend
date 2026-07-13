@@ -6,7 +6,7 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const NOTIFICATION_STAGGER_MS = 500; // 500ms gap between each push notification
 const ADDON_BASE_PRICE = 2000; // ₹/day/service sent to Snapja
 const SNAPJA_API = "https://api.snapja.com/api/tripreel/bookings";
-const SNAPJA_API_KEY = process.env.SNAPJA_API_KEY || "tripreel_snapja_2025";
+const SNAPJA_API_KEY = process.env.SNAPJA_API_KEY;
 
 // Resolve refund % for a given trip start date from admin slabs (0 = no-refund window)
 async function refundPercentForDate(startDate) {
