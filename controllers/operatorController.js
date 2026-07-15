@@ -10,6 +10,7 @@ exports.getAllOperators = async (req, res) => {
         { businessName: { $regex: search, $options: "i" } },
         { contactName: { $regex: search, $options: "i" } },
         { email: { $regex: search, $options: "i" } },
+        { phone: { $regex: search, $options: "i" } },
       ];
     }
     if (state && state !== "all") query.onboardingState = state;
@@ -22,7 +23,40 @@ exports.getAllOperators = async (req, res) => {
         .sort({ createdAt: -1 }),
       Operator.countDocuments(query),
     ]);
-    res.json({ success: true, total, page: Number(page), operators });
+
+    // Enrich with package + booking counts
+    const Package = require("../models/Package");
+    const TripBooking = require("../models/TripBooking");
+    const opIds = operators.map((o) => o._id);
+
+    const [pkgCounts, bkgCounts] = await Promise.all([
+      Package.aggregate([
+        { $match: { operatorId: { $in: opIds } } },
+        { $group: { _id: "$operatorId", count: { $sum: 1 } } },
+      ]),
+      TripBooking.aggregate([
+        { $match: { operatorId: { $in: opIds } } },
+        { $group: { _id: "$operatorId", count: { $sum: 1 } } },
+      ]),
+    ]);
+
+    const pkgMap = {};
+    pkgCounts.forEach((p) => {
+      pkgMap[p._id.toString()] = p.count;
+    });
+    const bkgMap = {};
+    bkgCounts.forEach((b) => {
+      bkgMap[b._id.toString()] = b.count;
+    });
+
+    const enriched = operators.map((op) => {
+      const obj = op.toJSON();
+      obj.packageCount = pkgMap[op._id.toString()] || 0;
+      obj.bookingCount = bkgMap[op._id.toString()] || 0;
+      return obj;
+    });
+
+    res.json({ success: true, total, page: Number(page), operators: enriched });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -285,6 +319,15 @@ exports.getOperatorStats = async (req, res) => {
       couponCount = coupons.length;
     } catch {}
 
+    // Flexible Availability
+    let flexRanges = [];
+    try {
+      const FlexibleAvailability = require("../models/FlexibleAvailability");
+      flexRanges = await FlexibleAvailability.find({ operatorId: operatorId })
+        .populate("packageId", "title")
+        .sort({ startDate: -1 });
+    } catch {}
+
     // Reviews
     let reviewCount = 0,
       avgRating = 0;
@@ -326,6 +369,7 @@ exports.getOperatorStats = async (req, res) => {
       batches,
       recentBookings,
       coupons,
+      flexRanges,
       recentReviews,
     });
   } catch (err) {

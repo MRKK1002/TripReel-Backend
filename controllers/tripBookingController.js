@@ -106,15 +106,29 @@ async function computeAuthoritativePricing({
   const platformFeePercent = (await getSetting("platform_fee_percent")) ?? 10;
   const gstPercent = (await getSetting("gst_percent")) ?? 5;
 
-  // Addons
+  // Addons — one creator per booking. Each selected addon-day adds:
+  //   base ₹2000 + per-day outside-city surcharge + per-day extra charges (entry/parking)
   const ADDON_BASE_PRICE = 2000;
-  let addonSurcharge = 0;
+  let addonSurcharge = 0; // operator earnings portion (outside-city + extras)
   let addonTotalPrice = 0;
   if (addonDays) {
     for (const name of Object.keys(addonDays)) {
       for (const dayIdx of addonDays[name] || []) {
         const dayInfo = pkg.itinerary[dayIdx];
-        const sc = dayInfo?.isOutsideCity ? pkg.outsideCityCharge || 0 : 0;
+        let sc = 0;
+        if (dayInfo?.isOutsideCity) {
+          // Per-day surcharge, fall back to package-level default
+          sc =
+            Number(dayInfo.outsideCityCharge) ||
+            Number(pkg.outsideCityCharge) ||
+            0;
+          // Add extra charges (entry fee, parking, etc.)
+          if (Array.isArray(dayInfo.extraCharges)) {
+            for (const ec of dayInfo.extraCharges) {
+              sc += Number(ec.amount) || 0;
+            }
+          }
+        }
         addonSurcharge += sc;
         addonTotalPrice += ADDON_BASE_PRICE + sc;
       }
@@ -527,8 +541,10 @@ exports.createBooking = async (req, res) => {
     const gstPercent = (await getSetting("gst_percent")) ?? 5;
 
     // ── Compute addon (Snapja) amounts — held by platform until dispatch ──────
+    // One creator per booking. Each addon-day: base ₹2000 + per-day outside-city
+    // surcharge (fallback to package default) + per-day extra charges.
     const ADDON_BASE_PRICE = 2000;
-    let addonSurcharge = 0; // operator's outside-city portion
+    let addonSurcharge = 0; // operator's outside-city + extras portion
     let addonTotalPrice = 0; // base + surcharge (full held amount)
     const addonDaysData = req.body.addonDays || null;
     const addonNames = addonDaysData ? Object.keys(addonDaysData) : [];
@@ -537,9 +553,18 @@ exports.createBooking = async (req, res) => {
         const days = addonDaysData[addonName] || [];
         for (const dayIdx of days) {
           const dayInfo = pkg.itinerary[dayIdx];
-          const surcharge = dayInfo?.isOutsideCity
-            ? pkg.outsideCityCharge || 0
-            : 0;
+          let surcharge = 0;
+          if (dayInfo?.isOutsideCity) {
+            surcharge =
+              Number(dayInfo.outsideCityCharge) ||
+              Number(pkg.outsideCityCharge) ||
+              0;
+            if (Array.isArray(dayInfo.extraCharges)) {
+              for (const ec of dayInfo.extraCharges) {
+                surcharge += Number(ec.amount) || 0;
+              }
+            }
+          }
           addonSurcharge += surcharge;
           addonTotalPrice += ADDON_BASE_PRICE + surcharge;
         }

@@ -1,5 +1,13 @@
 const mongoose = require("mongoose");
 
+const dayExtraChargeSchema = new mongoose.Schema(
+  {
+    label: { type: String, trim: true, default: "" }, // e.g. "Entry fee", "Parking"
+    amount: { type: Number, default: 0, min: 0, max: 5000 },
+  },
+  { _id: false },
+);
+
 const itineraryDaySchema = new mongoose.Schema(
   {
     day: { type: Number, required: true },
@@ -10,6 +18,11 @@ const itineraryDaySchema = new mongoose.Schema(
     pickupLat: { type: Number, default: null },
     pickupLng: { type: Number, default: null },
     isOutsideCity: { type: Boolean, default: false },
+    // Per-day outside-city surcharge for the creator (varies by place).
+    // Falls back to package.outsideCityCharge if 0/unset (backward compatible).
+    outsideCityCharge: { type: Number, default: 0, min: 0, max: 10000 },
+    // Optional extra charges for the creator on this day (entry fee, parking, etc.)
+    extraCharges: { type: [dayExtraChargeSchema], default: [] },
   },
   { _id: false },
 );
