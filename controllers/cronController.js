@@ -8,6 +8,14 @@ const ADDON_BASE_PRICE = 2000; // ₹/day/service sent to Snapja
 const SNAPJA_API = "https://api.snapja.com/api/tripreel/bookings";
 const SNAPJA_API_KEY = process.env.SNAPJA_API_KEY;
 
+// Effective trip dates — batch bookings use batch dates, flexible bookings have
+// no batch so fall back to flexEndDate/flexStartDate then the booking snapshot.
+// (Fixes flexible bookings staying "upcoming" forever because batchId is null.)
+const effectiveEndDate = (b) =>
+  b?.batchId?.endDate || b?.flexEndDate || b?.snapshot?.endDate || null;
+const effectiveStartDate = (b) =>
+  b?.batchId?.startDate || b?.flexStartDate || b?.snapshot?.startDate || null;
+
 // Resolve refund % for a given trip start date from admin slabs (0 = no-refund window)
 async function refundPercentForDate(startDate) {
   if (!startDate) return 0;
@@ -483,7 +491,8 @@ async function runCronJobs() {
 
     for (const booking of confirmedBookings) {
       try {
-        if (booking.batchId && booking.batchId.endDate < twoDaysAgo) {
+        const endD = effectiveEndDate(booking);
+        if (endD && new Date(endD) < twoDaysAgo) {
           booking.status = "COMPLETED";
           booking.hasReviewed = false;
           await booking.save();
@@ -579,7 +588,7 @@ async function runCronJobs() {
 
     for (const booking of confirmedForReminders) {
       try {
-        const startDate = booking.batchId?.startDate;
+        const startDate = effectiveStartDate(booking);
         if (!startDate) continue;
 
         const start = new Date(startDate);
@@ -680,7 +689,7 @@ async function runCronJobs() {
 
     for (const booking of completedBookings) {
       try {
-        const endDate = booking.batchId?.endDate;
+        const endDate = effectiveEndDate(booking);
         if (!endDate) continue;
 
         const end = new Date(endDate);
@@ -910,7 +919,8 @@ exports.runAutoCompleteAndCancel = async function () {
 
     for (const booking of confirmedBookings) {
       try {
-        if (booking.batchId && booking.batchId.endDate < now) {
+        const endD = effectiveEndDate(booking);
+        if (endD && new Date(endD) < now) {
           booking.status = "COMPLETED";
           booking.hasReviewed = false;
           await booking.save();
@@ -943,7 +953,8 @@ exports.runAutoCompleteAndCancel = async function () {
 
     for (const booking of completedUnpaid) {
       try {
-        if (booking.batchId && booking.batchId.endDate < twoDaysAgo) {
+        const endD = effectiveEndDate(booking);
+        if (endD && new Date(endD) < twoDaysAgo) {
           const OperatorWallet = require("../models/OperatorWallet");
           const WalletTransaction = require("../models/WalletTransaction");
           const { notifyOperator } = require("./notificationController");
@@ -1024,7 +1035,7 @@ exports.runTripReminders = async function () {
 
     for (const booking of confirmedForReminders) {
       try {
-        const startDate = booking.batchId?.startDate;
+        const startDate = effectiveStartDate(booking);
         if (!startDate) continue;
         const start = new Date(startDate);
         const todayStart = new Date(
@@ -1132,7 +1143,7 @@ exports.runReviewReminders = async function () {
 
     for (const booking of completedBookings) {
       try {
-        const endDate = booking.batchId?.endDate;
+        const endDate = effectiveEndDate(booking);
         if (!endDate) continue;
         const end = new Date(endDate);
         const todayStart = new Date(
@@ -1301,6 +1312,51 @@ exports.runWishlistAlerts = async function () {
     }
   } catch (err) {
     results.errors.push(`Wishlist alerts error: ${err.message}`);
+  }
+  return results;
+};
+
+// Job 6 only: abandoned-booking reminders — nudge users who reached the
+// booking screen for a package but didn't complete the booking.
+exports.runAbandonedBookingReminders = async function () {
+  const results = { reminders: 0, errors: [] };
+  try {
+    const BookingIntent = require("../models/BookingIntent");
+    const { notifyUser } = require("./notificationController");
+    const now = Date.now();
+    const twoHoursAgo = new Date(now - 2 * 60 * 60 * 1000);
+    const threeDaysAgo = new Date(now - 3 * 24 * 60 * 60 * 1000);
+
+    // Abandoned = seen the booking screen 2h–3d ago, not converted, not yet nudged
+    const intents = await BookingIntent.find({
+      converted: false,
+      notified: false,
+      lastSeenAt: { $lte: twoHoursAgo, $gte: threeDaysAgo },
+    }).limit(200);
+
+    for (const intent of intents) {
+      try {
+        const name = intent.packageTitle || "your trip";
+        await delay(NOTIFICATION_STAGGER_MS);
+        notifyUser(
+          intent.userId,
+          "Still thinking about it?",
+          `You were almost there! Tap to complete your booking for ${name}.`,
+          {
+            type: "abandoned_booking",
+            screen: "DestinationDetail",
+            packageId: String(intent.packageId),
+          },
+        );
+        intent.notified = true;
+        await intent.save();
+        results.reminders++;
+      } catch (e) {
+        results.errors.push(`Abandoned reminder ${intent._id}: ${e.message}`);
+      }
+    }
+  } catch (err) {
+    results.errors.push(`Abandoned booking reminders: ${err.message}`);
   }
   return results;
 };

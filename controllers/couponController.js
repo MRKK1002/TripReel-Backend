@@ -119,6 +119,8 @@ exports.validateCoupon = async (req, res) => {
       if (coupon.maxDiscount > 0 && discountAmount > coupon.maxDiscount) {
         discountAmount = coupon.maxDiscount;
       }
+      // Never let the discount exceed the order subtotal
+      if (discountAmount > subtotal) discountAmount = subtotal;
     } else {
       // flat
       discountAmount = coupon.value;
@@ -311,6 +313,23 @@ exports.updateCoupon = async (req, res) => {
         else coupon[key] = Number(req.body[key]) || req.body[key];
       }
     });
+
+    // Re-validate percentage cap on update (createCoupon enforces this too)
+    if (
+      coupon.type === "percentage" &&
+      (Number(coupon.value) <= 0 || Number(coupon.value) > 100)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Percentage discount must be between 1 and 100.",
+      });
+    }
+    if (Number(coupon.value) <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Discount value must be greater than 0.",
+      });
+    }
 
     await coupon.save();
     res.json({ success: true, coupon });

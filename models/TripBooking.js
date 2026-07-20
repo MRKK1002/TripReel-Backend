@@ -239,13 +239,32 @@ const tripBookingSchema = new mongoose.Schema(
   { timestamps: true },
 );
 
-// Auto-generate bookingId before first save
+// Auto-generate a collision-free sequential bookingId before first save.
+// Uses an atomic counter ($inc on a single doc) instead of countDocuments()+1,
+// which races under concurrency and collides after deletions — either of which
+// would fail a booking AFTER the user's payment was already captured.
 tripBookingSchema.pre("save", async function (next) {
-  if (!this.bookingId) {
-    const count = await mongoose.model("TripBooking").countDocuments();
-    this.bookingId = `TR-BKG-${String(count + 1).padStart(6, "0")}`;
+  if (this.bookingId) return next();
+  try {
+    const Counter = require("./Counter");
+    // Lazily seed the counter from the existing count so new IDs continue
+    // past any legacy TR-BKG-000001..N bookings (atomic, race-safe upsert).
+    const seed = await mongoose.model("TripBooking").estimatedDocumentCount();
+    await Counter.updateOne(
+      { _id: "tripBookingId" },
+      { $setOnInsert: { seq: seed } },
+      { upsert: true },
+    );
+    const counter = await Counter.findByIdAndUpdate(
+      "tripBookingId",
+      { $inc: { seq: 1 } },
+      { new: true },
+    );
+    this.bookingId = `TR-BKG-${String(counter.seq).padStart(6, "0")}`;
+    next();
+  } catch (e) {
+    next(e);
   }
-  next();
 });
 
 // SECURITY: prevent two bookings being minted from the same Razorpay payment

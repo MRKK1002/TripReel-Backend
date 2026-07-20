@@ -144,8 +144,11 @@ async function computeAuthoritativePricing({
   if (code) {
     const Coupon = require("../models/Coupon");
     const now = new Date();
+    // Flexible coupons are keyed by packageId, batch coupons by batchId
+    const couponMatch =
+      bookingMode === "flexible" ? { packageId } : { batchId };
     const coupon = await Coupon.findOne({
-      batchId,
+      ...couponMatch,
       code,
       isActive: true,
       validFrom: { $lte: now },
@@ -378,6 +381,21 @@ async function processCancellationRefund(
     $inc: { bookingCount: -booking.seats },
   });
 
+  // ── Return the coupon usage slot (createBooking incremented usedCount) ─────
+  const usedCoupon = booking.pricing?.couponCode;
+  if (usedCoupon) {
+    try {
+      const Coupon = require("../models/Coupon");
+      const match = booking.batchId
+        ? { batchId: booking.batchId }
+        : { packageId: booking.packageId };
+      await Coupon.updateOne(
+        { ...match, code: usedCoupon, usedCount: { $gt: 0 } },
+        { $inc: { usedCount: -1 } },
+      );
+    } catch {}
+  }
+
   // ── Credit operator the cancellation retention (immediately) ─────────────
   if (operatorRetained > 0) {
     await creditOperatorWallet(
@@ -583,10 +601,12 @@ exports.createBooking = async (req, res) => {
       const Coupon = require("../models/Coupon");
       const now = new Date();
 
+      // Flexible coupons are keyed by packageId, batch coupons by batchId
+      const couponMatch = isFlexible ? { packageId } : { batchId };
       // Atomic: only increment usedCount if coupon is still valid + within limit
       const coupon = await Coupon.findOneAndUpdate(
         {
-          batchId,
+          ...couponMatch,
           code: couponCode,
           isActive: true,
           validFrom: { $lte: now },
@@ -814,6 +834,12 @@ exports.createBooking = async (req, res) => {
     } catch (emailErr) {
       console.warn("Booking email failed:", emailErr.message);
     }
+
+    // Mark any abandoned-booking reminder intent as converted (best-effort)
+    try {
+      const { markIntentConverted } = require("./bookingIntentController");
+      markIntentConverted(req.user._id, packageId);
+    } catch {}
 
     res.status(201).json({ success: true, booking });
   } catch (err) {
@@ -1238,13 +1264,30 @@ exports.getRefundPreview = async (req, res) => {
     const gstRefund = gstFareRefund + gstAddonRefund;
     const refundAmount = fareRefund + gstRefund + addonRefund;
 
+    const totalPaid = Number(booking.pricing.totalAmount) || 0;
+    const deducted = Math.max(0, totalPaid - refundAmount);
+
     res.json({
       success: true,
       daysBeforeTrip,
       refundPercent,
       refundAmount,
-      totalPaid: booking.pricing.totalAmount,
-      breakdown: { fareRefund, gstRefund, addonRefund },
+      totalPaid,
+      deducted,
+      hasAddon: addon > 0,
+      breakdown: {
+        // what user paid, split
+        netFare,
+        gst,
+        addon,
+        // what comes back
+        fareRefund,
+        gstRefund,
+        addonRefund,
+        // what is kept (non-refundable trip fare + its GST per the slab)
+        fareKept: Math.max(0, netFare - fareRefund),
+        gstKept: Math.max(0, gst - gstRefund),
+      },
     });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });

@@ -77,6 +77,36 @@ exports.getPublicSettings = async (req, res) => {
   }
 };
 
+// POST /api/settings/sample-media/view  (public)
+// Body: { url } — increments the real view count for a sample work media item
+exports.incrementSampleMediaView = async (req, res) => {
+  try {
+    const { url } = req.body || {};
+    if (!url)
+      return res.status(400).json({ success: false, message: "url required" });
+
+    const doc = await PlatformSettings.findOne({ key: "sample_demo_media" });
+    if (!doc || !Array.isArray(doc.value))
+      return res
+        .status(404)
+        .json({ success: false, message: "Sample media not found" });
+
+    const item = doc.value.find((m) => m && m.url === url);
+    if (!item)
+      return res
+        .status(404)
+        .json({ success: false, message: "Media not found" });
+
+    item.views = (Number(item.views) || 0) + 1;
+    doc.markModified("value");
+    await doc.save();
+
+    res.json({ success: true, views: item.views });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
 // PATCH /api/settings/:key  (admin — update any setting)
 // Build a human-readable cancellation policy sentence from refund slabs
 function generatePolicyText(slabs) {

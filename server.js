@@ -67,6 +67,9 @@ app.use(
   require("./routes/flexibleAvailabilityRoutes"),
 );
 app.use("/api/trip-bookings", require("./routes/tripBookingRoutes"));
+app.use("/api/booking-intents", require("./routes/bookingIntentRoutes"));
+// Public share landing pages (smart deep links → app or store)
+app.use("/share", require("./routes/shareRoutes"));
 app.use("/api/operator-bookings", require("./routes/operatorBookingRoutes"));
 app.use("/api/settings", require("./routes/platformSettingsRoutes"));
 app.use("/api/wallet", require("./routes/walletRoutes"));
@@ -134,6 +137,7 @@ mongoose
       runSnapjaDispatch,
       runSnapjaStatusSync,
       runSnapjaAutoCancel,
+      runAbandonedBookingReminders,
       runCronJobs,
     } = require("./controllers/cronController");
 
@@ -252,6 +256,25 @@ mongoose
           );
         } catch (err) {
           console.error("❌ Cron 11AM error:", err.message);
+        }
+      },
+      { timezone: "Asia/Kolkata" },
+    );
+
+    // 12 PM & 7 PM IST — Abandoned-booking reminders (reached booking screen,
+    // didn't complete). Each intent is nudged only once (notified flag).
+    cron.schedule(
+      "0 12,19 * * *",
+      async () => {
+        try {
+          const result = await runAbandonedBookingReminders();
+          if (result.reminders) {
+            console.log(
+              `✅ Cron (abandoned booking): ${result.reminders} reminders sent`,
+            );
+          }
+        } catch (err) {
+          console.error("❌ Cron abandoned booking error:", err.message);
         }
       },
       { timezone: "Asia/Kolkata" },

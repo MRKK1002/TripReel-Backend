@@ -3,7 +3,7 @@ const admin = require("firebase-admin");
 // Initialize Firebase Admin with service account
 const serviceAccount = {
   type: "service_account",
-  project_id: process.env.FIREBASE_PROJECT_ID,
+  project_id: process.env.FIREBASE_PROJECT_ID || "treepreel",
   private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID || "",
   private_key: (process.env.FIREBASE_PRIVATE_KEY || "").replace(/\\n/g, "\n"),
   client_email: process.env.FIREBASE_CLIENT_EMAIL || "",
@@ -14,13 +14,21 @@ const serviceAccount = {
   client_x509_cert_url: process.env.FIREBASE_CERT_URL || "",
 };
 
-if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-  });
-}
+let messaging = null;
 
-const messaging = admin.messaging();
+try {
+  if (!admin.apps.length) {
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+    });
+  }
+  messaging = admin.messaging();
+} catch (err) {
+  console.warn(
+    "⚠️ Firebase init failed (notifications won't work):",
+    err.message,
+  );
+}
 
 /**
  * Send push notification to a single device

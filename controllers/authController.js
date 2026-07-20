@@ -133,6 +133,16 @@ exports.signupSendOtp = async (req, res) => {
       });
     }
 
+    // Server-side email validation (TLD must be 2+ letters, no double dots)
+    const emailRe =
+      /^[a-zA-Z0-9](?:[a-zA-Z0-9._%+-]*[a-zA-Z0-9])?@(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$/;
+    if (!emailRe.test(email) || email.includes("..")) {
+      return res.status(400).json({
+        success: false,
+        message: "Please enter a valid email address",
+      });
+    }
+
     if (phone.length < 10) {
       return res
         .status(400)

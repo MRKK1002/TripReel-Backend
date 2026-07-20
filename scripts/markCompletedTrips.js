@@ -59,9 +59,14 @@ async function main() {
 
   console.log(`Found ${confirmed.length} CONFIRMED bookings to evaluate...`);
 
+  // Flexible bookings have no batch — fall back to flexEndDate/snapshot.endDate
+  const endOf = (b) =>
+    b.batchId?.endDate || b.flexEndDate || b.snapshot?.endDate || null;
+
   for (const booking of confirmed) {
     try {
-      if (booking.batchId && booking.batchId.endDate < now) {
+      const endD = endOf(booking);
+      if (endD && new Date(endD) < now) {
         booking.status = "COMPLETED";
         booking.hasReviewed = false;
         await booking.save();
@@ -104,7 +109,8 @@ async function main() {
 
   for (const booking of completedUnpaid) {
     try {
-      if (booking.batchId && booking.batchId.endDate < twoDaysAgo) {
+      const endD = endOf(booking);
+      if (endD && new Date(endD) < twoDaysAgo) {
         const totalCredit = booking.pricing?.operatorAmount || 0;
         if (totalCredit > 0) {
           const wallet = await OperatorWallet.findOneAndUpdate(

@@ -23,6 +23,17 @@ exports.registerToken = async (req, res) => {
   }
 };
 
+// POST /api/notifications/unregister-token — clear FCM token on logout so the
+// device stops receiving this user's push notifications after they log out.
+exports.unregisterToken = async (req, res) => {
+  try {
+    await User.findByIdAndUpdate(req.user._id, { fcmToken: "" });
+    res.json({ success: true, message: "Token unregistered" });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
 // POST /api/notifications/send — admin sends notification to specific user or all
 exports.adminSendNotification = async (req, res) => {
   try {
