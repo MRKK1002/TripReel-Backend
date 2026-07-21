@@ -36,10 +36,14 @@ function getSubfolder(req) {
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    const subfolder = getSubfolder(req);
-    const destDir = path.join(baseUploadDir, subfolder);
-    if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
-    cb(null, destDir);
+    // Store everything directly in /uploads. Controllers build URLs as
+    // "/uploads/<filename>" (and path.relative(base, file.path) => filename),
+    // so a flat folder keeps every stored URL correct. (Subfolders previously
+    // caused profile photos & package images to 404 because the saved path
+    // included a subfolder the URL didn't.)
+    if (!fs.existsSync(baseUploadDir))
+      fs.mkdirSync(baseUploadDir, { recursive: true });
+    cb(null, baseUploadDir);
   },
   filename: (req, file, cb) => {
     const uniqueSuffix = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;

@@ -553,7 +553,7 @@ exports.reuploadDocument = async (req, res) => {
       tradeLicense: "tradeLicensePath",
       panCard: "panCardPath",
     };
-    operator[fieldMap[key]] = "/uploads/operators/" + req.file.filename;
+    operator[fieldMap[key]] = "/uploads/" + req.file.filename;
     operator.documentStatus[key] = {
       status: "PENDING",
       remark: "",

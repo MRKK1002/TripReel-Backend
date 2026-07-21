@@ -294,6 +294,7 @@ exports.getAllPackages = async (req, res) => {
 exports.getPopularPackages = async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit) || 10, 10);
+    const now = new Date();
 
     const packages = await Package.aggregate([
       {
@@ -306,8 +307,64 @@ exports.getPopularPackages = async (req, res) => {
           ],
         },
       },
+      // Check if the package has at least one upcoming batch with seats
+      {
+        $lookup: {
+          from: "batches",
+          let: { pid: "$_id" },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $and: [
+                    { $eq: ["$packageId", "$$pid"] },
+                    { $eq: ["$isActive", true] },
+                    { $gt: ["$startDate", now] },
+                    { $lt: ["$bookedSeats", "$totalSeats"] },
+                  ],
+                },
+              },
+            },
+            { $limit: 1 },
+            { $project: { _id: 1 } },
+          ],
+          as: "_futureBatches",
+        },
+      },
+      // Check if the package has at least one active flexible availability
+      {
+        $lookup: {
+          from: "flexibleavailabilities",
+          let: { pid: "$_id" },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $and: [
+                    { $eq: ["$packageId", "$$pid"] },
+                    { $eq: ["$isActive", true] },
+                    { $gte: ["$endDate", now] },
+                  ],
+                },
+              },
+            },
+            { $limit: 1 },
+            { $project: { _id: 1 } },
+          ],
+          as: "_flexAvail",
+        },
+      },
       {
         $addFields: {
+          // true if the package currently has bookable dates
+          hasAvailability: {
+            $gt: [
+              {
+                $add: [{ $size: "$_futureBatches" }, { $size: "$_flexAvail" }],
+              },
+              0,
+            ],
+          },
           popularityScore: {
             $add: [
               { $multiply: [{ $ifNull: ["$bookingCount", 0] }, 3] },
@@ -317,8 +374,17 @@ exports.getPopularPackages = async (req, res) => {
           },
         },
       },
+      // Packages with no bookable dates at all are excluded — bad UX to show them
+      {
+        $match: {
+          hasAvailability: true,
+        },
+      },
+      // Sort by popularity score, then newest
       { $sort: { popularityScore: -1, createdAt: -1 } },
       { $limit: limit },
+      // Clean up lookup fields
+      { $project: { _futureBatches: 0, _flexAvail: 0 } },
     ]);
 
     res.json({
