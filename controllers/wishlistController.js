@@ -10,6 +10,7 @@ exports.getAllWishlists = async (req, res) => {
       .populate("user", "name email")
       .populate("packages", "title image_url")
       .sort({ createdAt: -1 });
+    console.log("abc");
 
     const filtered = search
       ? wishlists.filter(
