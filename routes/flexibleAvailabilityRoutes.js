@@ -55,6 +55,13 @@ router.post("/", operatorProtect, async (req, res) => {
       });
     }
 
+    if (Number(adultPrice) <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Adult price must be greater than ₹0",
+      });
+    }
+
     // Verify ownership
     const pkg = await Package.findById(packageId);
     if (!pkg || String(pkg.operatorId) !== String(req.operator._id)) {
@@ -165,6 +172,20 @@ router.delete("/:id", operatorProtect, async (req, res) => {
         .status(403)
         .json({ success: false, message: "Not your record" });
     }
+
+    // Block delete if there are active (CONFIRMED/PENDING) bookings using this flex range
+    const TripBooking = require("../models/TripBooking");
+    const activeBookings = await TripBooking.countDocuments({
+      flexAvailabilityId: item._id,
+      status: { $in: ["CONFIRMED", "PENDING"] },
+    });
+    if (activeBookings > 0) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot delete — ${activeBookings} active booking(s) use this date range. Disable it instead.`,
+      });
+    }
+
     await item.deleteOne();
     res.json({ success: true, message: "Deleted" });
   } catch (err) {
