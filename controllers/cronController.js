@@ -245,6 +245,32 @@ async function runSnapjaAutoCancel() {
           if (snap.creatorName || snap.refundFlagged) continue;
           if (!snap.bookingId) continue;
 
+          // IMPORTANT: Check live Snapja status before cancelling — our local
+          // `creatorName` may be stale if the hourly sync hasn't run yet.
+          try {
+            const liveRes = await fetch(`${SNAPJA_API}/${snap.bookingId}`, {
+              headers: { "X-API-Key": SNAPJA_API_KEY },
+            });
+            if (liveRes.ok) {
+              const liveData = await liveRes.json();
+              const b = liveData.booking || liveData;
+              if (b.creator?.name || b.creator?.display_name) {
+                // Creator WAS assigned on Snapja — update our record, DON'T cancel
+                snapjaBookings[key].creatorName =
+                  b.creator.name || b.creator.display_name;
+                snapjaBookings[key].creatorPhone = b.creator.phone || "";
+                snapjaBookings[key].creatorPhoto =
+                  b.creator.picture || b.creator.profile_image || "";
+                if (b.otp) snapjaBookings[key].otp = b.otp;
+                if (b.otp_expires_at)
+                  snapjaBookings[key].otpExpiresAt = b.otp_expires_at;
+                snapjaBookings[key].status = b.status || "confirmed";
+                updated = true;
+                continue; // skip cancellation
+              }
+            }
+          } catch {}
+
           // No creator assigned and trip is tomorrow — cancel on Snapja
           console.log(
             `[SNAPJA AUTO-CANCEL] Cancelling ${key} for booking ${booking.bookingId} — no creator assigned, trip tomorrow`,
