@@ -9,6 +9,59 @@ function toDate(val) {
   return isNaN(d.getTime()) ? undefined : d;
 }
 
+const MAX_BATCH_PRICE = 10000000; // ₹1 crore sanity ceiling
+const MAX_BATCH_SEATS = 1000;
+
+// Price/seat rules. These lived only in the React form, so a direct API call
+// could create a ₹0 batch (free trips) or a batch with absurd seat counts.
+function validateBatchPricing({ adultPrice, childPrice, totalSeats }) {
+  const adult = Number(adultPrice);
+  if (!Number.isFinite(adult) || adult <= 0) {
+    return "Adult price must be greater than ₹0.";
+  }
+  if (adult > MAX_BATCH_PRICE) {
+    return `Adult price cannot exceed ₹${MAX_BATCH_PRICE.toLocaleString("en-IN")}.`;
+  }
+
+  if (childPrice !== undefined && childPrice !== null && childPrice !== "") {
+    const child = Number(childPrice);
+    if (!Number.isFinite(child) || child < 0) {
+      return "Child price cannot be negative.";
+    }
+    if (child > adult) {
+      return "Child price cannot be higher than the adult price.";
+    }
+  }
+
+  const seats = Number(totalSeats);
+  if (!Number.isFinite(seats) || !Number.isInteger(seats) || seats < 1) {
+    return "Total seats must be a whole number of at least 1.";
+  }
+  if (seats > MAX_BATCH_SEATS) {
+    return `Total seats cannot exceed ${MAX_BATCH_SEATS}.`;
+  }
+  return "";
+}
+
+// Two batches on the same package must not cover overlapping dates
+async function findOverlappingBatch({ packageId, start, end, excludeId }) {
+  const query = {
+    packageId,
+    startDate: { $lt: end },
+    endDate: { $gt: start },
+  };
+  if (excludeId) query._id = { $ne: excludeId };
+  return Batch.findOne(query);
+}
+
+const fmtRange = (a, b) =>
+  `${new Date(a).toLocaleDateString("en-IN")} – ${new Date(b).toLocaleDateString("en-IN")}`;
+
+// Exported for tests
+exports.validateBatchPricing = validateBatchPricing;
+exports.MAX_BATCH_PRICE = MAX_BATCH_PRICE;
+exports.MAX_BATCH_SEATS = MAX_BATCH_SEATS;
+
 // ── Public ────────────────────────────────────────────────────────────────────
 
 // GET /api/batches?packageId=X
@@ -89,6 +142,15 @@ exports.createBatch = async (req, res) => {
         message: "Package not found, not yours, or not yet approved",
       });
     }
+    // Fixed batches only apply to batch-mode packages (flexible packages use
+    // date-availability ranges instead) — prevents batch/flex date collisions.
+    if (pkg.bookingMode === "flexible") {
+      return res.status(400).json({
+        success: false,
+        message:
+          "This package uses flexible dates, not fixed batches. Use Date Availability instead.",
+      });
+    }
 
     const start = toDate(startDate);
     const end = toDate(endDate);
@@ -117,16 +179,39 @@ exports.createBatch = async (req, res) => {
       deadline = start;
     }
 
+    // ── Price / seat validation (was frontend-only, so ₹0 batches got through) ──
+    const priceError = validateBatchPricing({
+      adultPrice,
+      childPrice,
+      totalSeats,
+    });
+    if (priceError) {
+      return res.status(400).json({ success: false, message: priceError });
+    }
+
+    // Reject duplicate/overlapping batches on the same package
+    const overlap = await findOverlappingBatch({
+      packageId,
+      start,
+      end,
+    });
+    if (overlap) {
+      return res.status(400).json({
+        success: false,
+        message: `These dates overlap an existing batch (${fmtRange(overlap.startDate, overlap.endDate)}). Edit that batch or pick different dates.`,
+      });
+    }
+
     const batch = await Batch.create({
       packageId,
       operatorId: req.operator._id,
       startDate: start,
       endDate: end,
       bookingDeadline: deadline,
-      adultPrice: Number(adultPrice) || 0,
-      childPrice: Number(childPrice) || 0,
-      totalSeats: Math.max(1, Number(totalSeats) || 1),
-      label: (label || "").trim(),
+      adultPrice: Math.round(Number(adultPrice)),
+      childPrice: Math.round(Number(childPrice) || 0),
+      totalSeats: Math.floor(Number(totalSeats)),
+      label: (label || "").trim().slice(0, 80),
     });
 
     // Alert wishlisted users about new batch
@@ -187,6 +272,31 @@ exports.cloneBatch = async (req, res) => {
     }
     if (!deadline || deadline > start) deadline = start;
 
+    // The source batch may predate price validation — re-check before cloning
+    const cloneError = validateBatchPricing({
+      adultPrice: source.adultPrice,
+      childPrice: source.childPrice,
+      totalSeats: source.totalSeats,
+    });
+    if (cloneError) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot clone — the original batch has invalid pricing (${cloneError}) Fix it first.`,
+      });
+    }
+
+    const cloneOverlap = await findOverlappingBatch({
+      packageId: source.packageId,
+      start,
+      end,
+    });
+    if (cloneOverlap) {
+      return res.status(400).json({
+        success: false,
+        message: `These dates overlap an existing batch (${fmtRange(cloneOverlap.startDate, cloneOverlap.endDate)}). Pick different dates.`,
+      });
+    }
+
     const cloned = await Batch.create({
       packageId: source.packageId,
       operatorId: source.operatorId,
@@ -220,16 +330,18 @@ exports.updateBatch = async (req, res) => {
         .json({ success: false, message: "Batch not found or not yours" });
     }
 
-    // Block edit if any confirmed bookings exist
-    const confirmedCount = await TripBooking.countDocuments({
+    // Block edit if any live booking exists. This used to check CONFIRMED only,
+    // while delete checked CONFIRMED *and* PENDING — so a batch with a pending
+    // booking could have its price and dates rewritten under the traveller.
+    const liveCount = await TripBooking.countDocuments({
       batchId: batch._id,
-      status: "CONFIRMED",
+      status: { $in: ["CONFIRMED", "PENDING"] },
     });
-    if (confirmedCount > 0) {
+    if (liveCount > 0) {
       return res.status(400).json({
         success: false,
         message:
-          "Cannot edit a batch that has confirmed bookings. Contact admin.",
+          "Cannot edit a batch that already has bookings. Contact admin.",
       });
     }
 
@@ -244,22 +356,66 @@ exports.updateBatch = async (req, res) => {
     } = req.body;
 
     const oldPrice = batch.adultPrice;
+    const datesChanged = Boolean(startDate || endDate);
+
     if (startDate) batch.startDate = toDate(startDate) || batch.startDate;
     if (endDate) batch.endDate = toDate(endDate) || batch.endDate;
-    if (bookingDeadline) {
-      const d = toDate(bookingDeadline);
-      batch.bookingDeadline = d && d <= batch.startDate ? d : batch.startDate;
-    }
-    if (adultPrice !== undefined) batch.adultPrice = Number(adultPrice) || 0;
-    if (childPrice !== undefined) batch.childPrice = Number(childPrice) || 0;
-    if (totalSeats !== undefined)
-      batch.totalSeats = Math.max(batch.bookedSeats, Number(totalSeats) || 1);
-    if (label !== undefined) batch.label = (label || "").trim();
 
     if (batch.endDate <= batch.startDate) {
       return res
         .status(400)
         .json({ success: false, message: "endDate must be after startDate" });
+    }
+
+    // Moved dates must still be in the future — create enforced this, update
+    // did not, so a batch could be edited into the past.
+    if (datesChanged && batch.startDate <= new Date()) {
+      return res
+        .status(400)
+        .json({ success: false, message: "startDate must be in the future" });
+    }
+
+    // Re-clamp the deadline whenever either the deadline or the start date moves
+    if (bookingDeadline) {
+      const d = toDate(bookingDeadline);
+      batch.bookingDeadline = d && d <= batch.startDate ? d : batch.startDate;
+    } else if (datesChanged && batch.bookingDeadline > batch.startDate) {
+      batch.bookingDeadline = batch.startDate;
+    }
+
+    if (adultPrice !== undefined)
+      batch.adultPrice = Math.round(Number(adultPrice));
+    if (childPrice !== undefined)
+      batch.childPrice = Math.round(Number(childPrice) || 0);
+    if (totalSeats !== undefined)
+      batch.totalSeats = Math.max(
+        batch.bookedSeats,
+        Math.floor(Number(totalSeats)),
+      );
+    if (label !== undefined) batch.label = (label || "").trim().slice(0, 80);
+
+    const priceError = validateBatchPricing({
+      adultPrice: batch.adultPrice,
+      childPrice: batch.childPrice,
+      totalSeats: batch.totalSeats,
+    });
+    if (priceError) {
+      return res.status(400).json({ success: false, message: priceError });
+    }
+
+    if (datesChanged) {
+      const overlap = await findOverlappingBatch({
+        packageId: batch.packageId,
+        start: batch.startDate,
+        end: batch.endDate,
+        excludeId: batch._id,
+      });
+      if (overlap) {
+        return res.status(400).json({
+          success: false,
+          message: `These dates overlap another batch (${fmtRange(overlap.startDate, overlap.endDate)}). Pick different dates.`,
+        });
+      }
     }
 
     await batch.save();

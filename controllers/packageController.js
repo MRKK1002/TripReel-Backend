@@ -462,9 +462,21 @@ exports.reviewPackage = async (req, res) => {
       });
     }
 
+    // A rejection or revision request must tell the operator what to fix.
+    if (
+      (action === "reject" || action === "needs_revision") &&
+      !(adminNotes || "").trim()
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Please add a note explaining what needs to change before rejecting or requesting a revision.",
+      });
+    }
+
     const update = {
       status: statusMap[action],
-      adminNotes: adminNotes || "",
+      adminNotes: (adminNotes || "").trim(),
       isActive: action === "approve",
     };
 
@@ -512,11 +524,50 @@ exports.reviewPackage = async (req, res) => {
 // DELETE /api/packages/:id  (admin)
 exports.deletePackage = async (req, res) => {
   try {
-    const pkg = await Package.findByIdAndDelete(req.params.id);
+    const pkg = await Package.findById(req.params.id);
     if (!pkg)
       return res
         .status(404)
         .json({ success: false, message: "Package not found" });
+
+    // Don't orphan live bookings — same guard as the operator delete path.
+    const TripBooking = require("../models/TripBooking");
+    const liveBookings = await TripBooking.countDocuments({
+      packageId: pkg._id,
+      status: { $in: ["CONFIRMED", "PENDING"] },
+    });
+    if (liveBookings > 0) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot delete — ${liveBookings} active booking${liveBookings > 1 ? "s" : ""} reference this package. Cancel them first, or suspend the package to hide it.`,
+      });
+    }
+
+    // Keep packages that have any booking history for audit — archive instead
+    const anyBookings = await TripBooking.countDocuments({
+      packageId: pkg._id,
+    });
+    if (anyBookings > 0) {
+      pkg.isActive = false;
+      pkg.status = "ARCHIVED";
+      await pkg.save();
+      return res.json({
+        success: true,
+        archived: true,
+        message:
+          "Package has booking history — archived and hidden instead of deleted.",
+      });
+    }
+
+    const Batch = require("../models/Batch");
+    const Coupon = require("../models/Coupon");
+    const FlexibleAvailability = require("../models/FlexibleAvailability");
+    await Promise.all([
+      Batch.deleteMany({ packageId: pkg._id }),
+      Coupon.deleteMany({ packageId: pkg._id }),
+      FlexibleAvailability.deleteMany({ packageId: pkg._id }),
+    ]);
+    await pkg.deleteOne();
     res.json({ success: true, message: "Package deleted successfully" });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -566,36 +617,90 @@ exports.operatorGetMyPackages = async (req, res) => {
 };
 
 // POST /api/packages/operator  (operator — create package, starts as PENDING)
+// ─────────────────────────────────────────────────────────────────────────────
+// Fields on Package that only the platform may set. An operator submitting the
+// create/update form used to have its whole body spread into Mongo, so it could
+// self-promote (isFeatured/isTrending), fake its social proof (bookingCount,
+// avgRating, reviewCount, rating), approve itself (status/isActive), or hand the
+// package to another account (operatorId).
+// ─────────────────────────────────────────────────────────────────────────────
+const OPERATOR_FORBIDDEN_PACKAGE_FIELDS = [
+  "_id",
+  "id",
+  "operatorId",
+  "status",
+  "isActive",
+  "isFeatured",
+  "isTrending",
+  "rating",
+  "avgRating",
+  "reviewCount",
+  "bookingCount",
+  "adminNotes",
+  "createdAt",
+  "updatedAt",
+  "__v",
+];
+
+function stripPlatformFields(body) {
+  OPERATOR_FORBIDDEN_PACKAGE_FIELDS.forEach((f) => delete body[f]);
+  return body;
+}
+
+// Client-supplied image paths ("existing_images" / "existing_image_url") are used
+// to keep already-uploaded files across an edit. They were trusted verbatim, so
+// arbitrary strings or external URLs could be written into image fields. Only
+// accept paths that look like our own uploads, and enforce the gallery cap that
+// multer applies to fresh uploads.
+const MAX_GALLERY_IMAGES = 4;
+
+function sanitizeExistingImagePaths(value) {
+  const list = Array.isArray(value) ? value : [value];
+  return list
+    .filter((p) => typeof p === "string")
+    .map((p) => p.trim())
+    .filter(
+      (p) =>
+        p.startsWith("/uploads/") &&
+        !p.includes("..") &&
+        !p.includes("\\") &&
+        !/\s/.test(p),
+    );
+}
+
+// Resolve cover image + gallery from freshly uploaded files plus any retained
+// existing paths. Shared by create and update (was duplicated in both).
+function applyImageFields(body, files) {
+  const cover = files?.["image_url"]?.[0];
+  if (cover) {
+    body.image_url = "/uploads/" + cover.filename;
+  } else if (body.existing_image_url) {
+    body.image_url = sanitizeExistingImagePaths(body.existing_image_url)[0];
+    if (!body.image_url) delete body.image_url;
+  }
+
+  const newUrls = (files?.["images"] || []).map(
+    (f) => "/uploads/" + f.filename,
+  );
+  const keptUrls = body.existing_images
+    ? sanitizeExistingImagePaths(body.existing_images)
+    : [];
+
+  if (newUrls.length > 0 || keptUrls.length > 0) {
+    body.images = [...keptUrls, ...newUrls].slice(0, MAX_GALLERY_IMAGES);
+  }
+
+  delete body.existing_image_url;
+  delete body.existing_images;
+  return body;
+}
+
 exports.operatorCreatePackage = async (req, res) => {
   try {
-    const body = { ...req.body };
+    const body = stripPlatformFields({ ...req.body });
 
     // slot-0 → image_url (cover), slots 1-3 → images (gallery)
-    if (req.files) {
-      if (req.files["image_url"]?.[0]) {
-        body.image_url = "/uploads/" + req.files["image_url"][0].filename;
-      } else if (body.existing_image_url) {
-        body.image_url = body.existing_image_url;
-      }
-      if (req.files["images"]?.length) {
-        const newUrls = req.files["images"].map(
-          (f) => "/uploads/" + f.filename,
-        );
-        const existingUrls = body.existing_images
-          ? (Array.isArray(body.existing_images)
-              ? body.existing_images
-              : [body.existing_images]
-            ).filter(Boolean)
-          : [];
-        body.images = [...existingUrls, ...newUrls];
-      } else if (body.existing_images) {
-        body.images = Array.isArray(body.existing_images)
-          ? body.existing_images.filter(Boolean)
-          : [body.existing_images].filter(Boolean);
-      }
-    }
-    delete body.existing_image_url;
-    delete body.existing_images;
+    applyImageFields(body, req.files);
 
     const parseJSON = (val, fallback) => {
       if (typeof val !== "string") return val;
@@ -697,34 +802,10 @@ exports.operatorUpdatePackage = async (req, res) => {
       // If admin rejects, they'll request revision and operator can fix.
     }
 
-    const body = { ...req.body };
+    const body = stripPlatformFields({ ...req.body });
 
     // slot-0 → image_url (cover), slots 1-3 → images (gallery)
-    if (req.files) {
-      if (req.files["image_url"]?.[0]) {
-        body.image_url = "/uploads/" + req.files["image_url"][0].filename;
-      } else if (body.existing_image_url) {
-        body.image_url = body.existing_image_url;
-      }
-      if (req.files["images"]?.length) {
-        const newUrls = req.files["images"].map(
-          (f) => "/uploads/" + f.filename,
-        );
-        const existingUrls = body.existing_images
-          ? (Array.isArray(body.existing_images)
-              ? body.existing_images
-              : [body.existing_images]
-            ).filter(Boolean)
-          : [];
-        body.images = [...existingUrls, ...newUrls];
-      } else if (body.existing_images) {
-        body.images = Array.isArray(body.existing_images)
-          ? body.existing_images.filter(Boolean)
-          : [body.existing_images].filter(Boolean);
-      }
-    }
-    delete body.existing_image_url;
-    delete body.existing_images;
+    applyImageFields(body, req.files);
 
     const parseJSON = (val, fallback) => {
       if (typeof val !== "string") return val;
@@ -796,11 +877,16 @@ exports.operatorUpdatePackage = async (req, res) => {
       req.params.id,
       {
         ...body,
+        // Re-pin ownership and all platform-controlled fields so they can never
+        // be moved by the request body.
+        operatorId: pkg.operatorId,
         status: nextStatus,
         adminNotes: resetNotes ? "" : pkg.adminNotes,
         isActive: wasApproved ? pkg.isActive : false,
       },
-      { new: true, runValidators: true },
+      // Drafts can be partial, so only enforce full validation on submit.
+      // (Update validators don't evaluate the conditional-required reliably.)
+      { new: true, runValidators: nextStatus !== "DRAFT" },
     );
     res.json({ success: true, package: updated });
 
@@ -824,7 +910,7 @@ exports.operatorUpdatePackage = async (req, res) => {
 // DELETE /api/packages/operator/:id  (operator — delete their own package)
 exports.operatorDeletePackage = async (req, res) => {
   try {
-    const pkg = await Package.findOneAndDelete({
+    const pkg = await Package.findOne({
       _id: req.params.id,
       operatorId: req.operator._id,
     });
@@ -832,6 +918,51 @@ exports.operatorDeletePackage = async (req, res) => {
       return res
         .status(404)
         .json({ success: false, message: "Package not found or not yours" });
+
+    // ── Never orphan a paid booking ───────────────────────────────────────────
+    // This used to be a bare findOneAndDelete, so a package with CONFIRMED
+    // bookings could be hard-deleted, leaving TripBooking.packageId dangling
+    // along with its batches, coupons and flexible date ranges.
+    const TripBooking = require("../models/TripBooking");
+    const liveBookings = await TripBooking.countDocuments({
+      packageId: pkg._id,
+      status: { $in: ["CONFIRMED", "PENDING"] },
+    });
+    if (liveBookings > 0) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot delete — ${liveBookings} active booking${liveBookings > 1 ? "s" : ""} reference this package. Cancel them first, or disable the package to hide it from travellers.`,
+      });
+    }
+
+    // Any booking at all (including past/cancelled) means we keep the record for
+    // history and audit — disable instead of destroying it.
+    const anyBookings = await TripBooking.countDocuments({
+      packageId: pkg._id,
+    });
+    if (anyBookings > 0) {
+      pkg.isActive = false;
+      pkg.status = "ARCHIVED";
+      await pkg.save();
+      return res.json({
+        success: true,
+        archived: true,
+        message:
+          "This package has booking history, so it was archived and hidden from travellers instead of being deleted.",
+      });
+    }
+
+    // No bookings ever — safe to remove, along with its dependent records
+    const Batch = require("../models/Batch");
+    const Coupon = require("../models/Coupon");
+    const FlexibleAvailability = require("../models/FlexibleAvailability");
+    await Promise.all([
+      Batch.deleteMany({ packageId: pkg._id }),
+      Coupon.deleteMany({ packageId: pkg._id }),
+      FlexibleAvailability.deleteMany({ packageId: pkg._id }),
+    ]);
+    await pkg.deleteOne();
+
     res.json({ success: true, message: "Package deleted" });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });

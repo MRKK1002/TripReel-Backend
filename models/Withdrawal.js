@@ -22,6 +22,10 @@ const withdrawalSchema = new mongoose.Schema(
     payoutId: { type: String, default: "", index: true },
     fundAccountId: { type: String, default: "" },
     referenceId: { type: String, default: "", unique: true, sparse: true },
+    // UTR — the bank's money-movement reference, returned by RazorpayX once the
+    // payout is processed. This is the number an operator/bank uses to trace the
+    // transfer, so it's the most important id for reconciliation.
+    utr: { type: String, default: "" },
 
     // queued/pending/processing/processed/reversed/failed/cancelled
     status: {
@@ -40,6 +44,11 @@ const withdrawalSchema = new mongoose.Schema(
 
     // True once the debited amount has been returned to the wallet (on fail/reversal)
     refunded: { type: Boolean, default: false },
+
+    // True once this payout has been added to OperatorWallet.totalWithdrawn.
+    // Guards against double-counting when several webhook events arrive for the
+    // same payout.
+    countedInTotal: { type: Boolean, default: false },
   },
   { timestamps: true },
 );

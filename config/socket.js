@@ -13,20 +13,66 @@ function initSocket(httpServer) {
     },
   });
 
-  // Auth middleware — verify JWT token on connection
-  io.use((socket, next) => {
+  // ───────────────────────────────────────────────────────────────────────────
+  // Auth middleware — verify the JWT and DERIVE the identity from the database.
+  //
+  // The sender type used to come from `handshake.auth.userType`, i.e. from the
+  // client, so any valid user token could connect as "operator" or "admin" and
+  // post messages under that identity. It is now resolved from the token id.
+  // ───────────────────────────────────────────────────────────────────────────
+  io.use(async (socket, next) => {
     const token = socket.handshake.auth?.token || socket.handshake.query?.token;
     if (!token) return next(new Error("No token"));
 
+    let decoded;
     try {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      socket.userId = decoded.id;
-      socket.userType = socket.handshake.auth?.userType || "user"; // 'user' | 'operator' | 'admin'
-      next();
+      decoded = jwt.verify(token, process.env.JWT_SECRET);
     } catch {
-      next(new Error("Invalid token"));
+      return next(new Error("Invalid token"));
+    }
+
+    try {
+      const { Operator } = require("../models/Operator");
+      const User = require("../models/User");
+
+      // Operator and user tokens are both signed with { id }, so resolve which
+      // collection the id actually belongs to.
+      const operator = await Operator.findById(decoded.id).select(
+        "onboardingState",
+      );
+      if (operator) {
+        if (operator.onboardingState === "SUSPENDED") {
+          return next(new Error("Account suspended"));
+        }
+        socket.userId = String(operator._id);
+        socket.userType = "operator";
+        return next();
+      }
+
+      const user = await User.findById(decoded.id).select("role status");
+      if (!user) return next(new Error("Account no longer exists"));
+      if (user.status === "Suspended") {
+        return next(new Error("Account suspended"));
+      }
+      socket.userId = String(user._id);
+      socket.userType = user.role === "admin" ? "admin" : "user";
+      return next();
+    } catch (err) {
+      return next(new Error("Authentication failed"));
     }
   });
+
+  // Verify the connected socket is a party to the conversation
+  async function canAccessConversation(socket, conversationId) {
+    const mongoose = require("mongoose");
+    if (!mongoose.Types.ObjectId.isValid(conversationId)) return null;
+    const conv = await Conversation.findById(conversationId);
+    if (!conv) return null;
+    if (socket.userType === "admin") return conv;
+    if (socket.userType === "operator")
+      return String(conv.operatorId) === socket.userId ? conv : null;
+    return String(conv.userId) === socket.userId ? conv : null;
+  }
 
   io.on("connection", (socket) => {
     console.log(`Socket connected: ${socket.userId} (${socket.userType})`);
@@ -34,8 +80,15 @@ function initSocket(httpServer) {
     // Join user's personal room
     socket.join(socket.userId);
 
-    // Join a conversation room
-    socket.on("join_conversation", (conversationId) => {
+    // Join a conversation room — only if you're a party to it
+    socket.on("join_conversation", async (conversationId) => {
+      const conv = await canAccessConversation(socket, conversationId);
+      if (!conv) {
+        socket.emit("error_message", {
+          message: "You don't have access to this conversation",
+        });
+        return;
+      }
       socket.join(`conv_${conversationId}`);
     });
 
@@ -49,9 +102,23 @@ function initSocket(httpServer) {
       try {
         const { conversationId, text, imageUrl } = data;
 
-        const conv = await Conversation.findById(conversationId);
-        if (!conv || new Date() > conv.expiresAt) {
+        const conv = await canAccessConversation(socket, conversationId);
+        if (!conv) {
+          socket.emit("error_message", {
+            message: "You don't have access to this conversation",
+          });
+          return;
+        }
+        if (new Date() > conv.expiresAt) {
           socket.emit("error_message", { message: "Chat expired" });
+          return;
+        }
+
+        const bodyText = typeof text === "string" ? text.trim() : "";
+        const bodyImage = typeof imageUrl === "string" ? imageUrl.trim() : "";
+        if (!bodyText && !bodyImage) return;
+        if (bodyText.length > 2000) {
+          socket.emit("error_message", { message: "Message too long" });
           return;
         }
 
@@ -63,12 +130,12 @@ function initSocket(httpServer) {
           senderId,
           senderType,
           senderName: data.senderName || "",
-          text: text || "",
-          imageUrl: imageUrl || "",
+          text: bodyText,
+          imageUrl: bodyImage,
         });
 
         // Update conversation preview
-        const preview = imageUrl ? "📷 Image" : (text || "").substring(0, 60);
+        const preview = bodyImage ? "📷 Image" : bodyText.substring(0, 60);
         const update = {
           lastMessage: preview,
           lastMessageAt: new Date(),
@@ -107,8 +174,9 @@ function initSocket(httpServer) {
       }
     });
 
-    // Typing indicator
+    // Typing indicator — only broadcast into rooms you've legitimately joined
     socket.on("typing", ({ conversationId, isTyping }) => {
+      if (!socket.rooms.has(`conv_${conversationId}`)) return;
       socket.to(`conv_${conversationId}`).emit("user_typing", {
         userId: socket.userId,
         userType: socket.userType,
@@ -119,6 +187,8 @@ function initSocket(httpServer) {
     // Mark messages as read
     socket.on("mark_read", async ({ conversationId }) => {
       try {
+        const conv = await canAccessConversation(socket, conversationId);
+        if (!conv) return;
         const senderType = socket.userType;
         await Message.updateMany(
           { conversationId, senderType: { $ne: senderType }, read: false },

@@ -2,17 +2,29 @@ const mongoose = require("mongoose");
 
 const dayExtraChargeSchema = new mongoose.Schema(
   {
-    label: { type: String, trim: true, default: "" }, // e.g. "Entry fee", "Parking"
+    label: {
+      type: String,
+      trim: true,
+      default: "",
+      maxlength: [60, "Charge label cannot exceed 60 characters"],
+    },
     amount: { type: Number, default: 0, min: 0, max: 5000 },
   },
   { _id: false },
 );
 
+// Per-day extra charges flow straight into the operator's payout WITHOUT the
+// platform fee applied (see calcPricing in tripBookingController). The per-item
+// cap was the only guard, and the array was unbounded — so N x ₹5000 could be
+// stacked on a single day. Cap the count and the per-day total too.
+const MAX_EXTRA_CHARGES_PER_DAY = 5;
+const MAX_EXTRA_CHARGE_TOTAL_PER_DAY = 10000;
+
 const itineraryDaySchema = new mongoose.Schema(
   {
     day: { type: Number, required: true },
-    title: { type: String, required: true },
-    points: [{ type: String }],
+    title: { type: String, required: true, trim: true, maxlength: 80 },
+    points: [{ type: String, maxlength: 200 }],
     pickupPoint: { type: String, default: "" },
     pickupTime: { type: String, default: "" },
     pickupLat: { type: Number, default: null },
@@ -22,7 +34,24 @@ const itineraryDaySchema = new mongoose.Schema(
     // Falls back to package.outsideCityCharge if 0/unset (backward compatible).
     outsideCityCharge: { type: Number, default: 0, min: 0, max: 10000 },
     // Optional extra charges for the creator on this day (entry fee, parking, etc.)
-    extraCharges: { type: [dayExtraChargeSchema], default: [] },
+    extraCharges: {
+      type: [dayExtraChargeSchema],
+      default: [],
+      validate: [
+        {
+          validator: (arr) =>
+            !Array.isArray(arr) || arr.length <= MAX_EXTRA_CHARGES_PER_DAY,
+          message: `A day can have at most ${MAX_EXTRA_CHARGES_PER_DAY} extra charges`,
+        },
+        {
+          validator: (arr) =>
+            !Array.isArray(arr) ||
+            arr.reduce((sum, c) => sum + (Number(c?.amount) || 0), 0) <=
+              MAX_EXTRA_CHARGE_TOTAL_PER_DAY,
+          message: `Extra charges for a day cannot total more than ₹${MAX_EXTRA_CHARGE_TOTAL_PER_DAY}`,
+        },
+      ],
+    },
   },
   { _id: false },
 );
@@ -100,27 +129,41 @@ const packageSchema = new mongoose.Schema(
       type: String,
       required: [true, "Package title is required"],
       trim: true,
+      maxlength: [60, "Package title cannot exceed 60 characters"],
     },
+    // Location & price are only mandatory once the package is actually submitted
+    // for review. A DRAFT can be saved with just a title, so these must not be
+    // hard-required or draft-save would 400 with "Location is required".
     location: {
       type: String,
-      required: [true, "Location is required"],
+      required: [
+        function () {
+          return this.status !== "DRAFT";
+        },
+        "Location is required",
+      ],
       trim: true,
+      default: "",
+      maxlength: [50, "Location cannot exceed 50 characters"],
     },
     // Structured location fields for proximity-based filtering
     country: {
       type: String,
       trim: true,
       default: "India",
+      maxlength: 56,
     },
     state: {
       type: String,
       trim: true,
       default: "",
+      maxlength: 40,
     },
     city: {
       type: String,
       trim: true,
       default: "",
+      maxlength: 40,
     },
     tourType: {
       type: String,
@@ -131,11 +174,13 @@ const packageSchema = new mongoose.Schema(
       type: String,
       trim: true,
       default: "",
+      maxlength: 50,
     },
     departureCity: {
       type: String,
       trim: true,
       default: "",
+      maxlength: 40,
     },
     // How this package accepts bookings: "batch" (fixed group departures) or "flexible" (date availability ranges)
     bookingMode: {
@@ -190,8 +235,15 @@ const packageSchema = new mongoose.Schema(
     },
     price: {
       type: Number,
-      required: [true, "Price is required"],
-      min: 0,
+      required: [
+        function () {
+          return this.status !== "DRAFT";
+        },
+        "Price is required",
+      ],
+      min: [50, "Price must be at least ₹50"],
+      max: [5000000, "Price cannot exceed ₹50,00,000"],
+      default: 0,
     },
     priceLabel: {
       type: String,
@@ -264,6 +316,9 @@ const packageSchema = new mongoose.Schema(
         "APPROVED",
         "REJECTED",
         "EXPIRED",
+        // Operator "deleted" a package that has booking history — kept for
+        // audit/reporting, hidden from travellers.
+        "ARCHIVED",
       ],
       default: "PENDING",
     },

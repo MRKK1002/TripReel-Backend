@@ -12,18 +12,21 @@ const {
   adminToggleActive,
 } = require("../controllers/batchController");
 const { protect, restrictTo } = require("../middleware/authMiddleware");
-const { operatorProtect } = require("../middleware/operatorAuthMiddleware");
+const {
+  operatorProtect,
+  requireApprovedOperator,
+} = require("../middleware/operatorAuthMiddleware");
 
 // ── Public ────────────────────────────────────────────────────────────────────
 router.get("/", getBatchesForPackage); // ?packageId=X
 router.get("/:id", getBatchById);
 
-// ── Operator ──────────────────────────────────────────────────────────────────
+// ── Operator (write actions require an approved account) ──────────────────────
 router.get("/operator/mine", operatorProtect, operatorGetMyBatches);
-router.post("/", operatorProtect, createBatch);
-router.post("/:id/clone", operatorProtect, cloneBatch);
-router.put("/:id", operatorProtect, updateBatch);
-router.delete("/:id", operatorProtect, deleteBatch);
+router.post("/", operatorProtect, requireApprovedOperator, createBatch);
+router.post("/:id/clone", operatorProtect, requireApprovedOperator, cloneBatch);
+router.put("/:id", operatorProtect, requireApprovedOperator, updateBatch);
+router.delete("/:id", operatorProtect, requireApprovedOperator, deleteBatch);
 
 // ── Admin ─────────────────────────────────────────────────────────────────────
 router.get("/admin/all", protect, restrictTo("admin"), adminGetAllBatches);

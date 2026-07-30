@@ -1,6 +1,56 @@
 const Conversation = require("../models/Conversation");
 const Message = require("../models/Message");
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Conversation access guard
+//
+// getMessages / sendMessage previously filtered on the conversationId alone, so
+// any authenticated user or operator could read and post into ANY conversation
+// by iterating ids. Every entry point must now resolve the conversation through
+// this helper.
+//
+// Returns { conversation } on success, or { error: {status, message} }.
+// ─────────────────────────────────────────────────────────────────────────────
+async function loadAuthorizedConversation(req, conversationId) {
+  const mongoose = require("mongoose");
+  if (!mongoose.Types.ObjectId.isValid(conversationId)) {
+    return { error: { status: 400, message: "Invalid conversation id" } };
+  }
+
+  const conversation = await Conversation.findById(conversationId);
+  if (!conversation) {
+    return { error: { status: 404, message: "Conversation not found" } };
+  }
+
+  // Admins may read any conversation
+  if (req.user?.role === "admin") return { conversation, role: "admin" };
+
+  if (req.operator) {
+    if (String(conversation.operatorId) !== String(req.operator._id)) {
+      return {
+        error: { status: 403, message: "This conversation is not yours" },
+      };
+    }
+    return { conversation, role: "operator" };
+  }
+
+  if (req.user) {
+    if (String(conversation.userId) !== String(req.user._id)) {
+      return {
+        error: { status: 403, message: "This conversation is not yours" },
+      };
+    }
+    return { conversation, role: "user" };
+  }
+
+  return { error: { status: 401, message: "Not authorized" } };
+}
+
+exports.loadAuthorizedConversation = loadAuthorizedConversation;
+
+const MAX_MESSAGE_LENGTH = 2000;
+exports.MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH;
+
 // GET /api/chat/conversations — user's conversations
 exports.getUserConversations = async (req, res) => {
   try {
@@ -57,6 +107,17 @@ exports.getMessages = async (req, res) => {
     const { page = 1, limit = 50 } = req.query;
     const skip = (Number(page) - 1) * Number(limit);
 
+    // Ownership check — must run before any read or read-receipt write
+    const { error } = await loadAuthorizedConversation(
+      req,
+      req.params.conversationId,
+    );
+    if (error) {
+      return res
+        .status(error.status)
+        .json({ success: false, message: error.message });
+    }
+
     const messages = await Message.find({
       conversationId: req.params.conversationId,
     })
@@ -99,12 +160,32 @@ exports.getMessages = async (req, res) => {
 exports.sendMessage = async (req, res) => {
   try {
     const { text, imageUrl } = req.body;
-    const conv = await Conversation.findById(req.params.conversationId);
 
-    if (!conv)
+    // Ownership check — only the two parties (or an admin) may post here
+    const { conversation: conv, error } = await loadAuthorizedConversation(
+      req,
+      req.params.conversationId,
+    );
+    if (error) {
       return res
-        .status(404)
-        .json({ success: false, message: "Conversation not found" });
+        .status(error.status)
+        .json({ success: false, message: error.message });
+    }
+
+    const bodyText = typeof text === "string" ? text.trim() : "";
+    const bodyImage = typeof imageUrl === "string" ? imageUrl.trim() : "";
+    if (!bodyText && !bodyImage) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Message cannot be empty" });
+    }
+    if (bodyText.length > MAX_MESSAGE_LENGTH) {
+      return res.status(400).json({
+        success: false,
+        message: `Message cannot exceed ${MAX_MESSAGE_LENGTH} characters`,
+      });
+    }
+
     if (new Date() > conv.expiresAt) {
       return res
         .status(400)
@@ -120,21 +201,12 @@ exports.sendMessage = async (req, res) => {
       senderId,
       senderType,
       senderName,
-      text: text || "",
-      imageUrl: imageUrl || "",
+      text: bodyText,
+      imageUrl: bodyImage,
     });
 
     // Update conversation
-    const preview = imageUrl ? "📷 Image" : text?.substring(0, 60) || "";
-    const updateData = {
-      lastMessage: preview,
-      lastMessageAt: new Date(),
-      lastSenderType: senderType,
-    };
-    if (senderType !== "user") updateData.$inc = { unreadUser: 1 };
-    if (senderType !== "operator") {
-      updateData.$inc = { ...(updateData.$inc || {}), unreadOperator: 1 };
-    }
+    const preview = bodyImage ? "📷 Image" : bodyText.substring(0, 60);
 
     await Conversation.findByIdAndUpdate(conv._id, {
       lastMessage: preview,

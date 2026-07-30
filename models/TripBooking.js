@@ -178,6 +178,12 @@ const tripBookingSchema = new mongoose.Schema(
     refundError: { type: String, default: "" },
     refundBreakdown: refundBreakdownSchema,
 
+    // Audit trail for a refund settled outside Razorpay ("paid offline"), so it
+    // is always clear who overrode the automated flow and why.
+    refundMarkedManually: { type: Boolean, default: false },
+    refundMarkedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+    refundNote: { type: String, default: "", trim: true, maxlength: 500 },
+
     // Razorpay references (needed to issue refunds)
     razorpayPaymentId: { type: String, default: "" },
     razorpayOrderId: { type: String, default: "" },

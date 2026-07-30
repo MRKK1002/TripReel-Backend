@@ -213,12 +213,28 @@ exports.deleteReview = async (req, res) => {
 // GET /api/reviews/admin/all
 exports.adminGetAllReviews = async (req, res) => {
   try {
-    const { packageId, page = 1, limit = 20 } = req.query;
+    const {
+      packageId,
+      visibility, // "visible" | "hidden" | "all"
+      rating, // 1..5 exact
+      search, // matches comment text
+      page = 1,
+      limit = 20,
+    } = req.query;
+
     const query = {};
     if (packageId) query.packageId = packageId;
+    if (visibility === "visible") query.isVisible = true;
+    else if (visibility === "hidden") query.isVisible = false;
+    const r = Number(rating);
+    if (r >= 1 && r <= 5) query.rating = r;
+    if (search) {
+      const escapeRegex = require("../utils/escapeRegex");
+      query.comment = { $regex: escapeRegex(String(search)), $options: "i" };
+    }
 
     const skip = (Number(page) - 1) * Number(limit);
-    const [reviews, total] = await Promise.all([
+    const [reviews, total, hiddenCount] = await Promise.all([
       Review.find(query)
         .populate("userId", "name email")
         .populate("packageId", "title location")
@@ -226,9 +242,10 @@ exports.adminGetAllReviews = async (req, res) => {
         .skip(skip)
         .limit(Number(limit)),
       Review.countDocuments(query),
+      Review.countDocuments({ isVisible: false }),
     ]);
 
-    res.json({ success: true, reviews, total });
+    res.json({ success: true, reviews, total, hiddenCount });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }

@@ -1,26 +1,147 @@
-const { Operator, VALID_STATES } = require("../models/Operator");
+const {
+  Operator,
+  VALID_STATES,
+  EDITABLE_STATES,
+  ALLOWED_TRANSITIONS,
+  CORRECTABLE_FIELDS,
+} = require("../models/Operator");
+const {
+  collapseSpaces,
+  validatePersonName,
+  validatePhoneIN,
+  validateAccountNumber,
+  validateIfsc,
+  validateUpi,
+  validateGstin,
+  validateBounded,
+  validatePlaceName,
+  validateDestinations,
+  firstError,
+  LIMITS,
+} = require("../utils/validators");
+
+// Maps a UI "status" filter to the underlying onboardingState(s).
+// `needs_action` and `active` are virtual buckets spanning multiple states.
+const STATUS_GROUPS = {
+  needs_action: ["PENDING_APPROVAL", "CHANGES_REQUESTED"],
+  active: ["APPROVED", "ACTIVE_FULL"],
+};
+
+function buildOperatorQuery({ search, status, businessType, from, to }) {
+  const escapeRegex = require("../utils/escapeRegex");
+  const query = {};
+
+  if (search) {
+    const rx = { $regex: escapeRegex(String(search)), $options: "i" };
+    query.$or = [
+      { businessName: rx },
+      { contactName: rx },
+      { email: rx },
+      { phone: rx },
+    ];
+  }
+
+  if (status && status !== "all") {
+    if (STATUS_GROUPS[status])
+      query.onboardingState = { $in: STATUS_GROUPS[status] };
+    else query.onboardingState = status;
+  }
+
+  if (businessType && businessType !== "all") query.businessType = businessType;
+
+  if (from || to) {
+    query.createdAt = {};
+    if (from) {
+      const d = new Date(from);
+      if (!isNaN(d)) query.createdAt.$gte = d;
+    }
+    if (to) {
+      const d = new Date(to);
+      if (!isNaN(d)) {
+        d.setHours(23, 59, 59, 999);
+        query.createdAt.$lte = d;
+      }
+    }
+    if (Object.keys(query.createdAt).length === 0) delete query.createdAt;
+  }
+
+  return query;
+}
+
+// ── GET /api/operators/counts  (admin only) — tab badge counts ────────────────
+exports.getOperatorCounts = async (req, res) => {
+  try {
+    const rows = await Operator.aggregate([
+      { $group: { _id: "$onboardingState", count: { $sum: 1 } } },
+    ]);
+    const byState = {};
+    let total = 0;
+    rows.forEach((r) => {
+      byState[r._id] = r.count;
+      total += r.count;
+    });
+    const sum = (states) => states.reduce((n, s) => n + (byState[s] || 0), 0);
+
+    res.json({
+      success: true,
+      counts: {
+        all: total,
+        needs_action: sum(STATUS_GROUPS.needs_action),
+        active: sum(STATUS_GROUPS.active),
+        DRAFT: byState.DRAFT || 0,
+        PENDING_APPROVAL: byState.PENDING_APPROVAL || 0,
+        CHANGES_REQUESTED: byState.CHANGES_REQUESTED || 0,
+        APPROVED: byState.APPROVED || 0,
+        ACTIVE_FULL: byState.ACTIVE_FULL || 0,
+        REJECTED: byState.REJECTED || 0,
+        SUSPENDED: byState.SUSPENDED || 0,
+        EXPIRED: byState.EXPIRED || 0,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
 
 // ── GET /api/operators  (admin only) ─────────────────────────────────────────
 exports.getAllOperators = async (req, res) => {
   try {
-    const { search, state, page = 1, limit = 20 } = req.query;
-    const query = {};
-    if (search) {
-      query["$or"] = [
-        { businessName: { $regex: search, $options: "i" } },
-        { contactName: { $regex: search, $options: "i" } },
-        { email: { $regex: search, $options: "i" } },
-        { phone: { $regex: search, $options: "i" } },
-      ];
-    }
-    if (state && state !== "all") query.onboardingState = state;
+    const {
+      search,
+      status,
+      state, // legacy alias for status
+      businessType,
+      from,
+      to,
+      sort = "recent",
+      page = 1,
+      limit = 20,
+    } = req.query;
+
+    const query = buildOperatorQuery({
+      search,
+      status: status || state,
+      businessType,
+      from,
+      to,
+    });
+
+    // Sort options. "submitted" = FIFO on the review queue (oldest waiting first).
+    const sortMap = {
+      recent: { createdAt: -1 },
+      oldest: { createdAt: 1 },
+      submitted: { lastSubmittedAt: 1, createdAt: 1 },
+      name: { businessName: 1, contactName: 1 },
+    };
+    const sortBy = sortMap[sort] || sortMap.recent;
+
     const skip = (Number(page) - 1) * Number(limit);
     const [operators, total] = await Promise.all([
       Operator.find(query)
         .select("-password")
         .skip(skip)
         .limit(Number(limit))
-        .sort({ createdAt: -1 }),
+        .sort(sortBy),
       Operator.countDocuments(query),
     ]);
 
@@ -91,6 +212,52 @@ exports.transitionState = async (req, res) => {
 
     const previousState = operator.onboardingState;
 
+    // ── Enforce the state machine ──────────────────────────────────────────
+    if (newState === previousState) {
+      return res.status(400).json({
+        success: false,
+        message: `Operator is already ${previousState.replace(/_/g, " ").toLowerCase()}.`,
+      });
+    }
+    const allowed = ALLOWED_TRANSITIONS[previousState] || [];
+    if (!allowed.includes(newState)) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot move an operator from ${previousState} to ${newState}.`,
+      });
+    }
+
+    // A rejection / correction request must always carry a reason so the
+    // operator knows what to fix.
+    if (
+      (newState === "REJECTED" || newState === "SUSPENDED") &&
+      !(note || "").trim()
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: `A reason is required when marking an operator ${newState.toLowerCase()}.`,
+      });
+    }
+
+    // Don't approve while a document is still flagged as bad — otherwise the
+    // operator goes live with a rejected ID on file.
+    if (newState === "APPROVED") {
+      const badDocs = Object.entries(
+        operator.documentStatus?.toObject?.() || operator.documentStatus || {},
+      )
+        .filter(
+          ([, v]) =>
+            v?.status === "REJECTED" || v?.status === "REUPLOAD_REQUIRED",
+        )
+        .map(([k]) => k);
+      if (badDocs.length > 0) {
+        return res.status(400).json({
+          success: false,
+          message: `Cannot approve — these documents are still marked as rejected / re-upload required: ${badDocs.join(", ")}. Resolve them first.`,
+        });
+      }
+    }
+
     operator.transitionHistory.push({
       fromState: previousState,
       toState: newState,
@@ -100,6 +267,12 @@ exports.transitionState = async (req, res) => {
     });
     operator.onboardingState = newState;
     if (newState === "REJECTED") operator.rejectionReason = (note || "").trim();
+
+    // Approving clears any open correction request and the old rejection note
+    if (newState === "APPROVED" || newState === "ACTIVE_FULL") {
+      operator.rejectionReason = "";
+      operator.correctionRequest = undefined;
+    }
 
     await operator.save();
 
@@ -167,6 +340,99 @@ exports.transitionState = async (req, res) => {
         type: "general",
       });
     }
+
+    res.json({ success: true, operator });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// ── PATCH /api/operators/:id/request-changes  (admin only) ───────────────────
+// Real-world flow: admin reviews the application, spots wrong details (e.g. a
+// bad account number), and sends it back listing exactly which fields to fix.
+// Operator lands in CHANGES_REQUESTED, corrects those fields, and resubmits.
+exports.requestChanges = async (req, res) => {
+  try {
+    const { fields, note } = req.body;
+
+    const requestedFields = Array.isArray(fields)
+      ? fields.filter((f) => CORRECTABLE_FIELDS.includes(f))
+      : [];
+
+    if (requestedFields.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Select at least one field the operator needs to correct.",
+      });
+    }
+    if (!(note || "").trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Please explain what is wrong so the operator can fix it.",
+      });
+    }
+
+    const operator = await Operator.findById(req.params.id);
+    if (!operator)
+      return res
+        .status(404)
+        .json({ success: false, message: "Operator not found" });
+
+    const previousState = operator.onboardingState;
+    const allowed = ALLOWED_TRANSITIONS[previousState] || [];
+    if (!allowed.includes("CHANGES_REQUESTED")) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot request changes while the operator is ${previousState.replace(/_/g, " ").toLowerCase()}.`,
+      });
+    }
+
+    operator.correctionRequest = {
+      fields: requestedFields,
+      note: note.trim(),
+      requestedAt: new Date(),
+      requestedBy: req.user._id,
+    };
+    operator.onboardingState = "CHANGES_REQUESTED";
+    operator.transitionHistory.push({
+      fromState: previousState,
+      toState: "CHANGES_REQUESTED",
+      note: note.trim(),
+      performedBy: req.user._id,
+      timestamp: new Date(),
+    });
+
+    // Any flagged document also gets marked REUPLOAD_REQUIRED so the operator
+    // sees the request on the document itself.
+    const docFieldMap = {
+      governmentId: "governmentId",
+      selfieVerification: "selfieVerification",
+      panCard: "panCard",
+      tradeLicense: "tradeLicense",
+    };
+    if (!operator.documentStatus) operator.documentStatus = {};
+    requestedFields.forEach((f) => {
+      const docKey = docFieldMap[f];
+      if (docKey) {
+        operator.documentStatus[docKey] = {
+          status: "REUPLOAD_REQUIRED",
+          remark: note.trim(),
+          updatedAt: new Date(),
+        };
+      }
+    });
+    operator.markModified("documentStatus");
+
+    await operator.save();
+
+    const Notification = require("../models/Notification");
+    await Notification.create({
+      recipientId: operator._id,
+      recipientType: "operator",
+      title: "Corrections Required",
+      body: `Please correct the following before we can approve your account: ${requestedFields.join(", ")}. ${note.trim()}`,
+      type: "general",
+    });
 
     res.json({ success: true, operator });
   } catch (err) {
@@ -385,11 +651,16 @@ exports.submitOnboarding = async (req, res) => {
       return res
         .status(404)
         .json({ success: false, message: "Operator not found" });
-    if (operator.onboardingState !== "DRAFT") {
-      return res
-        .status(400)
-        .json({ success: false, message: "Onboarding already submitted" });
+    // First submission (DRAFT) or a resubmission after the admin asked for
+    // corrections / rejected the application.
+    if (!EDITABLE_STATES.includes(operator.onboardingState)) {
+      const msg =
+        operator.onboardingState === "PENDING_APPROVAL"
+          ? "Your application is already under review. You'll be notified once an admin reviews it."
+          : "Your application can no longer be edited.";
+      return res.status(400).json({ success: false, message: msg });
     }
+    const isResubmission = operator.onboardingState !== "DRAFT";
 
     const {
       contactName,
@@ -410,14 +681,6 @@ exports.submitOnboarding = async (req, res) => {
       confirmedAccuracy,
     } = req.body;
 
-    if (contactName) operator.contactName = contactName.trim();
-    if (phone) operator.phone = phone.trim();
-    if (businessName) operator.businessName = businessName.trim();
-    if (businessType) operator.businessType = businessType;
-    if (country) operator.country = country.trim();
-    if (state) operator.state = state.trim();
-    if (city) operator.city = city.trim();
-
     const parseList = (val) => {
       if (!val) return [];
       if (Array.isArray(val)) return val.filter(Boolean);
@@ -434,8 +697,111 @@ exports.submitOnboarding = async (req, res) => {
       }
       return [];
     };
-    if (mainOperatingDestinations)
-      operator.mainOperatingDestinations = parseList(mainOperatingDestinations);
+
+    const destinations = parseList(mainOperatingDestinations);
+    const isCompany = ["TOUR_OPERATOR", "TRAVEL_AGENCY"].includes(businessType);
+    const truthy = (v) => v === true || v === "true";
+
+    // On a resubmission, any document the admin flagged must be replaced with a
+    // fresh file — re-sending the same rejected file is not a correction.
+    const docFieldMap = {
+      governmentId: "governmentId",
+      selfieVerification: "selfieVerification",
+      panCard: "panCard",
+      tradeLicense: "tradeLicense",
+    };
+    const docLabels = {
+      governmentId: "Government ID",
+      selfieVerification: "Selfie verification",
+      panCard: "PAN card",
+      tradeLicense: "Trade license",
+    };
+    const staleDocError = (key) => {
+      if (!isResubmission) return "";
+      const st = operator.documentStatus?.[docFieldMap[key]]?.status;
+      if (st !== "REUPLOAD_REQUIRED" && st !== "REJECTED") return "";
+      return req.files?.[key]?.[0]
+        ? ""
+        : `${docLabels[key]} was rejected by the reviewer — please upload a new file.`;
+    };
+
+    // ── Full server-side validation of the 7-step form ─────────────────────
+    const bad = firstError({
+      contactName: validatePersonName(contactName, "Full name"),
+      phone: validatePhoneIN(phone),
+      businessName: isCompany
+        ? validateBounded(
+            businessName,
+            "Company / agency name",
+            2,
+            LIMITS.BUSINESS_NAME_MAX,
+          )
+        : validateBounded(
+            businessName,
+            "Company / agency name",
+            2,
+            LIMITS.BUSINESS_NAME_MAX,
+            { required: false },
+          ),
+      businessType: [
+        "INDIVIDUAL_GUIDE",
+        "TOUR_OPERATOR",
+        "TRAVEL_AGENCY",
+        "EXPERIENCE_HOST",
+      ].includes(businessType)
+        ? ""
+        : "Please select a valid business type.",
+      country: validatePlaceName(country, "Country"),
+      state: validatePlaceName(state, "State"),
+      city: validatePlaceName(city, "City"),
+      mainOperatingDestinations: validateDestinations(destinations),
+      governmentId:
+        req.files?.["governmentId"]?.[0] || operator.governmentId
+          ? staleDocError("governmentId")
+          : "Government ID is required.",
+      selfieVerification: staleDocError("selfieVerification"),
+      tradeLicense: staleDocError("tradeLicense"),
+      accountHolderName: validatePersonName(
+        accountHolderName,
+        "Account holder name",
+      ),
+      bankName: validateBounded(
+        bankName,
+        "Bank name",
+        LIMITS.BANK_NAME_MIN,
+        LIMITS.BANK_NAME_MAX,
+      ),
+      accountNumber: validateAccountNumber(accountNumber),
+      ifscCode: validateIfsc(ifscCode),
+      upiId: validateUpi(upiId, { required: false }),
+      gstNumber: validateGstin(gstNumber, { required: false }),
+      panCard:
+        req.files?.["panCard"]?.[0] || operator.panCardPath
+          ? staleDocError("panCard")
+          : "PAN card is required.",
+      agreedToPolicies: truthy(agreedToPolicies)
+        ? ""
+        : "You must agree to the platform policies.",
+      confirmedAccuracy: truthy(confirmedAccuracy)
+        ? ""
+        : "You must confirm accuracy of information.",
+    });
+    if (bad) {
+      return res
+        .status(400)
+        .json({ success: false, field: bad.field, message: bad.message });
+    }
+
+    operator.contactName = collapseSpaces(contactName);
+    operator.phone = String(phone).replace(/\D/g, "");
+    operator.businessName = collapseSpaces(businessName);
+    operator.businessType = businessType;
+    operator.country = collapseSpaces(country);
+    operator.state = collapseSpaces(state);
+    operator.city = collapseSpaces(city);
+    operator.mainOperatingDestinations = destinations.map((d) =>
+      collapseSpaces(d),
+    );
 
     // Files
     if (req.files) {
@@ -481,30 +847,60 @@ exports.submitOnboarding = async (req, res) => {
       }
     }
 
-    if (accountHolderName)
-      operator.accountHolderName = accountHolderName.trim();
-    if (bankName) operator.bankName = bankName.trim();
-    if (accountNumber) operator.accountNumber = accountNumber.trim();
-    if (ifscCode) operator.ifscCode = ifscCode.trim();
-    if (upiId) operator.upiId = upiId.trim();
-    if (gstNumber) operator.gstNumber = gstNumber.trim();
+    operator.accountHolderName = collapseSpaces(accountHolderName);
+    operator.bankName = collapseSpaces(bankName);
+    operator.accountNumber = String(accountNumber).trim();
+    operator.ifscCode = String(ifscCode).trim().toUpperCase();
+    operator.upiId = (upiId || "").trim();
+    operator.gstNumber = (gstNumber || "").trim().toUpperCase();
 
-    operator.agreedToPolicies =
-      agreedToPolicies === "true" || agreedToPolicies === true;
-    operator.confirmedAccuracy =
-      confirmedAccuracy === "true" || confirmedAccuracy === true;
+    operator.agreedToPolicies = true;
+    operator.confirmedAccuracy = true;
+
+    const fromState = operator.onboardingState;
+
+    // Close out the open correction request (keep it in history for audit)
+    if (operator.correctionRequest?.requestedAt) {
+      operator.correctionHistory.push({
+        fields: operator.correctionRequest.fields || [],
+        note: operator.correctionRequest.note || "",
+        requestedAt: operator.correctionRequest.requestedAt,
+        resolvedAt: new Date(),
+      });
+      operator.correctionRequest = undefined;
+    }
+    operator.rejectionReason = "";
 
     operator.transitionHistory.push({
-      fromState: "DRAFT",
+      fromState,
       toState: "PENDING_APPROVAL",
-      note: "Operator submitted onboarding form",
+      note: isResubmission
+        ? "Operator corrected details and resubmitted for approval"
+        : "Operator submitted onboarding form",
       timestamp: new Date(),
     });
     operator.onboardingState = "PENDING_APPROVAL";
+    operator.submissionCount = (operator.submissionCount || 0) + 1;
+    operator.lastSubmittedAt = new Date();
     operator.markModified("documentStatus");
 
     await operator.save();
-    res.json({ success: true, operator });
+
+    // Tell admins there's something to review again
+    if (isResubmission) {
+      try {
+        const Notification = require("../models/Notification");
+        await Notification.create({
+          recipientId: operator._id,
+          recipientType: "operator",
+          title: "Application Resubmitted",
+          body: "Thanks — your corrected details are back with our team for review.",
+          type: "general",
+        });
+      } catch {}
+    }
+
+    res.json({ success: true, operator, resubmitted: isResubmission });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -553,7 +949,8 @@ exports.reuploadDocument = async (req, res) => {
       tradeLicense: "tradeLicensePath",
       panCard: "panCardPath",
     };
-    operator[fieldMap[key]] = "/uploads/" + req.file.filename;
+    // operatorUploadMiddleware stores files under /uploads/operators/
+    operator[fieldMap[key]] = "/uploads/operators/" + req.file.filename;
     operator.documentStatus[key] = {
       status: "PENDING",
       remark: "",

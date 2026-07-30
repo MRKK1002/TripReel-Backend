@@ -32,7 +32,32 @@ const Report = mongoose.models.Report || mongoose.model("Report", reportSchema);
 // POST /api/reports — user submits a report
 exports.createReport = async (req, res) => {
   try {
-    const report = await Report.create({ ...req.body, userId: req.user._id });
+    // Only accept the fields a reporter is allowed to set — `status` and
+    // `adminNote` are staff-controlled.
+    const { bookingId, packageId, operatorId, type, subject, description } =
+      req.body;
+
+    const cleanSubject = String(subject || "").trim();
+    if (!cleanSubject) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Subject is required" });
+    }
+
+    const report = await Report.create({
+      userId: req.user._id,
+      bookingId: bookingId || undefined,
+      packageId: packageId || undefined,
+      operatorId: operatorId || undefined,
+      type: ["booking", "operator", "package", "other"].includes(type)
+        ? type
+        : "other",
+      subject: cleanSubject.slice(0, 200),
+      description: String(description || "")
+        .trim()
+        .slice(0, 2000),
+      status: "open",
+    });
     res.status(201).json({ success: true, report });
 
     // Notify admin about new report
@@ -81,8 +106,30 @@ exports.getAllReports = async (req, res) => {
 // PATCH /api/reports/:id — admin updates report status
 exports.updateReport = async (req, res) => {
   try {
-    const report = await Report.findByIdAndUpdate(req.params.id, req.body, {
+    // Whitelist — the whole body used to be written straight through, so an
+    // admin request could rewrite userId, subject, or the linked booking.
+    const updates = {};
+    if (req.body.status !== undefined) {
+      const allowedStatuses = ["open", "in_progress", "resolved", "closed"];
+      if (!allowedStatuses.includes(req.body.status)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid report status" });
+      }
+      updates.status = req.body.status;
+    }
+    if (req.body.adminNote !== undefined) {
+      updates.adminNote = String(req.body.adminNote).trim().slice(0, 1000);
+    }
+    if (Object.keys(updates).length === 0) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Nothing to update" });
+    }
+
+    const report = await Report.findByIdAndUpdate(req.params.id, updates, {
       new: true,
+      runValidators: true,
     });
     if (!report)
       return res

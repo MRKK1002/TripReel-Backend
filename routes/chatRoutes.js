@@ -8,7 +8,10 @@ const {
   sendMessage,
 } = require("../controllers/chatController");
 const { protect, restrictTo } = require("../middleware/authMiddleware");
-const { operatorProtect } = require("../middleware/operatorAuthMiddleware");
+const {
+  operatorProtect,
+  requireApprovedOperator,
+} = require("../middleware/operatorAuthMiddleware");
 
 // User routes
 router.get("/conversations", protect, getUserConversations);
@@ -33,6 +36,7 @@ router.get(
 router.post(
   "/operator/:conversationId/messages",
   operatorProtect,
+  requireApprovedOperator,
   (req, res, next) => {
     req.user = null;
     next();
@@ -64,6 +68,7 @@ router.post(
 router.post(
   "/operator/send-to-user/:userId",
   operatorProtect,
+  requireApprovedOperator,
   async (req, res) => {
     try {
       const Conversation = require("../models/Conversation");
@@ -72,6 +77,26 @@ router.post(
       const { text, imageUrl } = req.body;
       const operatorId = req.operator._id;
       const userId = req.params.userId;
+
+      if (!mongoose.Types.ObjectId.isValid(userId)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid user id" });
+      }
+
+      const bodyText = typeof text === "string" ? text.trim() : "";
+      const bodyImage = typeof imageUrl === "string" ? imageUrl.trim() : "";
+      if (!bodyText && !bodyImage) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Message cannot be empty" });
+      }
+      if (bodyText.length > 2000) {
+        return res.status(400).json({
+          success: false,
+          message: "Message cannot exceed 2000 characters",
+        });
+      }
 
       // Find existing active conversation
       let conv = await Conversation.findOne({
@@ -90,10 +115,19 @@ router.post(
           operatorId,
         }).sort({ createdAt: -1 });
 
+        // An operator may only start a conversation with a customer who has
+        // actually booked with them. Previously a missing booking fell back to
+        // a fabricated ObjectId, letting an operator cold-message any user id.
+        if (!recentBooking) {
+          return res.status(403).json({
+            success: false,
+            message:
+              "You can only message travellers who have booked one of your trips.",
+          });
+        }
+
         conv = await Conversation.create({
-          bookingId: recentBooking
-            ? recentBooking._id
-            : new mongoose.Types.ObjectId(),
+          bookingId: recentBooking._id,
           userId,
           operatorId,
           packageTitle:
@@ -108,11 +142,11 @@ router.post(
         senderId: operatorId,
         senderType: "operator",
         senderName: req.operator.contactName || "Operator",
-        text: text || "",
-        imageUrl: imageUrl || "",
+        text: bodyText,
+        imageUrl: bodyImage,
       });
 
-      const preview = (text || "").substring(0, 60) || "Document shared";
+      const preview = bodyText.substring(0, 60) || "Document shared";
       await Conversation.findByIdAndUpdate(conv._id, {
         lastMessage: preview,
         lastMessageAt: new Date(),

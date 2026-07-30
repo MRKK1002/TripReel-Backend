@@ -16,7 +16,10 @@ const {
   operatorGetReviews,
 } = require("../controllers/packageController");
 const { protect, restrictTo } = require("../middleware/authMiddleware");
-const { operatorProtect } = require("../middleware/operatorAuthMiddleware");
+const {
+  operatorProtect,
+  requireApprovedOperator,
+} = require("../middleware/operatorAuthMiddleware");
 const upload = require("../middleware/uploadMiddleware");
 
 // multer fields for package images
@@ -26,19 +29,34 @@ const packageUpload = upload.fields([
 ]);
 
 // ── Operator routes (must come before /:id to avoid conflicts) ────────────────
+// Writes are gated on admin approval — an unapproved operator can read their
+// (empty) list but cannot create or change anything.
 router.get("/operator/mine", operatorProtect, operatorGetMyPackages);
 router.get("/operator/reviews", operatorProtect, operatorGetReviews);
-router.post("/operator", operatorProtect, packageUpload, operatorCreatePackage);
+router.post(
+  "/operator",
+  operatorProtect,
+  requireApprovedOperator,
+  packageUpload,
+  operatorCreatePackage,
+);
 router.put(
   "/operator/:id",
   operatorProtect,
+  requireApprovedOperator,
   packageUpload,
   operatorUpdatePackage,
 );
-router.delete("/operator/:id", operatorProtect, operatorDeletePackage);
+router.delete(
+  "/operator/:id",
+  operatorProtect,
+  requireApprovedOperator,
+  operatorDeletePackage,
+);
 router.patch(
   "/operator/:id/toggle-active",
   operatorProtect,
+  requireApprovedOperator,
   operatorToggleActive,
 );
 

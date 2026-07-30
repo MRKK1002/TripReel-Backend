@@ -1,5 +1,18 @@
 const jwt = require("jsonwebtoken");
 const { Operator } = require("../models/Operator");
+const {
+  collapseSpaces,
+  validatePersonName,
+  validateEmail,
+  validatePhoneIN,
+  validatePassword,
+  validateUpi,
+  validateBounded,
+  validatePlaceName,
+  validateDestinations,
+  firstError,
+  LIMITS,
+} = require("../utils/validators");
 
 const signToken = (id) =>
   jwt.sign({ id }, process.env.JWT_SECRET, {
@@ -11,21 +24,22 @@ exports.register = async (req, res) => {
   try {
     let { contactName, email, phone, password } = req.body;
 
-    if (!password || password.length < 8) {
-      return res.status(400).json({
-        success: false,
-        message: "Password must be at least 8 characters",
-      });
-    }
-
     // Normalize
+    contactName = collapseSpaces(contactName);
     email = (email || "").trim().toLowerCase();
-    phone = (phone || "").trim();
+    phone = (phone || "").trim().replace(/\D/g, "");
 
-    if (!email) {
+    // ── Validate every field server-side (client rules can be bypassed) ────
+    const bad = firstError({
+      contactName: validatePersonName(contactName, "Full name"),
+      email: validateEmail(email),
+      phone: validatePhoneIN(phone),
+      password: validatePassword(password),
+    });
+    if (bad) {
       return res
         .status(400)
-        .json({ success: false, message: "Email is required" });
+        .json({ success: false, field: bad.field, message: bad.message });
     }
 
     // Reject if email OR phone already belongs to another operator
@@ -89,14 +103,13 @@ exports.login = async (req, res) => {
         .json({ success: false, message: "Invalid email or password" });
     }
 
-    if (operator.onboardingState === "SUSPENDED") {
-      // Allow login but they'll see suspended status page
-    }
-
     const token = signToken(operator._id);
 
-    // Return full operator data (exclude password)
-    const fullOperator = await Operator.findById(operator._id);
+    // Return full operator data (exclude password + payout identifiers, which
+    // the client never needs and which used to be persisted to localStorage)
+    const fullOperator = await Operator.findById(operator._id).select(
+      "-razorpayContactId -razorpayFundAccountId -razorpayFundFingerprint",
+    );
 
     res.json({
       success: true,
@@ -146,6 +159,71 @@ exports.updateProfile = async (req, res) => {
         .split(",")
         .map((s) => s.trim())
         .filter(Boolean);
+    }
+
+    // ── Validate only the fields actually being changed ────────────────────
+    const checks = {};
+    if (updates.contactName !== undefined) {
+      updates.contactName = collapseSpaces(updates.contactName);
+      checks.contactName = validatePersonName(updates.contactName, "Full name");
+    }
+    if (updates.phone !== undefined) {
+      updates.phone = String(updates.phone).replace(/\D/g, "");
+      checks.phone = validatePhoneIN(updates.phone);
+    }
+    if (updates.businessName !== undefined) {
+      updates.businessName = collapseSpaces(updates.businessName);
+      checks.businessName = validateBounded(
+        updates.businessName,
+        "Business name",
+        2,
+        LIMITS.BUSINESS_NAME_MAX,
+        { required: false },
+      );
+    }
+    if (updates.businessType !== undefined) {
+      const allowedTypes = [
+        "INDIVIDUAL_GUIDE",
+        "TOUR_OPERATOR",
+        "TRAVEL_AGENCY",
+        "EXPERIENCE_HOST",
+        "",
+      ];
+      checks.businessType = allowedTypes.includes(updates.businessType)
+        ? ""
+        : "Please select a valid business type.";
+    }
+    if (updates.city !== undefined)
+      checks.city = validatePlaceName(updates.city, "City");
+    if (updates.state !== undefined)
+      checks.state = validatePlaceName(updates.state, "State");
+    if (updates.country !== undefined)
+      checks.country = validatePlaceName(updates.country, "Country");
+    if (updates.mainOperatingDestinations !== undefined)
+      checks.mainOperatingDestinations = validateDestinations(
+        updates.mainOperatingDestinations,
+      );
+    if (updates.upiId !== undefined) {
+      updates.upiId = String(updates.upiId).trim();
+      checks.upiId = validateUpi(updates.upiId, { required: false });
+    }
+
+    const bad = firstError(checks);
+    if (bad) {
+      return res
+        .status(400)
+        .json({ success: false, field: bad.field, message: bad.message });
+    }
+
+    // Changing the UPI ID changes where money goes — stamp it so the wallet can
+    // apply its cooling-off window, and drop the cached RazorpayX fund account.
+    if (updates.upiId !== undefined) {
+      const current = await Operator.findById(req.operator._id).select("upiId");
+      if ((current?.upiId || "") !== updates.upiId) {
+        updates.payoutDetailsChangedAt = new Date();
+        updates.razorpayFundAccountId = "";
+        updates.razorpayFundFingerprint = "";
+      }
     }
 
     const operator = await Operator.findByIdAndUpdate(

@@ -891,6 +891,57 @@ async function runCronJobs() {
   return results;
 }
 
+// Days a DRAFT operator can sit un-submitted before it auto-expires
+const DRAFT_EXPIRY_DAYS = Number(process.env.OPERATOR_DRAFT_EXPIRY_DAYS) || 14;
+
+/**
+ * Job: auto-expire abandoned operator drafts.
+ * An operator who registered but never submitted their onboarding form within
+ * DRAFT_EXPIRY_DAYS is moved DRAFT → EXPIRED, so they drop out of the admin's
+ * queue and the drafts pile stops growing. They can still re-apply (EXPIRED is
+ * an editable state), which puts them back into PENDING_APPROVAL.
+ */
+exports.runStaleDraftExpiry = async function () {
+  const results = { expired: 0, errors: [] };
+  try {
+    const { Operator } = require("../models/Operator");
+    const cutoff = new Date(
+      Date.now() - DRAFT_EXPIRY_DAYS * 24 * 60 * 60 * 1000,
+    );
+
+    // Never submitted (submissionCount 0 / no lastSubmittedAt) and registered
+    // before the cutoff.
+    const stale = await Operator.find({
+      onboardingState: "DRAFT",
+      createdAt: { $lt: cutoff },
+      $or: [
+        { submissionCount: { $in: [0, null] } },
+        { submissionCount: { $exists: false } },
+      ],
+      lastSubmittedAt: { $in: [null, undefined] },
+    }).select("_id onboardingState transitionHistory");
+
+    for (const op of stale) {
+      try {
+        op.transitionHistory.push({
+          fromState: "DRAFT",
+          toState: "EXPIRED",
+          note: `Auto-expired: onboarding not completed within ${DRAFT_EXPIRY_DAYS} days`,
+          timestamp: new Date(),
+        });
+        op.onboardingState = "EXPIRED";
+        await op.save();
+        results.expired++;
+      } catch (e) {
+        results.errors.push(`Expire ${op._id}: ${e.message}`);
+      }
+    }
+  } catch (err) {
+    results.errors.push(`Stale draft expiry: ${err.message}`);
+  }
+  return results;
+};
+
 // POST /api/admin/run-cron  — manual trigger (admin only)
 exports.runCron = async (req, res) => {
   try {
@@ -899,6 +950,7 @@ exports.runCron = async (req, res) => {
     const reminders = await exports.runTripReminders();
     const reviews = await exports.runReviewReminders();
     const wishlist = await exports.runWishlistAlerts();
+    const drafts = await exports.runStaleDraftExpiry();
     const results = {
       completed: auto.completed,
       cancelled: auto.cancelled,
@@ -906,11 +958,13 @@ exports.runCron = async (req, res) => {
       reminders: reminders.reminders,
       reviewReminders: reviews.reviewReminders,
       urgencyAlerts: wishlist.urgencyAlerts,
+      draftsExpired: drafts.expired,
       errors: [
         ...auto.errors,
         ...reminders.errors,
         ...reviews.errors,
         ...wishlist.errors,
+        ...drafts.errors,
       ],
     };
     res.json({

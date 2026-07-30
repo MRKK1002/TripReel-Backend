@@ -1,5 +1,50 @@
 const PlatformSettings = require("../models/PlatformSettings");
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Cancellation refund slabs feed real refund calculations, so they get the same
+// checks the admin UI applies. Mirrors CancellationSlabs.jsx validate().
+// ─────────────────────────────────────────────────────────────────────────────
+function validateRefundSlabs(slabs) {
+  if (!Array.isArray(slabs) || slabs.length === 0)
+    return "Add at least one refund tier.";
+  if (slabs.length > 20) return "You can define at most 20 refund tiers.";
+
+  for (const slab of slabs) {
+    const days = Number(slab?.daysBeforeTrip);
+    const pct = Number(slab?.refundPercent);
+    if (!Number.isFinite(days) || !Number.isInteger(days) || days < 0)
+      return "Days before trip must be a whole number of 0 or more.";
+    if (days > 3650) return "Days before trip cannot exceed 3650.";
+    if (!Number.isFinite(pct) || pct < 0 || pct > 100)
+      return "Refund percentage must be between 0 and 100.";
+  }
+
+  // A 0-day catch-all guarantees every cancellation maps to a tier
+  if (!slabs.some((s) => Number(s.daysBeforeTrip) === 0))
+    return "Add a 0-day tier (the catch-all for last-minute cancellations).";
+
+  const sorted = [...slabs].sort(
+    (a, b) => Number(b.daysBeforeTrip) - Number(a.daysBeforeTrip),
+  );
+
+  // Duplicate thresholds make the mapping ambiguous
+  const days = sorted.map((s) => Number(s.daysBeforeTrip));
+  if (new Set(days).size !== days.length)
+    return "Two tiers use the same 'days before trip' value. Make each tier unique.";
+
+  // Cancelling later must never refund more than cancelling earlier
+  for (let i = 1; i < sorted.length; i++) {
+    if (Number(sorted[i].refundPercent) > Number(sorted[i - 1].refundPercent)) {
+      return `Illogical tiers: cancelling closer to the trip (${sorted[i].daysBeforeTrip} days) cannot refund more than cancelling earlier (${sorted[i - 1].daysBeforeTrip} days).`;
+    }
+  }
+
+  return "";
+}
+
+// Exported for tests
+exports.validateRefundSlabs = validateRefundSlabs;
+
 // Default settings — seeded on first GET if missing
 const DEFAULTS = [
   { key: "platform_fee_percent", value: 10, label: "Platform Fee (%)" },
@@ -171,13 +216,28 @@ exports.updateSetting = async (req, res) => {
       }
       finalValue = numVal;
     } else if (arrayKeys.includes(req.params.key)) {
-      // Array settings (refund slabs) — store as-is
       if (!Array.isArray(value)) {
         return res
           .status(400)
           .json({ success: false, message: "value must be an array" });
       }
-      finalValue = value;
+      // Refund slabs drive live refund math — validate here too, not just in the
+      // React form (a direct PATCH could previously save refundPercent: 500).
+      if (req.params.key === "cancellation_refund_slabs") {
+        const slabError = validateRefundSlabs(value);
+        if (slabError) {
+          return res.status(400).json({ success: false, message: slabError });
+        }
+        finalValue = value
+          .map((s) => ({
+            daysBeforeTrip: Math.floor(Number(s.daysBeforeTrip)),
+            refundPercent: Number(s.refundPercent),
+            label: typeof s.label === "string" ? s.label.trim() : undefined,
+          }))
+          .sort((a, b) => b.daysBeforeTrip - a.daysBeforeTrip);
+      } else {
+        finalValue = value;
+      }
     } else {
       // String settings (policies, terms) — just store as-is
       finalValue = String(value).trim();

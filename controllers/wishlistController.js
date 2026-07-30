@@ -10,7 +10,6 @@ exports.getAllWishlists = async (req, res) => {
       .populate("user", "name email")
       .populate("packages", "title image_url")
       .sort({ createdAt: -1 });
-    console.log("abc");
 
     const filtered = search
       ? wishlists.filter(
@@ -46,7 +45,23 @@ exports.getMyWishlists = async (req, res) => {
 // POST /api/wishlists
 exports.createWishlist = async (req, res) => {
   try {
-    const wishlist = await Wishlist.create({ ...req.body, user: req.user.id });
+    // Whitelist instead of spreading the raw body
+    const name = String(req.body.name || "").trim();
+    if (!name) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Wishlist name is required" });
+    }
+
+    const wishlist = await Wishlist.create({
+      user: req.user.id,
+      name: name.slice(0, 100),
+      location: String(req.body.location || "")
+        .trim()
+        .slice(0, 100),
+      image: String(req.body.image || "").trim(),
+      packages: [],
+    });
     res.status(201).json({ success: true, wishlist });
   } catch (err) {
     res.status(400).json({ success: false, message: err.message });
@@ -95,7 +110,14 @@ exports.removePackageFromWishlist = async (req, res) => {
 // DELETE /api/wishlists/:id
 exports.deleteWishlist = async (req, res) => {
   try {
-    const wishlist = await Wishlist.findByIdAndDelete(req.params.id);
+    // Ownership check — this was a bare findByIdAndDelete, so any authenticated
+    // user could delete any other user's wishlist. Admins may delete any.
+    const filter =
+      req.user?.role === "admin"
+        ? { _id: req.params.id }
+        : { _id: req.params.id, user: req.user.id };
+
+    const wishlist = await Wishlist.findOneAndDelete(filter);
     if (!wishlist)
       return res
         .status(404)
@@ -120,24 +142,23 @@ exports.operatorWishlistStats = async (req, res) => {
       return res.json({ success: true, total: 0, packages: [] });
     }
 
-    // Find all wishlists that contain any of the operator's packages
+    // Find all wishlists that contain any of the operator's packages.
+    // Counts only — the response used to include the name/avatar of users who
+    // wishlisted, which the operator UI never shows and doesn't need.
     const wishlists = await Wishlist.find({ packages: { $in: packageIds } })
-      .populate("user", "name avatar")
+      .select("packages")
       .lean();
 
     // Count per package
     const packageCounts = {};
     packageIds.forEach((id) => {
-      packageCounts[id.toString()] = { count: 0, users: [] };
+      packageCounts[id.toString()] = { count: 0 };
     });
 
     wishlists.forEach((wl) => {
       (wl.packages || []).forEach((pkgId) => {
         const key = pkgId.toString();
-        if (packageCounts[key]) {
-          packageCounts[key].count++;
-          if (wl.user) packageCounts[key].users.push(wl.user);
-        }
+        if (packageCounts[key]) packageCounts[key].count++;
       });
     });
 
@@ -146,7 +167,6 @@ exports.operatorWishlistStats = async (req, res) => {
         packageId: p._id,
         title: p.title,
         wishlistCount: packageCounts[p._id.toString()]?.count || 0,
-        users: (packageCounts[p._id.toString()]?.users || []).slice(0, 5),
       }))
       .filter((p) => p.wishlistCount > 0)
       .sort((a, b) => b.wishlistCount - a.wishlistCount);
