@@ -7,10 +7,12 @@ const {
   getAllOperators,
   getOperatorById,
   transitionState,
+  requestChanges,
   submitOnboarding,
   reuploadDocument,
   updateDocumentStatus,
   getOperatorStats,
+  getOperatorCounts,
 } = require("../controllers/operatorController");
 
 // ── Operator: submit onboarding ───────────────────────────────────────────────
@@ -37,6 +39,9 @@ router.patch(
 // ── Admin: list all operators ─────────────────────────────────────────────────
 router.get("/", protect, restrictTo("admin"), getAllOperators);
 
+// ── Admin: tab counts (must be before /:id so "counts" isn't read as an id) ──
+router.get("/counts", protect, restrictTo("admin"), getOperatorCounts);
+
 // ── Admin: get single operator ────────────────────────────────────────────────
 router.get("/:id", protect, restrictTo("admin"), getOperatorById);
 
@@ -45,6 +50,14 @@ router.get("/:id/stats", protect, restrictTo("admin"), getOperatorStats);
 
 // ── Admin: approve / reject / suspend ────────────────────────────────────────
 router.patch("/:id/state", protect, restrictTo("admin"), transitionState);
+
+// ── Admin: send the application back for field-level corrections ─────────────
+router.patch(
+  "/:id/request-changes",
+  protect,
+  restrictTo("admin"),
+  requestChanges,
+);
 
 // ── Admin: approve / reject / reupload a document ────────────────────────────
 router.patch(

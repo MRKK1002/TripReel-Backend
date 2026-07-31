@@ -4,25 +4,74 @@ const cors = require("cors");
 const dotenv = require("dotenv");
 const path = require("path");
 const http = require("http");
+const rateLimit = require("express-rate-limit");
 
 dotenv.config();
 
 // ── Force Indian Standard Time for ALL server-side date math ────────────────
-// TripReel operates only in India. Pinning the process timezone makes every
-// `new Date()`, `.getDate()`, `.getHours()`, and server-side toLocaleString
-// resolve in IST regardless of where the server is hosted (cloud hosts default
-// to UTC). This prevents off-by-one-day errors in refund slabs, auto-complete,
-// trip countdowns, and Snapja dispatch dates. Must run before any Date usage.
 process.env.TZ = process.env.TZ || "Asia/Kolkata";
 
 const app = express();
 const server = http.createServer(app);
 
+// Behind a proxy/load balancer (Render, nginx, Cloudflare) the client IP arrives
+// in X-Forwarded-For. Without this every request looks like it comes from the
+// proxy, which makes the rate limiters key on a single IP — either useless or a
+// self-inflicted DoS on all users at once.
+app.set("trust proxy", Number(process.env.TRUST_PROXY_HOPS || 1));
+
 // Initialize WebSocket
 const { initSocket } = require("./config/socket");
 initSocket(server);
 
-// ── Middleware ────────────────────────────────────────────────────────────────
+// ── Rate limiters ─────────────────────────────────────────────────────────────
+// Limiters are ON by default. Set DISABLE_RATE_LIMIT=true locally if they get in
+// the way — they used to be tied to NODE_ENV, so any environment not started
+// with NODE_ENV=production ran completely unthrottled.
+const rateLimitDisabled = process.env.DISABLE_RATE_LIMIT === "true";
+const skipRateLimit = () => rateLimitDisabled;
+
+// Auth endpoints (login, OTP send/verify, Google login) — strict
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 20, // 20 attempts per IP per 15 min
+  message: {
+    success: false,
+    message:
+      "Too many requests from this IP. Please try again after 15 minutes.",
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: skipRateLimit,
+});
+
+// OTP send — extra strict (prevents SMS bombing)
+const otpSendLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000, // 10 minutes
+  max: 5, // 5 OTP requests per IP per 10 min
+  message: {
+    success: false,
+    message: "Too many OTP requests. Please try again after 10 minutes.",
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: skipRateLimit,
+});
+
+// General API — loose (protects against scraping/DDoS)
+const generalLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 200, // 200 requests per IP per minute
+  message: {
+    success: false,
+    message: "Too many requests. Please slow down.",
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: skipRateLimit,
+});
+
+// ── Middleware ─────────────────────────────────────────────────────────────────
 app.use(cors());
 app.use(
   express.json({
@@ -34,10 +83,17 @@ app.use(
 );
 app.use(express.urlencoded({ extended: true, limit: "20mb" }));
 
+// Apply general limiter to all /api routes
+app.use("/api", generalLimiter);
+
 // Static folder for uploaded images and videos
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
 // ── Routes ────────────────────────────────────────────────────────────────────
+// Auth — stricter limits; OTP send endpoints get their own even tighter limiter
+app.use("/api/auth/signup/send-otp", otpSendLimiter);
+app.use("/api/auth/login/send-otp", otpSendLimiter);
+app.use("/api/auth", authLimiter);
 app.use("/api/auth", require("./routes/authRoutes"));
 app.use("/api/profile", require("./routes/profileRoutes"));
 app.use("/api/reviews", require("./routes/reviewRoutes"));
@@ -57,6 +113,7 @@ app.use("/api/trips", require("./routes/tripRoutes"));
 app.use("/api/bookings", require("./routes/bookingRoutes"));
 app.use("/api/wishlists", require("./routes/wishlistRoutes"));
 app.use("/api/reels", require("./routes/reelRoutes"));
+app.use("/api/operators/auth", authLimiter);
 app.use("/api/operators/auth", require("./routes/operatorAuthRoutes"));
 app.use("/api/operators", require("./routes/operatorRoutes"));
 
@@ -67,7 +124,12 @@ app.use(
   require("./routes/flexibleAvailabilityRoutes"),
 );
 app.use("/api/trip-bookings", require("./routes/tripBookingRoutes"));
+app.use("/api/booking-intents", require("./routes/bookingIntentRoutes"));
+// Public share landing pages (smart deep links → app or store)
+app.use("/share", require("./routes/shareRoutes"));
 app.use("/api/operator-bookings", require("./routes/operatorBookingRoutes"));
+app.use("/api/trip-groups", require("./routes/tripGroupRoutes"));
+app.use("/api/trip-doc-templates", require("./routes/tripDocTemplateRoutes"));
 app.use("/api/settings", require("./routes/platformSettingsRoutes"));
 app.use("/api/wallet", require("./routes/walletRoutes"));
 app.use("/api/cron", require("./routes/cronRoutes"));
@@ -134,6 +196,8 @@ mongoose
       runSnapjaDispatch,
       runSnapjaStatusSync,
       runSnapjaAutoCancel,
+      runAbandonedBookingReminders,
+      runStaleDraftExpiry,
       runCronJobs,
     } = require("./controllers/cronController");
 
@@ -148,6 +212,18 @@ mongoose
           );
         } catch (err) {
           console.error("❌ Cron midnight error:", err.message);
+        }
+
+        // Expire abandoned operator drafts (never submitted within the window)
+        try {
+          const draft = await runStaleDraftExpiry();
+          if (draft.expired) {
+            console.log(
+              `✅ Cron (midnight): ${draft.expired} stale operator drafts expired`,
+            );
+          }
+        } catch (err) {
+          console.error("❌ Cron draft-expiry error:", err.message);
         }
       },
       { timezone: "Asia/Kolkata" },
@@ -252,6 +328,25 @@ mongoose
           );
         } catch (err) {
           console.error("❌ Cron 11AM error:", err.message);
+        }
+      },
+      { timezone: "Asia/Kolkata" },
+    );
+
+    // 12 PM & 7 PM IST — Abandoned-booking reminders (reached booking screen,
+    // didn't complete). Each intent is nudged only once (notified flag).
+    cron.schedule(
+      "0 12,19 * * *",
+      async () => {
+        try {
+          const result = await runAbandonedBookingReminders();
+          if (result.reminders) {
+            console.log(
+              `✅ Cron (abandoned booking): ${result.reminders} reminders sent`,
+            );
+          }
+        } catch (err) {
+          console.error("❌ Cron abandoned booking error:", err.message);
         }
       },
       { timezone: "Asia/Kolkata" },

@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const {
   registerToken,
+  unregisterToken,
   adminSendNotification,
   getMyNotifications,
   getOperatorNotifications,
@@ -25,6 +26,7 @@ router.patch(
 // User & Admin routes
 router.use(protect);
 router.post("/register-token", registerToken);
+router.post("/unregister-token", unregisterToken);
 router.get("/my", getMyNotifications);
 router.get("/admin/all", restrictTo("admin"), getAdminNotifications);
 router.patch("/mark-read", markAllRead);

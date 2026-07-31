@@ -64,7 +64,7 @@ ehthumbs.db
 # ========================
 # Uploads / User content
 # ========================
-uploads/
+
 temp/
 tmp/
 
@@ -73,3 +73,4 @@ tmp/
 # ========================
 dist/
 build/
+BOOKING_SYSTEM.md/

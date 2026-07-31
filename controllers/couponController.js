@@ -1,6 +1,58 @@
 const Coupon = require("../models/Coupon");
 const Batch = require("../models/Batch");
 
+// ── Validation helpers ────────────────────────────────────────────────────────
+
+// The validity window was never checked, so a coupon could be created with
+// validFrom after validUntil (silently dead) or with validUntil in the past.
+function validateCouponWindow({ validFrom, validUntil, requireFuture = true }) {
+  const until = new Date(validUntil);
+  if (isNaN(until.getTime())) return "Please provide a valid expiry date.";
+
+  // Only compare against an explicit start date. Defaulting the start to "now"
+  // meant an existing coupon with no validFrom could never be edited once it had
+  // expired, because until <= now always tripped this check.
+  if (validFrom) {
+    const from = new Date(validFrom);
+    if (isNaN(from.getTime())) return "Please provide a valid start date.";
+    if (until <= from)
+      return "The expiry date must be after the coupon's start date.";
+  }
+
+  // Only enforced when the expiry is actually being set — otherwise an operator
+  // could not deactivate or tidy up an already-expired coupon.
+  if (requireFuture && until <= new Date())
+    return "The expiry date must be in the future.";
+
+  return "";
+}
+
+function validateCouponLimits({
+  maxDiscount,
+  minGuests,
+  minOrderAmount,
+  usageLimit,
+}) {
+  const nonNegative = {
+    "Maximum discount": maxDiscount,
+    "Minimum guests": minGuests,
+    "Minimum order amount": minOrderAmount,
+    "Usage limit": usageLimit,
+  };
+  for (const [label, raw] of Object.entries(nonNegative)) {
+    if (raw === undefined || raw === null || raw === "") continue;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 0) return `${label} cannot be negative.`;
+  }
+  if (minGuests !== undefined && Number(minGuests) > 100)
+    return "Minimum guests cannot exceed 100.";
+  return "";
+}
+
+// Exported for tests
+exports.validateCouponWindow = validateCouponWindow;
+exports.validateCouponLimits = validateCouponLimits;
+
 // ── Public / User ─────────────────────────────────────────────────────────────
 
 // GET /api/coupons?batchId=X or ?packageId=X — available coupons (app shows these)
@@ -119,6 +171,8 @@ exports.validateCoupon = async (req, res) => {
       if (coupon.maxDiscount > 0 && discountAmount > coupon.maxDiscount) {
         discountAmount = coupon.maxDiscount;
       }
+      // Never let the discount exceed the order subtotal
+      if (discountAmount > subtotal) discountAmount = subtotal;
     } else {
       // flat
       discountAmount = coupon.value;
@@ -188,6 +242,21 @@ exports.createCoupon = async (req, res) => {
         success: false,
         message: "Discount value must be greater than 0.",
       });
+    }
+
+    const windowError = validateCouponWindow({ validFrom, validUntil });
+    if (windowError) {
+      return res.status(400).json({ success: false, message: windowError });
+    }
+
+    const limitsError = validateCouponLimits({
+      maxDiscount,
+      minGuests,
+      minOrderAmount,
+      usageLimit,
+    });
+    if (limitsError) {
+      return res.status(400).json({ success: false, message: limitsError });
     }
 
     let resolvedPackageId = packageId;
@@ -288,6 +357,32 @@ exports.updateCoupon = async (req, res) => {
         .json({ success: false, message: "Coupon not found or not yours" });
     }
 
+    // Once a coupon has been redeemed, its economics are locked. Travellers have
+    // already booked against these terms; only the expiry, the usage cap and the
+    // on/off switch may still be adjusted.
+    const alreadyUsed = Number(coupon.usedCount) > 0;
+    const lockedWhenUsed = [
+      "code",
+      "type",
+      "value",
+      "maxDiscount",
+      "minGuests",
+      "minOrderAmount",
+    ];
+    if (alreadyUsed) {
+      const attempted = lockedWhenUsed.filter(
+        (k) =>
+          req.body[k] !== undefined &&
+          String(req.body[k]) !== String(coupon[k]),
+      );
+      if (attempted.length > 0) {
+        return res.status(400).json({
+          success: false,
+          message: `This coupon has already been used ${coupon.usedCount} time(s), so its discount terms can't be changed. You can still change the expiry date, usage limit, or deactivate it.`,
+        });
+      }
+    }
+
     const allowed = [
       "code",
       "type",
@@ -301,16 +396,88 @@ exports.updateCoupon = async (req, res) => {
       "description",
       "isActive",
     ];
+    const numericKeys = [
+      "value",
+      "maxDiscount",
+      "minGuests",
+      "minOrderAmount",
+      "usageLimit",
+    ];
     allowed.forEach((key) => {
-      if (req.body[key] !== undefined) {
-        if (key === "code")
-          coupon[key] = String(req.body[key]).trim().toUpperCase();
-        else if (key === "validFrom" || key === "validUntil")
-          coupon[key] = new Date(req.body[key]);
-        else if (key === "isActive") coupon[key] = Boolean(req.body[key]);
-        else coupon[key] = Number(req.body[key]) || req.body[key];
+      if (req.body[key] === undefined) return;
+      if (key === "code") {
+        coupon[key] = String(req.body[key]).trim().toUpperCase();
+      } else if (key === "validFrom" || key === "validUntil") {
+        coupon[key] = new Date(req.body[key]);
+      } else if (key === "isActive") {
+        coupon[key] = Boolean(req.body[key]);
+      } else if (key === "type") {
+        coupon[key] = String(req.body[key]);
+      } else if (numericKeys.includes(key)) {
+        // Was `Number(x) || x`, which silently kept the raw string when the
+        // value was 0 or non-numeric.
+        const n = Number(req.body[key]);
+        if (!Number.isFinite(n)) {
+          throw new Error(`${key} must be a number`);
+        }
+        coupon[key] = n;
+      } else {
+        coupon[key] = String(req.body[key]).trim();
       }
     });
+
+    if (!["percentage", "flat"].includes(coupon.type)) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Coupon type is invalid." });
+    }
+
+    // Re-validate percentage cap on update (createCoupon enforces this too)
+    if (
+      coupon.type === "percentage" &&
+      (Number(coupon.value) <= 0 || Number(coupon.value) > 100)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Percentage discount must be between 1 and 100.",
+      });
+    }
+    if (Number(coupon.value) <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Discount value must be greater than 0.",
+      });
+    }
+
+    const windowError = validateCouponWindow({
+      validFrom: coupon.validFrom,
+      validUntil: coupon.validUntil,
+      requireFuture: req.body.validUntil !== undefined,
+    });
+    if (windowError) {
+      return res.status(400).json({ success: false, message: windowError });
+    }
+
+    const limitsError = validateCouponLimits({
+      maxDiscount: coupon.maxDiscount,
+      minGuests: coupon.minGuests,
+      minOrderAmount: coupon.minOrderAmount,
+      usageLimit: coupon.usageLimit,
+    });
+    if (limitsError) {
+      return res.status(400).json({ success: false, message: limitsError });
+    }
+
+    // A usage cap below what's already been redeemed is nonsensical
+    if (
+      Number(coupon.usageLimit) > 0 &&
+      Number(coupon.usageLimit) < Number(coupon.usedCount)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: `Usage limit cannot be lower than the ${coupon.usedCount} redemption(s) already made.`,
+      });
+    }
 
     await coupon.save();
     res.json({ success: true, coupon });

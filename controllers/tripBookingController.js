@@ -7,6 +7,11 @@ const { notifyUser } = require("./notificationController");
 const { getSetting } = require("./platformSettingsController");
 const escapeRegex = require("../utils/escapeRegex");
 
+// Most bookings an operator may cancel in one batch-cancel request. Each one
+// issues a synchronous Razorpay refund, so a bigger batch cannot finish inside a
+// single HTTP request and is handed to admin instead.
+const MAX_BULK_CANCEL = 25;
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function calcPricing({
@@ -106,15 +111,29 @@ async function computeAuthoritativePricing({
   const platformFeePercent = (await getSetting("platform_fee_percent")) ?? 10;
   const gstPercent = (await getSetting("gst_percent")) ?? 5;
 
-  // Addons
+  // Addons — one creator per booking. Each selected addon-day adds:
+  //   base ₹2000 + per-day outside-city surcharge + per-day extra charges (entry/parking)
   const ADDON_BASE_PRICE = 2000;
-  let addonSurcharge = 0;
+  let addonSurcharge = 0; // operator earnings portion (outside-city + extras)
   let addonTotalPrice = 0;
   if (addonDays) {
     for (const name of Object.keys(addonDays)) {
       for (const dayIdx of addonDays[name] || []) {
         const dayInfo = pkg.itinerary[dayIdx];
-        const sc = dayInfo?.isOutsideCity ? pkg.outsideCityCharge || 0 : 0;
+        let sc = 0;
+        if (dayInfo?.isOutsideCity) {
+          // Per-day surcharge, fall back to package-level default
+          sc =
+            Number(dayInfo.outsideCityCharge) ||
+            Number(pkg.outsideCityCharge) ||
+            0;
+          // Add extra charges (entry fee, parking, etc.)
+          if (Array.isArray(dayInfo.extraCharges)) {
+            for (const ec of dayInfo.extraCharges) {
+              sc += Number(ec.amount) || 0;
+            }
+          }
+        }
         addonSurcharge += sc;
         addonTotalPrice += ADDON_BASE_PRICE + sc;
       }
@@ -130,8 +149,11 @@ async function computeAuthoritativePricing({
   if (code) {
     const Coupon = require("../models/Coupon");
     const now = new Date();
+    // Flexible coupons are keyed by packageId, batch coupons by batchId
+    const couponMatch =
+      bookingMode === "flexible" ? { packageId } : { batchId };
     const coupon = await Coupon.findOne({
-      batchId,
+      ...couponMatch,
       code,
       isActive: true,
       validFrom: { $lte: now },
@@ -364,6 +386,21 @@ async function processCancellationRefund(
     $inc: { bookingCount: -booking.seats },
   });
 
+  // ── Return the coupon usage slot (createBooking incremented usedCount) ─────
+  const usedCoupon = booking.pricing?.couponCode;
+  if (usedCoupon) {
+    try {
+      const Coupon = require("../models/Coupon");
+      const match = booking.batchId
+        ? { batchId: booking.batchId }
+        : { packageId: booking.packageId };
+      await Coupon.updateOne(
+        { ...match, code: usedCoupon, usedCount: { $gt: 0 } },
+        { $inc: { usedCount: -1 } },
+      );
+    } catch {}
+  }
+
   // ── Credit operator the cancellation retention (immediately) ─────────────
   if (operatorRetained > 0) {
     await creditOperatorWallet(
@@ -527,8 +564,10 @@ exports.createBooking = async (req, res) => {
     const gstPercent = (await getSetting("gst_percent")) ?? 5;
 
     // ── Compute addon (Snapja) amounts — held by platform until dispatch ──────
+    // One creator per booking. Each addon-day: base ₹2000 + per-day outside-city
+    // surcharge (fallback to package default) + per-day extra charges.
     const ADDON_BASE_PRICE = 2000;
-    let addonSurcharge = 0; // operator's outside-city portion
+    let addonSurcharge = 0; // operator's outside-city + extras portion
     let addonTotalPrice = 0; // base + surcharge (full held amount)
     const addonDaysData = req.body.addonDays || null;
     const addonNames = addonDaysData ? Object.keys(addonDaysData) : [];
@@ -537,9 +576,18 @@ exports.createBooking = async (req, res) => {
         const days = addonDaysData[addonName] || [];
         for (const dayIdx of days) {
           const dayInfo = pkg.itinerary[dayIdx];
-          const surcharge = dayInfo?.isOutsideCity
-            ? pkg.outsideCityCharge || 0
-            : 0;
+          let surcharge = 0;
+          if (dayInfo?.isOutsideCity) {
+            surcharge =
+              Number(dayInfo.outsideCityCharge) ||
+              Number(pkg.outsideCityCharge) ||
+              0;
+            if (Array.isArray(dayInfo.extraCharges)) {
+              for (const ec of dayInfo.extraCharges) {
+                surcharge += Number(ec.amount) || 0;
+              }
+            }
+          }
           addonSurcharge += surcharge;
           addonTotalPrice += ADDON_BASE_PRICE + surcharge;
         }
@@ -558,10 +606,12 @@ exports.createBooking = async (req, res) => {
       const Coupon = require("../models/Coupon");
       const now = new Date();
 
+      // Flexible coupons are keyed by packageId, batch coupons by batchId
+      const couponMatch = isFlexible ? { packageId } : { batchId };
       // Atomic: only increment usedCount if coupon is still valid + within limit
       const coupon = await Coupon.findOneAndUpdate(
         {
-          batchId,
+          ...couponMatch,
           code: couponCode,
           isActive: true,
           validFrom: { $lte: now },
@@ -739,6 +789,62 @@ exports.createBooking = async (req, res) => {
       { type: "new_booking", bookingId: booking._id.toString() },
     );
 
+    // ── Auto-send itinerary to traveller on confirmation ──────────────────
+    // The base itinerary is always available from the package. The operator
+    // can later send a richer document with transport/driver details from the
+    // Booking Management page, but the traveller gets something useful NOW.
+    try {
+      if (pkg.itinerary?.length > 0) {
+        const itineraryLines = pkg.itinerary
+          .filter((d) => d.title)
+          .map((d) => {
+            let line = `Day ${d.day}: ${d.title}`;
+            if (d.points?.length > 0) {
+              line +=
+                "\n" +
+                d.points
+                  .filter(Boolean)
+                  .map((p) => `  • ${p}`)
+                  .join("\n");
+            }
+            return line;
+          })
+          .join("\n\n");
+
+        const itineraryMsg = [
+          `📋 Your Itinerary — ${pkg.title}`,
+          `📍 ${pkg.location || ""}`,
+          `📅 ${startFmt} → ${endFmt}`,
+          "",
+          itineraryLines,
+          "",
+          pkg.inclusions?.length > 0
+            ? "✅ Inclusions: " + pkg.inclusions.filter(Boolean).join(", ")
+            : "",
+          pkg.exclusions?.length > 0
+            ? "❌ Exclusions: " + pkg.exclusions.filter(Boolean).join(", ")
+            : "",
+          "",
+          "Your operator will share pickup details and transport info closer to the trip date.",
+        ]
+          .filter(Boolean)
+          .join("\n");
+
+        // Send via the existing chat conversation (already created above)
+        const Message = require("../models/Message");
+        await Message.create({
+          conversationId: conv._id,
+          senderId: pkg.operatorId,
+          senderType: "operator",
+          senderName: "Trip Reel",
+          text: itineraryMsg,
+        });
+      }
+    } catch (itinErr) {
+      // Non-blocking — booking is already confirmed regardless
+      console.warn("Auto-itinerary send failed:", itinErr.message);
+    }
+
     // Notify admin about new booking
     notifyAdmin(
       "New Booking",
@@ -789,6 +895,12 @@ exports.createBooking = async (req, res) => {
     } catch (emailErr) {
       console.warn("Booking email failed:", emailErr.message);
     }
+
+    // Mark any abandoned-booking reminder intent as converted (best-effort)
+    try {
+      const { markIntentConverted } = require("./bookingIntentController");
+      markIntentConverted(req.user._id, packageId);
+    } catch {}
 
     res.status(201).json({ success: true, booking });
   } catch (err) {
@@ -1006,6 +1118,7 @@ exports.operatorGetMyBookings = async (req, res) => {
       status,
       packageId,
       batchId,
+      bookingMode,
       search,
       fromDate,
       toDate,
@@ -1016,6 +1129,7 @@ exports.operatorGetMyBookings = async (req, res) => {
     if (status && status !== "all") query.status = status;
     if (packageId) query.packageId = packageId;
     if (batchId) query.batchId = batchId;
+    if (bookingMode && bookingMode !== "all") query.bookingMode = bookingMode;
     if (search)
       query.bookingId = { $regex: escapeRegex(search), $options: "i" };
     if (fromDate || toDate) {
@@ -1041,6 +1155,74 @@ exports.operatorGetMyBookings = async (req, res) => {
     ]);
 
     res.json({ success: true, total, page: Number(page), bookings });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// ── Operator dashboard summary (server-side aggregation) ──────────────────────
+// GET /api/operator-bookings/summary
+// The dashboard used to reduce these numbers over a client-capped 200-booking
+// list, so revenue/traveller/status counts were understated for busy operators.
+// Aggregate across ALL bookings here instead.
+exports.operatorBookingSummary = async (req, res) => {
+  try {
+    const operatorId = req.operator._id;
+    const monthStart = new Date();
+    monthStart.setDate(1);
+    monthStart.setHours(0, 0, 0, 0);
+
+    const [byStatus, servedAgg, monthAgg] = await Promise.all([
+      TripBooking.aggregate([
+        { $match: { operatorId } },
+        { $group: { _id: "$status", count: { $sum: 1 } } },
+      ]),
+      // Travellers served on confirmed/completed trips
+      TripBooking.aggregate([
+        {
+          $match: {
+            operatorId,
+            status: { $in: ["CONFIRMED", "COMPLETED"] },
+          },
+        },
+        { $group: { _id: null, seats: { $sum: "$pricing.seats" } } },
+      ]),
+      // Operator revenue this month (confirmed/completed)
+      TripBooking.aggregate([
+        {
+          $match: {
+            operatorId,
+            status: { $in: ["CONFIRMED", "COMPLETED"] },
+            createdAt: { $gte: monthStart },
+          },
+        },
+        {
+          $group: {
+            _id: null,
+            revenue: { $sum: "$pricing.operatorAmount" },
+          },
+        },
+      ]),
+    ]);
+
+    const statusCounts = byStatus.reduce((acc, s) => {
+      acc[s._id] = s.count;
+      return acc;
+    }, {});
+    const total = byStatus.reduce((sum, s) => sum + s.count, 0);
+
+    res.json({
+      success: true,
+      summary: {
+        totalBookings: total,
+        confirmedBookings: statusCounts.CONFIRMED || 0,
+        completedBookings: statusCounts.COMPLETED || 0,
+        cancelledBookings: statusCounts.CANCELLED || 0,
+        pendingBookings: statusCounts.PENDING || 0,
+        totalTravelers: servedAgg[0]?.seats || 0,
+        monthRevenue: monthAgg[0]?.revenue || 0,
+      },
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -1213,13 +1395,30 @@ exports.getRefundPreview = async (req, res) => {
     const gstRefund = gstFareRefund + gstAddonRefund;
     const refundAmount = fareRefund + gstRefund + addonRefund;
 
+    const totalPaid = Number(booking.pricing.totalAmount) || 0;
+    const deducted = Math.max(0, totalPaid - refundAmount);
+
     res.json({
       success: true,
       daysBeforeTrip,
       refundPercent,
       refundAmount,
-      totalPaid: booking.pricing.totalAmount,
-      breakdown: { fareRefund, gstRefund, addonRefund },
+      totalPaid,
+      deducted,
+      hasAddon: addon > 0,
+      breakdown: {
+        // what user paid, split
+        netFare,
+        gst,
+        addon,
+        // what comes back
+        fareRefund,
+        gstRefund,
+        addonRefund,
+        // what is kept (non-refundable trip fare + its GST per the slab)
+        fareKept: Math.max(0, netFare - fareRefund),
+        gstKept: Math.max(0, gst - gstRefund),
+      },
     });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -1310,6 +1509,28 @@ exports.operatorCancelBatch = async (req, res) => {
     });
 
     const { notifyAdmin } = require("./notificationController");
+
+    // Deactivate the batch FIRST so no new booking can slip in while we refund.
+    // (Previously this happened after the loop, leaving a window open.)
+    batch.isActive = false;
+    await batch.save();
+
+    // Guard against a request that would time out mid-refund. Each cancellation
+    // is a synchronous Razorpay call, so a very large batch can't be completed
+    // inside one HTTP request — an admin has to handle those.
+    if (bookings.length > MAX_BULK_CANCEL) {
+      notifyAdmin(
+        "Large Batch Cancellation Needs Admin Action",
+        `Operator tried to cancel batch "${batch.label || batchId}" with ${bookings.length} live bookings — above the ${MAX_BULK_CANCEL} limit. The batch is now closed to new bookings; refunds must be processed by admin.`,
+        { type: "booking_cancelled", batchId: String(batchId) },
+      );
+      return res.status(409).json({
+        success: false,
+        code: "BULK_CANCEL_TOO_LARGE",
+        message: `This batch has ${bookings.length} active bookings, which is too many to refund in one go. We've closed it to new bookings and alerted our team, who will process the refunds and contact you.`,
+      });
+    }
+
     let cancelled = 0;
     let totalRefund = 0;
     const errors = [];
@@ -1342,15 +1563,31 @@ exports.operatorCancelBatch = async (req, res) => {
       }
     }
 
-    // Deactivate the batch so no new bookings
-    batch.isActive = false;
-    await batch.save();
-
     notifyAdmin(
-      "Operator Cancelled an Entire Batch",
-      `Operator cancelled batch "${batch.label || batchId}" — ${cancelled} booking(s) refunded (₹${totalRefund.toLocaleString("en-IN")} total). Reason: ${reason || "—"}`,
+      errors.length > 0
+        ? "Batch Cancellation Had Refund Failures"
+        : "Operator Cancelled an Entire Batch",
+      `Operator cancelled batch "${batch.label || batchId}" — ${cancelled} of ${bookings.length} booking(s) refunded (₹${totalRefund.toLocaleString("en-IN")} total).${
+        errors.length > 0
+          ? ` ${errors.length} refund(s) FAILED and need manual action: ${errors.join("; ")}`
+          : ""
+      } Reason: ${reason || "—"}`,
       { type: "booking_cancelled", batchId: String(batchId) },
     );
+
+    // Partial failures used to come back as `success: true`, so the operator
+    // believed every traveller had been refunded.
+    if (errors.length > 0) {
+      return res.status(207).json({
+        success: false,
+        partial: true,
+        cancelledCount: cancelled,
+        failedCount: errors.length,
+        totalRefund,
+        errors,
+        message: `${cancelled} of ${bookings.length} bookings were refunded. ${errors.length} refund(s) could not be processed — our team has been alerted and will complete them.`,
+      });
+    }
 
     res.json({
       success: true,
@@ -1481,12 +1718,57 @@ exports.adminMarkRefundDone = async (req, res) => {
         .status(404)
         .json({ success: false, message: "Booking not found" });
     }
+
+    // ── Guards ────────────────────────────────────────────────────────────────
+    // This used to flip ANY booking to REFUNDED with no state check and no record
+    // of which admin did it. "Paid offline" is a manual override, so it needs a
+    // reason and must only apply where an automated refund actually failed.
+    const note = (req.body.note || "").trim();
+    if (!note) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Please add a note describing how this refund was paid (reference number, method, date).",
+      });
+    }
+
+    if (booking.refundStatus === "REFUNDED") {
+      return res.status(400).json({
+        success: false,
+        message: "This booking is already marked as refunded.",
+      });
+    }
+
+    const markable = ["FAILED", "MANUAL", "PENDING", "PROCESSING"];
+    if (booking.refundStatus && !markable.includes(booking.refundStatus)) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot mark a refund as done from state "${booking.refundStatus}".`,
+      });
+    }
+
+    if (booking.status !== "CANCELLED") {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Only a cancelled booking can have its refund marked as completed.",
+      });
+    }
+
     booking.refundStatus = "REFUNDED";
     booking.refundedAt = new Date();
     booking.refundError = "";
-    if (req.body.note)
-      booking.cancelReason = `${booking.cancelReason} | ${req.body.note}`;
+    booking.refundMarkedManually = true;
+    booking.refundMarkedBy = req.user._id;
+    booking.refundNote = note;
+    booking.cancelReason =
+      `${booking.cancelReason || ""} | Manual refund by admin: ${note}`.trim();
     await booking.save();
+
+    console.log(
+      `[adminMarkRefundDone] booking=${booking.bookingId} amount=${booking.refundAmount} admin=${req.user._id} note="${note}"`,
+    );
+
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -1503,6 +1785,17 @@ exports.syncSnapjaStatus = async (req, res) => {
         .status(404)
         .json({ success: false, message: "Booking not found" });
     }
+
+    // Ownership check — this route only had `protect`, so any logged-in user
+    // could sync and read add-on data for arbitrary bookings.
+    const isOwner = String(booking.userId) === String(req.user._id);
+    const isAdmin = req.user.role === "admin";
+    if (!isOwner && !isAdmin) {
+      return res
+        .status(403)
+        .json({ success: false, message: "Not authorized" });
+    }
+
     if (!booking.addonDispatched || !booking.snapjaBookings) {
       return res.json({
         success: true,

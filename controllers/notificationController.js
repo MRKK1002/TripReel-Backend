@@ -23,6 +23,17 @@ exports.registerToken = async (req, res) => {
   }
 };
 
+// POST /api/notifications/unregister-token — clear FCM token on logout so the
+// device stops receiving this user's push notifications after they log out.
+exports.unregisterToken = async (req, res) => {
+  try {
+    await User.findByIdAndUpdate(req.user._id, { fcmToken: "" });
+    res.json({ success: true, message: "Token unregistered" });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
 // POST /api/notifications/send — admin sends notification to specific user or all
 exports.adminSendNotification = async (req, res) => {
   try {
@@ -152,16 +163,26 @@ exports.getMyNotifications = async (req, res) => {
 // GET /api/notifications/operator/my — operator gets their notifications
 exports.getOperatorNotifications = async (req, res) => {
   try {
-    const notifications = await Notification.find({
+    // Scope by recipientType as well as id — filtering on id alone relied on
+    // ObjectIds never colliding across the User and Operator collections.
+    const query = {
       recipientId: req.operator._id,
-    })
-      .sort({ createdAt: -1 })
-      .limit(50);
-    const unreadCount = await Notification.countDocuments({
-      recipientId: req.operator._id,
-      read: false,
-    });
-    res.json({ success: true, notifications, unreadCount });
+      recipientType: "operator",
+    };
+
+    const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100);
+    const page = Math.max(Number(req.query.page) || 1, 1);
+
+    const [notifications, unreadCount, total] = await Promise.all([
+      Notification.find(query)
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit),
+      Notification.countDocuments({ ...query, read: false }),
+      Notification.countDocuments(query),
+    ]);
+
+    res.json({ success: true, notifications, unreadCount, total, page });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -181,7 +202,11 @@ exports.markAllRead = async (req, res) => {
       );
     } else {
       await Notification.updateMany(
-        { recipientId: userId, read: false },
+        {
+          recipientId: userId,
+          recipientType: req.operator ? "operator" : "user",
+          read: false,
+        },
         { read: true },
       );
     }

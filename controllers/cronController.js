@@ -8,6 +8,14 @@ const ADDON_BASE_PRICE = 2000; // ₹/day/service sent to Snapja
 const SNAPJA_API = "https://api.snapja.com/api/tripreel/bookings";
 const SNAPJA_API_KEY = process.env.SNAPJA_API_KEY;
 
+// Effective trip dates — batch bookings use batch dates, flexible bookings have
+// no batch so fall back to flexEndDate/flexStartDate then the booking snapshot.
+// (Fixes flexible bookings staying "upcoming" forever because batchId is null.)
+const effectiveEndDate = (b) =>
+  b?.batchId?.endDate || b?.flexEndDate || b?.snapshot?.endDate || null;
+const effectiveStartDate = (b) =>
+  b?.batchId?.startDate || b?.flexStartDate || b?.snapshot?.startDate || null;
+
 // Resolve refund % for a given trip start date from admin slabs (0 = no-refund window)
 async function refundPercentForDate(startDate) {
   if (!startDate) return 0;
@@ -236,6 +244,32 @@ async function runSnapjaAutoCancel() {
           // Skip if already assigned (has creator) or already refunded
           if (snap.creatorName || snap.refundFlagged) continue;
           if (!snap.bookingId) continue;
+
+          // IMPORTANT: Check live Snapja status before cancelling — our local
+          // `creatorName` may be stale if the hourly sync hasn't run yet.
+          try {
+            const liveRes = await fetch(`${SNAPJA_API}/${snap.bookingId}`, {
+              headers: { "X-API-Key": SNAPJA_API_KEY },
+            });
+            if (liveRes.ok) {
+              const liveData = await liveRes.json();
+              const b = liveData.booking || liveData;
+              if (b.creator?.name || b.creator?.display_name) {
+                // Creator WAS assigned on Snapja — update our record, DON'T cancel
+                snapjaBookings[key].creatorName =
+                  b.creator.name || b.creator.display_name;
+                snapjaBookings[key].creatorPhone = b.creator.phone || "";
+                snapjaBookings[key].creatorPhoto =
+                  b.creator.picture || b.creator.profile_image || "";
+                if (b.otp) snapjaBookings[key].otp = b.otp;
+                if (b.otp_expires_at)
+                  snapjaBookings[key].otpExpiresAt = b.otp_expires_at;
+                snapjaBookings[key].status = b.status || "confirmed";
+                updated = true;
+                continue; // skip cancellation
+              }
+            }
+          } catch {}
 
           // No creator assigned and trip is tomorrow — cancel on Snapja
           console.log(
@@ -483,7 +517,8 @@ async function runCronJobs() {
 
     for (const booking of confirmedBookings) {
       try {
-        if (booking.batchId && booking.batchId.endDate < twoDaysAgo) {
+        const endD = effectiveEndDate(booking);
+        if (endD && new Date(endD) < twoDaysAgo) {
           booking.status = "COMPLETED";
           booking.hasReviewed = false;
           await booking.save();
@@ -579,7 +614,7 @@ async function runCronJobs() {
 
     for (const booking of confirmedForReminders) {
       try {
-        const startDate = booking.batchId?.startDate;
+        const startDate = effectiveStartDate(booking);
         if (!startDate) continue;
 
         const start = new Date(startDate);
@@ -680,7 +715,7 @@ async function runCronJobs() {
 
     for (const booking of completedBookings) {
       try {
-        const endDate = booking.batchId?.endDate;
+        const endDate = effectiveEndDate(booking);
         if (!endDate) continue;
 
         const end = new Date(endDate);
@@ -856,6 +891,57 @@ async function runCronJobs() {
   return results;
 }
 
+// Days a DRAFT operator can sit un-submitted before it auto-expires
+const DRAFT_EXPIRY_DAYS = Number(process.env.OPERATOR_DRAFT_EXPIRY_DAYS) || 14;
+
+/**
+ * Job: auto-expire abandoned operator drafts.
+ * An operator who registered but never submitted their onboarding form within
+ * DRAFT_EXPIRY_DAYS is moved DRAFT → EXPIRED, so they drop out of the admin's
+ * queue and the drafts pile stops growing. They can still re-apply (EXPIRED is
+ * an editable state), which puts them back into PENDING_APPROVAL.
+ */
+exports.runStaleDraftExpiry = async function () {
+  const results = { expired: 0, errors: [] };
+  try {
+    const { Operator } = require("../models/Operator");
+    const cutoff = new Date(
+      Date.now() - DRAFT_EXPIRY_DAYS * 24 * 60 * 60 * 1000,
+    );
+
+    // Never submitted (submissionCount 0 / no lastSubmittedAt) and registered
+    // before the cutoff.
+    const stale = await Operator.find({
+      onboardingState: "DRAFT",
+      createdAt: { $lt: cutoff },
+      $or: [
+        { submissionCount: { $in: [0, null] } },
+        { submissionCount: { $exists: false } },
+      ],
+      lastSubmittedAt: { $in: [null, undefined] },
+    }).select("_id onboardingState transitionHistory");
+
+    for (const op of stale) {
+      try {
+        op.transitionHistory.push({
+          fromState: "DRAFT",
+          toState: "EXPIRED",
+          note: `Auto-expired: onboarding not completed within ${DRAFT_EXPIRY_DAYS} days`,
+          timestamp: new Date(),
+        });
+        op.onboardingState = "EXPIRED";
+        await op.save();
+        results.expired++;
+      } catch (e) {
+        results.errors.push(`Expire ${op._id}: ${e.message}`);
+      }
+    }
+  } catch (err) {
+    results.errors.push(`Stale draft expiry: ${err.message}`);
+  }
+  return results;
+};
+
 // POST /api/admin/run-cron  — manual trigger (admin only)
 exports.runCron = async (req, res) => {
   try {
@@ -864,6 +950,7 @@ exports.runCron = async (req, res) => {
     const reminders = await exports.runTripReminders();
     const reviews = await exports.runReviewReminders();
     const wishlist = await exports.runWishlistAlerts();
+    const drafts = await exports.runStaleDraftExpiry();
     const results = {
       completed: auto.completed,
       cancelled: auto.cancelled,
@@ -871,11 +958,13 @@ exports.runCron = async (req, res) => {
       reminders: reminders.reminders,
       reviewReminders: reviews.reviewReminders,
       urgencyAlerts: wishlist.urgencyAlerts,
+      draftsExpired: drafts.expired,
       errors: [
         ...auto.errors,
         ...reminders.errors,
         ...reviews.errors,
         ...wishlist.errors,
+        ...drafts.errors,
       ],
     };
     res.json({
@@ -910,7 +999,8 @@ exports.runAutoCompleteAndCancel = async function () {
 
     for (const booking of confirmedBookings) {
       try {
-        if (booking.batchId && booking.batchId.endDate < now) {
+        const endD = effectiveEndDate(booking);
+        if (endD && new Date(endD) < now) {
           booking.status = "COMPLETED";
           booking.hasReviewed = false;
           await booking.save();
@@ -943,7 +1033,8 @@ exports.runAutoCompleteAndCancel = async function () {
 
     for (const booking of completedUnpaid) {
       try {
-        if (booking.batchId && booking.batchId.endDate < twoDaysAgo) {
+        const endD = effectiveEndDate(booking);
+        if (endD && new Date(endD) < twoDaysAgo) {
           const OperatorWallet = require("../models/OperatorWallet");
           const WalletTransaction = require("../models/WalletTransaction");
           const { notifyOperator } = require("./notificationController");
@@ -1024,7 +1115,7 @@ exports.runTripReminders = async function () {
 
     for (const booking of confirmedForReminders) {
       try {
-        const startDate = booking.batchId?.startDate;
+        const startDate = effectiveStartDate(booking);
         if (!startDate) continue;
         const start = new Date(startDate);
         const todayStart = new Date(
@@ -1132,7 +1223,7 @@ exports.runReviewReminders = async function () {
 
     for (const booking of completedBookings) {
       try {
-        const endDate = booking.batchId?.endDate;
+        const endDate = effectiveEndDate(booking);
         if (!endDate) continue;
         const end = new Date(endDate);
         const todayStart = new Date(
@@ -1301,6 +1392,51 @@ exports.runWishlistAlerts = async function () {
     }
   } catch (err) {
     results.errors.push(`Wishlist alerts error: ${err.message}`);
+  }
+  return results;
+};
+
+// Job 6 only: abandoned-booking reminders — nudge users who reached the
+// booking screen for a package but didn't complete the booking.
+exports.runAbandonedBookingReminders = async function () {
+  const results = { reminders: 0, errors: [] };
+  try {
+    const BookingIntent = require("../models/BookingIntent");
+    const { notifyUser } = require("./notificationController");
+    const now = Date.now();
+    const twoHoursAgo = new Date(now - 2 * 60 * 60 * 1000);
+    const threeDaysAgo = new Date(now - 3 * 24 * 60 * 60 * 1000);
+
+    // Abandoned = seen the booking screen 2h–3d ago, not converted, not yet nudged
+    const intents = await BookingIntent.find({
+      converted: false,
+      notified: false,
+      lastSeenAt: { $lte: twoHoursAgo, $gte: threeDaysAgo },
+    }).limit(200);
+
+    for (const intent of intents) {
+      try {
+        const name = intent.packageTitle || "your trip";
+        await delay(NOTIFICATION_STAGGER_MS);
+        notifyUser(
+          intent.userId,
+          "Still thinking about it?",
+          `You were almost there! Tap to complete your booking for ${name}.`,
+          {
+            type: "abandoned_booking",
+            screen: "DestinationDetail",
+            packageId: String(intent.packageId),
+          },
+        );
+        intent.notified = true;
+        await intent.save();
+        results.reminders++;
+      } catch (e) {
+        results.errors.push(`Abandoned reminder ${intent._id}: ${e.message}`);
+      }
+    }
+  } catch (err) {
+    results.errors.push(`Abandoned booking reminders: ${err.message}`);
   }
   return results;
 };

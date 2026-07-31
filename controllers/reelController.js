@@ -51,6 +51,24 @@ exports.getReelById = async (req, res) => {
   }
 };
 
+// POST /api/reels/:id/view — increment the real view count when a reel is opened
+exports.incrementReelView = async (req, res) => {
+  try {
+    const reel = await Reel.findByIdAndUpdate(
+      req.params.id,
+      { $inc: { views: 1 } },
+      { new: true, select: "views" },
+    );
+    if (!reel)
+      return res
+        .status(404)
+        .json({ success: false, message: "Reel not found" });
+    res.json({ success: true, views: reel.views });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
 // POST /api/reels
 exports.createReel = async (req, res) => {
   try {
