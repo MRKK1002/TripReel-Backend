@@ -5,7 +5,7 @@
 require("dotenv").config();
 
 const SNAPJA_API = "https://api.snapja.com/api/tripreel/bookings";
-const SNAPJA_API_KEY = process.env.SNAPJA_API_KEY || "tripreel_snapja_2025";
+const SNAPJA_API_KEY = process.env.SNAPJA_API_KEY;
 
 async function main() {
   const bookingId = process.argv[2] || "SNJ0383";

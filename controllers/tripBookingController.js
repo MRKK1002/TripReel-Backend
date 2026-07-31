@@ -1512,7 +1512,7 @@ exports.syncSnapjaStatus = async (req, res) => {
     }
 
     const SNAPJA_API = "https://api.snapja.com/api/tripreel/bookings";
-    const SNAPJA_API_KEY = process.env.SNAPJA_API_KEY || "tripreel_snapja_2025";
+const SNAPJA_API_KEY = process.env.SNAPJA_API_KEY;
 
     let updated = false;
     const snapjaBookings = { ...booking.snapjaBookings };
