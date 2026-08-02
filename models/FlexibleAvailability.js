@@ -20,6 +20,12 @@ const flexibleAvailabilitySchema = new mongoose.Schema(
     // Pricing for flexible dates (can differ from batch pricing)
     adultPrice: { type: Number, required: true, min: 0 },
     childPrice: { type: Number, default: 0, min: 0 },
+    // Maximum bookings (total seats) allowed in this range. 0 = unlimited.
+    // Without this, flex bookings had no capacity check — a package could be
+    // booked infinitely. The operator sets this when creating the range.
+    maxBookings: { type: Number, default: 0, min: 0 },
+    // Current booked seat count (atomically incremented on each booking)
+    bookedSeats: { type: Number, default: 0, min: 0 },
     // Operator can disable without deleting
     isActive: { type: Boolean, default: true },
   },

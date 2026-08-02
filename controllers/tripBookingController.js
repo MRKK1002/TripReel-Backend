@@ -7,6 +7,22 @@ const { notifyUser } = require("./notificationController");
 const { getSetting } = require("./platformSettingsController");
 const escapeRegex = require("../utils/escapeRegex");
 
+// Parse a YYYY-MM-DD date string as local (IST) midnight rather than UTC midnight.
+// new Date('2026-08-01') in Node treats it as UTC, which is 2026-07-31T18:30Z in IST —
+// the booking would be stored one day early. Since the server's TZ is Asia/Kolkata
+// (set in server.js), new Date(y, m, d) creates local midnight correctly.
+function parseLocalDateStr(str) {
+  if (!str) return null;
+  // Accept YYYY-MM-DD or ISO string — strip the time component first
+  const datePart = String(str).split("T")[0];
+  const parts = datePart.split("-").map(Number);
+  if (parts.length === 3 && parts.every((n) => !isNaN(n))) {
+    const [y, m, d] = parts;
+    return new Date(y, m - 1, d); // local midnight in TZ = Asia/Kolkata
+  }
+  return new Date(str); // fallback
+}
+
 // Most bookings an operator may cancel in one batch-cancel request. Each one
 // issues a synchronous Razorpay refund, so a bigger batch cannot finish inside a
 // single HTTP request and is handed to admin instead.
@@ -494,6 +510,42 @@ exports.createBooking = async (req, res) => {
       adultPrice = flexRecord.adultPrice;
       childPrice = flexRecord.childPrice || 0;
       operatorId = flexRecord.operatorId;
+
+      // ── Capacity check (atomic, like the batch path) ────────────────────────
+      // maxBookings of 0 means unlimited. Otherwise, atomically reserve seats.
+      if (flexRecord.maxBookings > 0) {
+        const FlexibleAvailability = require("../models/FlexibleAvailability");
+        const reserved = await FlexibleAvailability.findOneAndUpdate(
+          {
+            _id: flexRecord._id,
+            $expr: {
+              $lte: [{ $add: ["$bookedSeats", numSeats] }, "$maxBookings"],
+            },
+          },
+          { $inc: { bookedSeats: numSeats } },
+          { new: true },
+        );
+        if (!reserved) {
+          const remaining = Math.max(
+            0,
+            flexRecord.maxBookings - (flexRecord.bookedSeats || 0),
+          );
+          return res.status(400).json({
+            success: false,
+            message:
+              remaining > 0
+                ? `Only ${remaining} seat${remaining > 1 ? "s" : ""} left for these dates.`
+                : "This date range is fully booked.",
+          });
+        }
+      } else {
+        // Unlimited — still track for analytics, non-atomic is fine
+        const FlexibleAvailability = require("../models/FlexibleAvailability");
+        await FlexibleAvailability.updateOne(
+          { _id: flexRecord._id },
+          { $inc: { bookedSeats: numSeats } },
+        );
+      }
     } else {
       // ── Batch booking — existing flow ──────────────────────────────────────
       batch = await Batch.findById(batchId);
@@ -674,11 +726,11 @@ exports.createBooking = async (req, res) => {
       packageImageUrl: pkg.image_url || "",
       batchLabel: batch ? batch.label || "" : "Flexible",
       startDate: isFlexible
-        ? req.body.flexStartDate || new Date()
+        ? parseLocalDateStr(req.body.flexStartDate) || new Date()
         : batch.startDate,
       endDate: isFlexible
         ? (() => {
-            const d = new Date(req.body.flexStartDate || Date.now());
+            const d = parseLocalDateStr(req.body.flexStartDate) || new Date();
             d.setDate(d.getDate() + (pkg.itinerary?.length || 5) - 1);
             return d;
           })()
@@ -692,7 +744,9 @@ exports.createBooking = async (req, res) => {
       packageId,
       batchId: isFlexible ? undefined : batchId,
       bookingMode: isFlexible ? "flexible" : "batch",
-      flexStartDate: isFlexible ? req.body.flexStartDate : undefined,
+      flexStartDate: isFlexible
+        ? parseLocalDateStr(req.body.flexStartDate)
+        : undefined,
       flexEndDate: isFlexible ? snapshot.endDate : undefined,
       flexAvailabilityId: isFlexible ? req.body.flexAvailabilityId : undefined,
       operatorId,

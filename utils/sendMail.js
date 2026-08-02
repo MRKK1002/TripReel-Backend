@@ -2,18 +2,18 @@ const nodemailer = require("nodemailer");
 
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST,
-  port: Number(process.env.SMTP_PORT) || 587,
-  secure: false,
+  port: Number(process.env.SMTP_PORT) || 465,
+  secure: Number(process.env.SMTP_PORT) === 465, // true for 465, false for 587
   auth: {
     user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASSWORD,
+    pass: process.env.SMTP_PASS || process.env.SMTP_PASSWORD,
   },
 });
 
 // Anti-spam: proper headers
 const FROM_NAME = "Trip Reel";
-const FROM_EMAIL = process.env.SMTP_USER;
-const REPLY_TO = "support@tripreel.com";
+const FROM_EMAIL = process.env.SMTP_FROM || "no-reply@tripreel.in";
+const REPLY_TO = "support@tripreel.in";
 
 /**
  * Base email wrapper with Trip Reel branding

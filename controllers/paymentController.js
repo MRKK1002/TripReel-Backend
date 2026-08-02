@@ -45,6 +45,19 @@ exports.createOrder = async (req, res) => {
       });
     }
 
+    // Cross-check seats vs adults + children to prevent inventory manipulation.
+    // seats:1, adults:5 would charge 5 fares but reserve 1 seat (overbooking);
+    // seats:5, adults:1 would reserve 5 seats for 1 fare (inventory drain).
+    const numSeats = Math.max(1, Number(seats) || 1);
+    const numAdults = adults != null ? Math.max(0, Number(adults)) : numSeats;
+    const numChildren = adults != null ? Math.max(0, Number(children) || 0) : 0;
+    if (numAdults + numChildren !== numSeats) {
+      return res.status(400).json({
+        success: false,
+        message: `Seats (${numSeats}) must equal adults (${numAdults}) + children (${numChildren}).`,
+      });
+    }
+
     // ── Recompute the authoritative amount SERVER-SIDE (never trust client) ──
     const tripBookingController = require("./tripBookingController");
     let authoritativeAmount;
@@ -138,14 +151,11 @@ exports.verifyPayment = async (req, res) => {
       orderId,
     } = req.body;
 
-    console.log("[VERIFY DEBUG] Received:", {
+    console.log("[Payment Verify] Received:", {
       razorpay_order_id,
       razorpay_payment_id,
       hasSignature: !!razorpay_signature,
       orderId,
-      bodyKeys: Object.keys(req.body),
-      hasAddonDays: !!req.body.addonDays,
-      addonDays: req.body.addonDays,
     });
 
     if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
@@ -244,15 +254,11 @@ exports.verifyPayment = async (req, res) => {
 
     // Now create the actual booking using the existing tripBookingController logic
     const tripBookingController = require("./tripBookingController");
-    console.log("[VERIFY DEBUG] Creating booking with:", {
+    console.log("[Payment Verify] Creating booking:", {
       packageId: notes.packageId,
       batchId: notes.batchId,
       bookingMode: notes.bookingMode,
       seats: notes.seats,
-      adults: notes.adults,
-      children: notes.children,
-      addonDays,
-      flexAvailabilityId: notes.flexAvailabilityId,
     });
     const fakeReq = {
       user: req.user,
@@ -290,6 +296,22 @@ exports.verifyPayment = async (req, res) => {
       tripBookingController.createBooking(fakeReq, fakeRes).catch(reject);
     });
 
+    // ── Reconciliation check ──────────────────────────────────────────────────
+    // The booking's pricing was recomputed independently of the order. If a batch
+    // price, coupon, or GST changed between order creation and now, flag it.
+    const bookingTotal = booking?.booking?.pricing?.totalAmount;
+    const orderTotalRupees = Number(order.amount) / 100;
+    if (
+      bookingTotal &&
+      Math.abs(bookingTotal - orderTotalRupees) > 1 // allow ₹1 rounding
+    ) {
+      console.warn(
+        `[RECONCILIATION] Booking ${booking?.booking?.bookingId} total ₹${bookingTotal} ≠ order ₹${orderTotalRupees}. Pricing changed between order and booking.`,
+      );
+      // The booking is still valid (payment was collected at order amount), but
+      // we log the discrepancy so admins can investigate.
+    }
+
     res.status(200).json({
       success: true,
       message: "Payment verified and booking confirmed",
@@ -299,7 +321,7 @@ exports.verifyPayment = async (req, res) => {
 
     // Email is already sent by createBooking — no need to send again here
   } catch (err) {
-    console.error("[VERIFY DEBUG] FULL ERROR:", err.message, err.stack);
+    console.error("[Payment Verify] Error:", err.message);
     res.status(500).json({
       success: false,
       message: err.message || "Payment verification failed",

@@ -186,14 +186,26 @@ exports.signupSendOtp = async (req, res) => {
       expiresAt,
     });
 
-    // OTP delivery: In production, send via DLT SMS. In dev, logged to console.
-    console.log(`[DEV] Signup OTP for ${phone}: ${code}`);
+    // OTP delivery via RapidSMS (DLT transactional route)
+    const { sendOtpSms } = require("../utils/sendSms");
+    const smsResult = await sendOtpSms(phone, code);
+    if (!smsResult.success && process.env.OTP_DEV_MODE !== "true") {
+      console.error(
+        `[SIGNUP] SMS delivery failed for ${phone}:`,
+        smsResult.reason,
+      );
+    }
+    // Dev fallback log (always — helpful for local testing even when SMS works)
+    if (process.env.OTP_DEV_MODE === "true") {
+      console.log(`[DEV] Signup OTP for ${phone}: ${code}`);
+    }
+
     const response = {
       success: true,
       message: "OTP sent successfully",
       expiresIn: OTP_TTL_MINUTES * 60,
     };
-    // Only include OTP in response during testing (set OTP_DEV_MODE=true in .env)
+    // Only include OTP in response during LOCAL TESTING (never in production)
     if (process.env.OTP_DEV_MODE === "true") response.otp = code;
     res.json(response);
   } catch (err) {
@@ -342,8 +354,19 @@ exports.loginSendOtp = async (req, res) => {
 
     await Otp.create({ phone, code, purpose: "login", expiresAt });
 
-    // OTP delivery: In production, send via DLT SMS. In dev, logged to console.
-    console.log(`[DEV] Login OTP for ${phone}: ${code}`);
+    // OTP delivery via RapidSMS (DLT transactional route)
+    const { sendOtpSms } = require("../utils/sendSms");
+    const smsResult = await sendOtpSms(phone, code);
+    if (!smsResult.success && process.env.OTP_DEV_MODE !== "true") {
+      console.error(
+        `[LOGIN] SMS delivery failed for ${phone}:`,
+        smsResult.reason,
+      );
+    }
+    if (process.env.OTP_DEV_MODE === "true") {
+      console.log(`[DEV] Login OTP for ${phone}: ${code}`);
+    }
+
     const response = {
       success: true,
       message: "OTP sent successfully",

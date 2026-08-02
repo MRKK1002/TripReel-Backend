@@ -67,7 +67,7 @@ exports.getPackageReviews = async (req, res) => {
 // ── User (requires auth) ───────────────────────────────────────────────────────
 
 // POST /api/reviews
-// Body: { packageId, tripId (optional), batchId (optional), bookingId (optional), rating, comment }
+// Body: { packageId, bookingId (required), rating, comment }
 exports.createReview = async (req, res) => {
   try {
     const { packageId, tripId, batchId, bookingId, rating, comment } = req.body;
@@ -76,6 +76,15 @@ exports.createReview = async (req, res) => {
       return res
         .status(400)
         .json({ success: false, message: "packageId is required" });
+    }
+
+    // A review must be tied to a completed booking — prevents rating inflation
+    // from users who never actually booked the package.
+    if (!bookingId && !tripId) {
+      return res.status(400).json({
+        success: false,
+        message: "You can only review a package you've booked.",
+      });
     }
 
     const r = Number(rating);
