@@ -97,6 +97,8 @@ const operatorSchema = new mongoose.Schema(
         "Enter a valid 10-digit Indian mobile number starting with 6-9",
       ],
     },
+    phoneVerified: { type: Boolean, default: false },
+    emailVerified: { type: Boolean, default: false },
     password: { type: String, required: true, minlength: 8, select: false },
 
     // ── Step 2: Business Information ──────────────────────────────────────

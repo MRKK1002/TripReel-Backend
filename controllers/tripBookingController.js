@@ -28,6 +28,35 @@ function parseLocalDateStr(str) {
 // single HTTP request and is handed to admin instead.
 const MAX_BULK_CANCEL = 25;
 
+// Determine the per-day base price for an addon based on its name.
+// Reel maker / videographer uses one price, photographer uses another.
+function pickAddonBasePrice(addonName, photographerPrice, videographerPrice) {
+  const n = (addonName || "").toLowerCase();
+  if (n.includes("reel") || n.includes("video")) return videographerPrice;
+  return photographerPrice; // default to photographer
+}
+
+// A traveler aged 1–7 is a child; age 0 (unknown) or 8+ is charged as an adult.
+// Must match CHILD_MAX_AGE on the app (BookingScreen.jsx).
+const CHILD_MAX_AGE = 7;
+
+// Derive the authoritative adult/child split from traveler ages. The client's
+// self-declared adults/children counts are NEVER trusted for pricing — a
+// modified app could declare adults as children to pay a lower child fare.
+function deriveSplitFromTravelers(travelers) {
+  const list = Array.isArray(travelers) ? travelers : [];
+  let adults = 0;
+  let children = 0;
+  for (const t of list) {
+    const age = Number(t?.age) || 0;
+    if (age > 0 && age <= CHILD_MAX_AGE) children += 1;
+    else adults += 1;
+  }
+  return { adults, children, total: list.length };
+}
+exports.deriveSplitFromTravelers = deriveSplitFromTravelers;
+exports.CHILD_MAX_AGE = CHILD_MAX_AGE;
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function calcPricing({
@@ -87,6 +116,7 @@ async function computeAuthoritativePricing({
   batchId,
   bookingMode,
   flexAvailabilityId,
+  flexStartDate,
   seats,
   adults,
   children,
@@ -107,6 +137,23 @@ async function computeAuthoritativePricing({
       throw new Error("Flexible availability not found or inactive");
     if (String(flex.packageId) !== String(packageId))
       throw new Error("Flexible availability does not belong to this package");
+
+    // Validate chosen start date up-front (before charging) — future + in-window
+    if (flexStartDate) {
+      const chosen = parseLocalDateStr(flexStartDate);
+      const todayMid = new Date();
+      todayMid.setHours(0, 0, 0, 0);
+      const winStart = new Date(flex.startDate);
+      winStart.setHours(0, 0, 0, 0);
+      const winEnd = new Date(flex.endDate);
+      winEnd.setHours(0, 0, 0, 0);
+      if (!chosen) throw new Error("Please select a valid start date.");
+      if (chosen < todayMid)
+        throw new Error("The selected start date is in the past.");
+      if (chosen < winStart || chosen > winEnd)
+        throw new Error("The selected date is outside the available range.");
+    }
+
     adultPrice = flex.adultPrice;
     childPrice = flex.childPrice || 0;
   } else {
@@ -128,12 +175,20 @@ async function computeAuthoritativePricing({
   const gstPercent = (await getSetting("gst_percent")) ?? 5;
 
   // Addons — one creator per booking. Each selected addon-day adds:
-  //   base ₹2000 + per-day outside-city surcharge + per-day extra charges (entry/parking)
-  const ADDON_BASE_PRICE = 2000;
+  //   base price (per service type from settings) + per-day outside-city surcharge + per-day extra charges
+  const photographerPrice =
+    (await getSetting("photographer_base_price")) ?? 2000;
+  const videographerPrice =
+    (await getSetting("videographer_base_price")) ?? 2000;
   let addonSurcharge = 0; // operator earnings portion (outside-city + extras)
   let addonTotalPrice = 0;
   if (addonDays) {
     for (const name of Object.keys(addonDays)) {
+      const basePrice = pickAddonBasePrice(
+        name,
+        photographerPrice,
+        videographerPrice,
+      );
       for (const dayIdx of addonDays[name] || []) {
         const dayInfo = pkg.itinerary[dayIdx];
         let sc = 0;
@@ -151,7 +206,7 @@ async function computeAuthoritativePricing({
           }
         }
         addonSurcharge += sc;
-        addonTotalPrice += ADDON_BASE_PRICE + sc;
+        addonTotalPrice += basePrice + sc;
       }
     }
   }
@@ -507,6 +562,36 @@ exports.createBooking = async (req, res) => {
           message: "Flex record does not belong to this package",
         });
       }
+
+      // ── Validate the chosen start date is in the future AND inside the
+      // operator's available window. Without this a user could book a past date
+      // or a date outside the range — breaking scheduling & refund slabs.
+      const chosenStart = parseLocalDateStr(req.body.flexStartDate);
+      if (!chosenStart) {
+        return res.status(400).json({
+          success: false,
+          message: "Please select a valid start date.",
+        });
+      }
+      const todayMid = new Date();
+      todayMid.setHours(0, 0, 0, 0);
+      const winStart = new Date(flexRecord.startDate);
+      winStart.setHours(0, 0, 0, 0);
+      const winEnd = new Date(flexRecord.endDate);
+      winEnd.setHours(0, 0, 0, 0);
+      if (chosenStart < todayMid) {
+        return res.status(400).json({
+          success: false,
+          message: "The selected start date is in the past.",
+        });
+      }
+      if (chosenStart < winStart || chosenStart > winEnd) {
+        return res.status(400).json({
+          success: false,
+          message: "The selected date is outside the available range.",
+        });
+      }
+
       adultPrice = flexRecord.adultPrice;
       childPrice = flexRecord.childPrice || 0;
       operatorId = flexRecord.operatorId;
@@ -602,9 +687,31 @@ exports.createBooking = async (req, res) => {
       operatorId = batch.operatorId;
     }
 
+    // Seats are now reserved (atomically). If ANY later step fails — before the
+    // booking row exists — we MUST release them, otherwise payment was captured
+    // but inventory stays locked (phantom sold-out).
+    const releaseReservedSeats = async () => {
+      try {
+        if (isFlexible) {
+          const FlexibleAvailability = require("../models/FlexibleAvailability");
+          await FlexibleAvailability.updateOne(
+            { _id: flexRecord._id },
+            { $inc: { bookedSeats: -numSeats } },
+          );
+        } else {
+          await Batch.findByIdAndUpdate(batchId, {
+            $inc: { bookedSeats: -numSeats },
+          });
+        }
+      } catch (e) {
+        console.error("[createBooking] failed to release seats:", e.message);
+      }
+    };
+
     // ── Fetch package ──────────────────────────────────────────────────────
     const pkg = await Package.findById(packageId);
     if (!pkg || !pkg.isActive || pkg.status !== "APPROVED") {
+      await releaseReservedSeats();
       return res.status(404).json({
         success: false,
         message: "Package not found or not available",
@@ -616,15 +723,23 @@ exports.createBooking = async (req, res) => {
     const gstPercent = (await getSetting("gst_percent")) ?? 5;
 
     // ── Compute addon (Snapja) amounts — held by platform until dispatch ──────
-    // One creator per booking. Each addon-day: base ₹2000 + per-day outside-city
+    // One creator per booking. Each addon-day: base price (per service type) + per-day outside-city
     // surcharge (fallback to package default) + per-day extra charges.
-    const ADDON_BASE_PRICE = 2000;
+    const photographerPrice =
+      (await getSetting("photographer_base_price")) ?? 2000;
+    const videographerPrice =
+      (await getSetting("videographer_base_price")) ?? 2000;
     let addonSurcharge = 0; // operator's outside-city + extras portion
     let addonTotalPrice = 0; // base + surcharge (full held amount)
     const addonDaysData = req.body.addonDays || null;
     const addonNames = addonDaysData ? Object.keys(addonDaysData) : [];
     if (addonDaysData) {
       for (const addonName of addonNames) {
+        const basePrice = pickAddonBasePrice(
+          addonName,
+          photographerPrice,
+          videographerPrice,
+        );
         const days = addonDaysData[addonName] || [];
         for (const dayIdx of days) {
           const dayInfo = pkg.itinerary[dayIdx];
@@ -641,7 +756,7 @@ exports.createBooking = async (req, res) => {
             }
           }
           addonSurcharge += surcharge;
-          addonTotalPrice += ADDON_BASE_PRICE + surcharge;
+          addonTotalPrice += basePrice + surcharge;
         }
       }
     }
@@ -739,38 +854,65 @@ exports.createBooking = async (req, res) => {
     };
 
     // ── Create booking — auto-confirmed (payment simulated) ──────────────────
-    const booking = await TripBooking.create({
-      userId: req.user._id,
-      packageId,
-      batchId: isFlexible ? undefined : batchId,
-      bookingMode: isFlexible ? "flexible" : "batch",
-      flexStartDate: isFlexible
-        ? parseLocalDateStr(req.body.flexStartDate)
-        : undefined,
-      flexEndDate: isFlexible ? snapshot.endDate : undefined,
-      flexAvailabilityId: isFlexible ? req.body.flexAvailabilityId : undefined,
-      operatorId,
-      seats: numSeats,
-      status: "CONFIRMED", // auto-confirmed — no admin approval needed
-      travelers: Array.isArray(req.body.travelers)
-        ? req.body.travelers.slice(0, numSeats).map((t) => ({
-            name: String(t.name || "").trim(),
-            gender: String(t.gender || "").trim(),
-            age: Number(t.age) || 0,
-          }))
-        : [],
-      pricing,
-      snapshot,
-      addonDays: addonDaysData,
-      addonSchedule: req.body.addonSchedule || null,
-      addonSurcharge,
-      addonNames,
-      addonTotalPrice,
-      addonHeld: addonTotalPrice > 0, // hold Snapja money until dispatch
-      addonDispatched: false,
-      razorpayPaymentId: req.body.paymentId || "",
-      razorpayOrderId: req.body.razorpayOrderId || "",
-    });
+    // If create fails, payment was already captured — release the reserved seats
+    // and return the consumed coupon slot so inventory isn't lost.
+    let booking;
+    try {
+      booking = await TripBooking.create({
+        userId: req.user._id,
+        packageId,
+        batchId: isFlexible ? undefined : batchId,
+        bookingMode: isFlexible ? "flexible" : "batch",
+        flexStartDate: isFlexible
+          ? parseLocalDateStr(req.body.flexStartDate)
+          : undefined,
+        flexEndDate: isFlexible ? snapshot.endDate : undefined,
+        flexAvailabilityId: isFlexible
+          ? req.body.flexAvailabilityId
+          : undefined,
+        operatorId,
+        seats: numSeats,
+        status: "CONFIRMED", // auto-confirmed — no admin approval needed
+        travelers: Array.isArray(req.body.travelers)
+          ? req.body.travelers.slice(0, numSeats).map((t) => ({
+              name: String(t.name || "").trim(),
+              gender: String(t.gender || "").trim(),
+              age: Number(t.age) || 0,
+            }))
+          : [],
+        pricing,
+        snapshot,
+        addonDays: addonDaysData,
+        addonSchedule: req.body.addonSchedule || null,
+        addonSurcharge,
+        addonNames,
+        addonTotalPrice,
+        addonHeld: addonTotalPrice > 0, // hold Snapja money until dispatch
+        addonDispatched: false,
+        razorpayPaymentId: req.body.paymentId || "",
+        razorpayOrderId: req.body.razorpayOrderId || "",
+      });
+    } catch (createErr) {
+      await releaseReservedSeats();
+      if (appliedCouponId) {
+        try {
+          const Coupon = require("../models/Coupon");
+          await Coupon.updateOne(
+            { _id: appliedCouponId },
+            { $inc: { usedCount: -1 } },
+          );
+        } catch {}
+      }
+      console.error(
+        "[createBooking] booking create failed after payment:",
+        createErr.message,
+      );
+      return res.status(500).json({
+        success: false,
+        message:
+          "Payment was received but the booking could not be created. Our team has been notified — please contact support with your payment ID.",
+      });
+    }
 
     // ── Side effects — increment seats + bookingCount immediately ──────────
     // ── Side effects — bookingCount (seats already reserved atomically above) ─
@@ -1859,7 +2001,7 @@ exports.syncSnapjaStatus = async (req, res) => {
     }
 
     const SNAPJA_API = "https://api.snapja.com/api/tripreel/bookings";
-const SNAPJA_API_KEY = process.env.SNAPJA_API_KEY;
+    const SNAPJA_API_KEY = process.env.SNAPJA_API_KEY;
 
     let updated = false;
     const snapjaBookings = { ...booking.snapjaBookings };

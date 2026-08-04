@@ -50,6 +50,16 @@ const DEFAULTS = [
   { key: "platform_fee_percent", value: 10, label: "Platform Fee (%)" },
   { key: "gst_percent", value: 5, label: "GST on Bookings (%)" },
   {
+    key: "photographer_base_price",
+    value: 2000,
+    label: "Photographer Base Price (₹/day)",
+  },
+  {
+    key: "videographer_base_price",
+    value: 2000,
+    label: "Reel Maker / Videographer Base Price (₹/day)",
+  },
+  {
     key: "default_cancellation_policy",
     value:
       "Free cancellation up to 7 days before departure. 50% refund for cancellations 3-7 days prior. No refund within 3 days of departure.",
@@ -104,6 +114,8 @@ exports.getPublicSettings = async (req, res) => {
     await seedDefaults();
     const keys = [
       "gst_percent",
+      "photographer_base_price",
+      "videographer_base_price",
       "default_cancellation_policy",
       "default_refund_policy",
       "default_terms",
@@ -192,7 +204,12 @@ exports.updateSetting = async (req, res) => {
     }
 
     const numVal = Number(value);
-    const numericKeys = ["platform_fee_percent", "gst_percent"];
+    const numericKeys = [
+      "platform_fee_percent",
+      "gst_percent",
+      "photographer_base_price",
+      "videographer_base_price",
+    ];
     const arrayKeys = [
       "cancellation_refund_slabs",
       "sample_demo_media",

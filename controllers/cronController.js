@@ -1,10 +1,10 @@
 const TripBooking = require("../models/TripBooking");
 const Batch = require("../models/Batch");
+const { getSetting } = require("./platformSettingsController");
 
 // Helper: stagger notifications to avoid sending all at once
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const NOTIFICATION_STAGGER_MS = 500; // 500ms gap between each push notification
-const ADDON_BASE_PRICE = 2000; // ₹/day/service sent to Snapja
 const SNAPJA_API = "https://api.snapja.com/api/tripreel/bookings";
 const SNAPJA_API_KEY = process.env.SNAPJA_API_KEY;
 
@@ -59,6 +59,10 @@ async function runSnapjaDispatch() {
   try {
     const Package = require("../models/Package");
     const User = require("../models/User");
+    const photographerPrice =
+      (await getSetting("photographer_base_price")) ?? 2000;
+    const videographerPrice =
+      (await getSetting("videographer_base_price")) ?? 2000;
 
     const bookings = await TripBooking.find({
       status: "CONFIRMED",
@@ -94,6 +98,8 @@ async function runSnapjaDispatch() {
           const serviceType = addonName.toLowerCase().includes("photographer")
             ? "photographer"
             : "reelmaker";
+          const addonPrice =
+            serviceType === "reelmaker" ? videographerPrice : photographerPrice;
           for (const dayIdx of addonDays[addonName] || []) {
             const dayInfo = pkg?.itinerary?.[dayIdx];
             const actualDate = new Date(startDate);
@@ -129,7 +135,7 @@ async function runSnapjaDispatch() {
                     lat: sched.lat || dayInfo?.pickupLat || 0,
                     lng: sched.lng || dayInfo?.pickupLng || 0,
                   },
-                  price: ADDON_BASE_PRICE,
+                  price: addonPrice,
                   duration: 1,
                   date: actualDate.toISOString().split("T")[0],
                   time,

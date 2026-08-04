@@ -699,6 +699,23 @@ exports.operatorCreatePackage = async (req, res) => {
   try {
     const body = stripPlatformFields({ ...req.body });
 
+    // Prevent duplicate titles for the same operator
+    if (body.title?.trim()) {
+      const existingTitle = await Package.findOne({
+        operatorId: req.operator._id,
+        title: {
+          $regex: `^${body.title.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
+          $options: "i",
+        },
+      });
+      if (existingTitle) {
+        return res.status(400).json({
+          success: false,
+          message: `You already have a package titled "${body.title.trim()}". Please use a different title.`,
+        });
+      }
+    }
+
     // slot-0 → image_url (cover), slots 1-3 → images (gallery)
     applyImageFields(body, req.files);
 
@@ -763,12 +780,25 @@ exports.operatorCreatePackage = async (req, res) => {
 
     const status = submissionMode === "DRAFT" ? "DRAFT" : "PENDING";
 
-    const pkg = await Package.create({
-      ...body,
-      operatorId: req.operator._id,
-      status,
-      isActive: false,
-    });
+    // Drafts are partial — skip Mongoose schema validators for them.
+    // Submitted packages get full validation.
+    let pkg;
+    if (status === "DRAFT") {
+      pkg = new Package({
+        ...body,
+        operatorId: req.operator._id,
+        status,
+        isActive: false,
+      });
+      await pkg.save({ validateBeforeSave: false });
+    } else {
+      pkg = await Package.create({
+        ...body,
+        operatorId: req.operator._id,
+        status,
+        isActive: false,
+      });
+    }
     res.status(201).json({ success: true, package: pkg });
 
     // Notify admin: new package for review
@@ -872,6 +902,16 @@ exports.operatorUpdatePackage = async (req, res) => {
     // If package was previously APPROVED, keep its current isActive state
     // (respect operator's disable choice). Otherwise hide it until approved.
     const wasApproved = pkg.status === "APPROVED";
+
+    // Auto-sync the legacy `duration` text field from numeric days/nights
+    if (body.durationDays != null) {
+      const days = Number(body.durationDays) || 0;
+      const nights = Number(body.durationNights) || Math.max(0, days - 1);
+      body.duration =
+        days === 1
+          ? "1 Day"
+          : `${days} Days / ${nights} Night${nights !== 1 ? "s" : ""}`;
+    }
 
     const updated = await Package.findByIdAndUpdate(
       req.params.id,

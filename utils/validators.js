@@ -28,7 +28,7 @@ const PLACE_NAME_RE = /^[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ.'\-() ]*$/;
 const EMAIL_RE = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
 const PHONE_IN_RE = /^[6-9]\d{9}$/;
 const IFSC_RE = /^[A-Z]{4}0[A-Z0-9]{6}$/;
-const UPI_RE = /^[a-zA-Z0-9][a-zA-Z0-9.\-_]{1,63}@[a-zA-Z]{2,64}$/;
+const UPI_RE = /^[a-zA-Z0-9][a-zA-Z0-9.\-_]{1,63}@[a-zA-Z][a-zA-Z0-9.]{1,63}$/;
 const GSTIN_RE = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/;
 const PAN_RE = /^[A-Z]{5}[0-9]{4}[A-Z]$/;
 

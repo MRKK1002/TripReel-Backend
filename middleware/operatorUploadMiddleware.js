@@ -26,11 +26,23 @@ const storage = multer.diskStorage({
 });
 
 const fileFilter = (req, file, cb) => {
-  const allowed = ["application/pdf", "image/jpeg", "image/jpg", "image/png"];
-  if (allowed.includes(file.mimetype)) {
+  const ext = path.extname(file.originalname).toLowerCase();
+  const mime = (file.mimetype || "").toLowerCase();
+
+  // KYC docs may only be PDF or common image formats. Extension AND mimetype
+  // must both match — mimetype alone is client-controlled and spoofable.
+  const allowedByExt = [".pdf", ".jpg", ".jpeg", ".png"];
+  const allowedByMime = [
+    "application/pdf",
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+  ];
+
+  if (allowedByExt.includes(ext) && allowedByMime.includes(mime)) {
     cb(null, true);
   } else {
-    cb(new Error("Only PDF and image files are allowed"));
+    cb(new Error("Only PDF, JPG or PNG files are allowed"));
   }
 };
 

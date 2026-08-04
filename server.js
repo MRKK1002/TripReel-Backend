@@ -72,7 +72,36 @@ const generalLimiter = rateLimit({
 });
 
 // ── Middleware ─────────────────────────────────────────────────────────────────
-app.use(cors());
+// CORS whitelist — only these browser origins may call the API. Mobile apps,
+// curl, and server-to-server calls send no Origin header and are always allowed
+// (CORS is a browser-only protection). Add/remove domains via CORS_ORIGINS in
+// .env (comma-separated) without touching code.
+const defaultOrigins = [
+  "https://tripreel.in",
+  "https://www.tripreel.in",
+  "https://operator.tripreel.in",
+  "https://admin.tripreel.in",
+  "http://localhost:5173",
+  "http://localhost:3000",
+  "http://127.0.0.1:5173",
+];
+const envOrigins = (process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map((o) => o.trim())
+  .filter(Boolean);
+const allowedOrigins = [...new Set([...defaultOrigins, ...envOrigins])];
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // No origin = mobile app / curl / same-origin / server-to-server → allow
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+      return callback(new Error(`Origin ${origin} not allowed by CORS`));
+    },
+    credentials: true,
+  }),
+);
 app.use(
   express.json({
     limit: "20mb",
@@ -86,8 +115,51 @@ app.use(express.urlencoded({ extended: true, limit: "20mb" }));
 // Apply general limiter to all /api routes
 app.use("/api", generalLimiter);
 
-// Static folder for uploaded images and videos
-app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+// ── Private KYC document serving (signed URLs only) ──────────────────────────
+// Operator KYC docs (government ID, PAN, selfie, trade license) are private.
+// They are served ONLY through /api/secure-docs with a valid HMAC signature.
+// Block any direct static access to /uploads/operators/.
+const { verifySignedUrl } = require("./utils/signedDocUrl");
+
+app.get("/api/secure-docs", (req, res) => {
+  const result = verifySignedUrl(req.query);
+  if (!result.ok) {
+    return res.status(403).json({ success: false, message: result.reason });
+  }
+  // filePath looks like "/uploads/operators/xyz.jpg" — resolve safely
+  const safePath = path.normalize(result.filePath).replace(/^(\.\.[/\\])+/, "");
+  const absPath = path.join(__dirname, safePath);
+  // Final containment check — never serve outside the operators upload dir
+  const operatorsDir = path.join(__dirname, "uploads", "operators");
+  if (!absPath.startsWith(operatorsDir)) {
+    return res.status(403).json({ success: false, message: "Forbidden" });
+  }
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Cache-Control", "private, no-store");
+  return res.sendFile(absPath, (err) => {
+    if (err && !res.headersSent) {
+      res.status(404).json({ success: false, message: "File not found" });
+    }
+  });
+});
+
+// Block direct static access to the private operators folder
+app.use("/uploads/operators", (req, res) => {
+  res.status(403).json({
+    success: false,
+    message: "Access denied. This document requires a signed link.",
+  });
+});
+
+// Static folder for public uploaded images and videos (packages, banners, etc.)
+app.use(
+  "/uploads",
+  (req, res, next) => {
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    next();
+  },
+  express.static(path.join(__dirname, "uploads")),
+);
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 // Auth — stricter limits; OTP send endpoints get their own even tighter limiter
@@ -113,6 +185,8 @@ app.use("/api/trips", require("./routes/tripRoutes"));
 app.use("/api/bookings", require("./routes/bookingRoutes"));
 app.use("/api/wishlists", require("./routes/wishlistRoutes"));
 app.use("/api/reels", require("./routes/reelRoutes"));
+app.use("/api/operators/auth/send-otp", otpSendLimiter);
+app.use("/api/operators/auth/forgot-password", otpSendLimiter);
 app.use("/api/operators/auth", authLimiter);
 app.use("/api/operators/auth", require("./routes/operatorAuthRoutes"));
 app.use("/api/operators", require("./routes/operatorRoutes"));
@@ -150,9 +224,20 @@ app.get("/", (req, res) => {
 
 // ── Global error handler ──────────────────────────────────────────────────────
 app.use((err, req, res, next) => {
-  // Ensure CORS headers are present even on error responses (multer errors,
-  // timeouts, etc. can bypass the cors() middleware response headers).
-  res.setHeader("Access-Control-Allow-Origin", "*");
+  // CORS rejection → clean 403 (don't leak a stack trace)
+  if (err && /not allowed by CORS/i.test(err.message || "")) {
+    return res
+      .status(403)
+      .json({ success: false, message: "Origin not allowed." });
+  }
+
+  // Reflect the request origin on error responses ONLY if it's whitelisted, so
+  // error bodies stay readable for our own apps without opening it to everyone.
+  const origin = req.headers.origin;
+  if (origin && allowedOrigins.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+  }
   res.setHeader(
     "Access-Control-Allow-Methods",
     "GET,POST,PUT,PATCH,DELETE,OPTIONS",

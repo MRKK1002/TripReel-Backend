@@ -5,12 +5,20 @@ const {
   login,
   getMe,
   updateProfile,
+  forgotPassword,
+  resetPassword,
+  sendOtp,
+  verifyOtp,
 } = require("../controllers/operatorAuthController");
 const { operatorProtect } = require("../middleware/operatorAuthMiddleware");
 
 // Public routes
 router.post("/register", register);
 router.post("/login", login);
+router.post("/send-otp", sendOtp);
+router.post("/verify-otp", verifyOtp);
+router.post("/forgot-password", forgotPassword);
+router.post("/reset-password", resetPassword);
 
 // Protected routes
 router.get("/me", operatorProtect, getMe);

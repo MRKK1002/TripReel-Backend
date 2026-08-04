@@ -191,7 +191,22 @@ exports.getOperatorById = async (req, res) => {
       return res
         .status(404)
         .json({ success: false, message: "Operator not found" });
-    res.json({ success: true, operator });
+
+    // Replace private KYC doc paths with short-lived signed URLs so admins can
+    // view them without the files being publicly downloadable.
+    const { toSignedUrl } = require("../utils/signedDocUrl");
+    const op = operator.toObject();
+    for (const field of [
+      "governmentId",
+      "selfieVerification",
+      "panCardPath",
+      "tradeLicensePath",
+      "profilePhoto",
+    ]) {
+      if (op[field]) op[field] = toSignedUrl(op[field]);
+    }
+
+    res.json({ success: true, operator: op });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }

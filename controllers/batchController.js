@@ -43,10 +43,12 @@ function validateBatchPricing({ adultPrice, childPrice, totalSeats }) {
   return "";
 }
 
-// Two batches on the same package must not cover overlapping dates
+// Two ACTIVE batches on the same package must not cover overlapping dates.
+// Disabled batches don't block re-listing new dates over the same window.
 async function findOverlappingBatch({ packageId, start, end, excludeId }) {
   const query = {
     packageId,
+    isActive: { $ne: false },
     startDate: { $lt: end },
     endDate: { $gt: start },
   };
@@ -177,6 +179,11 @@ exports.createBatch = async (req, res) => {
     if (!deadline || deadline > start) {
       // Default: booking deadline = start date
       deadline = start;
+    }
+    // Deadline can't already be in the past — that would create a batch nobody
+    // can ever book. Clamp it up to "now" (so it's at least bookable today).
+    if (deadline < now) {
+      deadline = start; // start is guaranteed future, so this stays bookable
     }
 
     // ── Price / seat validation (was frontend-only, so ₹0 batches got through) ──

@@ -51,16 +51,47 @@ const storage = multer.diskStorage({
   },
 });
 
-const fileFilter = (req, file, cb) => {
-  const allowed = /jpeg|jpg|png|gif|webp|mp4|mov/;
-  const extname = allowed.test(path.extname(file.originalname).toLowerCase());
-  const mimetype =
-    allowed.test(file.mimetype) || file.mimetype.startsWith("video/");
+// Explicitly dangerous types that must NEVER be accepted even if the extension
+// or mimetype looks benign — SVG/HTML can carry executable scripts (stored XSS).
+const BLOCKED_EXTENSIONS = [
+  ".svg",
+  ".html",
+  ".htm",
+  ".xml",
+  ".js",
+  ".php",
+  ".phtml",
+  ".exe",
+  ".sh",
+];
+const BLOCKED_MIMES = [
+  "image/svg+xml",
+  "text/html",
+  "application/xhtml+xml",
+  "application/xml",
+  "text/xml",
+  "application/javascript",
+  "text/javascript",
+];
 
-  if (extname || mimetype) {
+const fileFilter = (req, file, cb) => {
+  const ext = path.extname(file.originalname).toLowerCase();
+  const mime = (file.mimetype || "").toLowerCase();
+
+  // Hard block dangerous types first
+  if (BLOCKED_EXTENSIONS.includes(ext) || BLOCKED_MIMES.includes(mime)) {
+    return cb(new Error("This file type is not allowed."));
+  }
+
+  // Allowed image + video types — extension AND mimetype must BOTH match
+  const allowedExt = /\.(jpe?g|png|gif|webp|mp4|mov)$/i;
+  const extOk = allowedExt.test(ext);
+  const mimeOk = mime.startsWith("image/") || mime.startsWith("video/");
+
+  if (extOk && mimeOk) {
     cb(null, true);
   } else {
-    cb(new Error("Only image/video files are allowed"));
+    cb(new Error("Only JPG, PNG, GIF, WEBP, MP4 or MOV files are allowed"));
   }
 };
 

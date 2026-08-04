@@ -221,6 +221,17 @@ const tripBookingSchema = new mongoose.Schema(
       default: false,
     },
 
+    // Set when the amount charged (order) differs from the recomputed booking
+    // total (e.g. an admin changed a price/setting between order and payment).
+    // Admin is notified to reconcile. Booking is honored at the charged amount.
+    pricingMismatch: {
+      flagged: { type: Boolean, default: false },
+      chargedAmount: { type: Number },
+      computedAmount: { type: Number },
+      note: { type: String, default: "" },
+      flaggedAt: { type: Date },
+    },
+
     // Addon (Snapja) money is HELD by platform until the booking is locked-in,
     // then dispatched to Snapja. If cancelled before dispatch → fully refundable.
     addonHeld: {

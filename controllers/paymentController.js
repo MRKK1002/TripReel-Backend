@@ -30,10 +30,9 @@ exports.createOrder = async (req, res) => {
       flexStartDate,
       flexAvailabilityId,
       seats,
-      adults,
-      children,
       couponCode,
       addonDays,
+      travelers,
     } = req.body;
 
     const isFlexible = bookingMode === "flexible";
@@ -45,21 +44,29 @@ exports.createOrder = async (req, res) => {
       });
     }
 
-    // Cross-check seats vs adults + children to prevent inventory manipulation.
-    // seats:1, adults:5 would charge 5 fares but reserve 1 seat (overbooking);
-    // seats:5, adults:1 would reserve 5 seats for 1 fare (inventory drain).
+    const tripBookingController = require("./tripBookingController");
+
+    // ── Derive the adult/child split from traveler AGES, server-side ─────────
+    // The client's self-declared adults/children are NEVER trusted for pricing.
+    // Travelers must be provided and their count must equal the reserved seats.
     const numSeats = Math.max(1, Number(seats) || 1);
-    const numAdults = adults != null ? Math.max(0, Number(adults)) : numSeats;
-    const numChildren = adults != null ? Math.max(0, Number(children) || 0) : 0;
-    if (numAdults + numChildren !== numSeats) {
+    const split = tripBookingController.deriveSplitFromTravelers(travelers);
+    if (split.total === 0) {
       return res.status(400).json({
         success: false,
-        message: `Seats (${numSeats}) must equal adults (${numAdults}) + children (${numChildren}).`,
+        message: "Traveler details are required to book.",
       });
     }
+    if (split.total !== numSeats) {
+      return res.status(400).json({
+        success: false,
+        message: `Number of travelers (${split.total}) must equal seats (${numSeats}).`,
+      });
+    }
+    const numAdults = split.adults;
+    const numChildren = split.children;
 
     // ── Recompute the authoritative amount SERVER-SIDE (never trust client) ──
-    const tripBookingController = require("./tripBookingController");
     let authoritativeAmount;
     try {
       authoritativeAmount =
@@ -68,9 +75,10 @@ exports.createOrder = async (req, res) => {
           batchId: isFlexible ? null : batchId,
           bookingMode: isFlexible ? "flexible" : "batch",
           flexAvailabilityId: isFlexible ? flexAvailabilityId : undefined,
-          seats,
-          adults,
-          children,
+          flexStartDate: isFlexible ? flexStartDate : undefined,
+          seats: numSeats,
+          adults: numAdults,
+          children: numChildren,
           couponCode,
           addonDays,
         });
@@ -108,9 +116,9 @@ exports.createOrder = async (req, res) => {
         bookingMode: isFlexible ? "flexible" : "batch",
         flexStartDate: flexStartDate || "",
         flexAvailabilityId: flexAvailabilityId || "",
-        seats: String(seats || 1),
-        adults: adults != null ? String(adults) : "",
-        children: children != null ? String(children) : "0",
+        seats: String(numSeats),
+        adults: String(numAdults),
+        children: String(numChildren),
         userId: req.user._id.toString(),
         couponCode: couponCode || "",
         addonDays: addonDaysStr, // compact format fits in Razorpay notes
@@ -297,19 +305,52 @@ exports.verifyPayment = async (req, res) => {
     });
 
     // ── Reconciliation check ──────────────────────────────────────────────────
-    // The booking's pricing was recomputed independently of the order. If a batch
-    // price, coupon, or GST changed between order creation and now, flag it.
+    // The booking's pricing was recomputed independently of the order. If a
+    // price/coupon/GST/addon-price changed between order creation and payment,
+    // the recomputed total won't match the amount actually charged. The customer
+    // paid the order amount (what they agreed to), so we HONOR that — but we
+    // persist a flag and notify admin so the discrepancy is reconciled by a human
+    // (never silently swallowed).
     const bookingTotal = booking?.booking?.pricing?.totalAmount;
+    const bookingId = booking?.booking?._id;
+    const bookingRef = booking?.booking?.bookingId;
     const orderTotalRupees = Number(order.amount) / 100;
     if (
       bookingTotal &&
+      bookingId &&
       Math.abs(bookingTotal - orderTotalRupees) > 1 // allow ₹1 rounding
     ) {
-      console.warn(
-        `[RECONCILIATION] Booking ${booking?.booking?.bookingId} total ₹${bookingTotal} ≠ order ₹${orderTotalRupees}. Pricing changed between order and booking.`,
-      );
-      // The booking is still valid (payment was collected at order amount), but
-      // we log the discrepancy so admins can investigate.
+      const note = `Charged ₹${orderTotalRupees} but recomputed total is ₹${bookingTotal}. A price or setting likely changed between order and payment.`;
+      console.warn(`[RECONCILIATION] Booking ${bookingRef}: ${note}`);
+
+      try {
+        const TripBooking = require("../models/TripBooking");
+        await TripBooking.updateOne(
+          { _id: bookingId },
+          {
+            $set: {
+              pricingMismatch: {
+                flagged: true,
+                chargedAmount: orderTotalRupees,
+                computedAmount: bookingTotal,
+                note,
+                flaggedAt: new Date(),
+              },
+            },
+          },
+        );
+        const { notifyAdmin } = require("./notificationController");
+        notifyAdmin(
+          "Pricing Mismatch — Reconcile Booking",
+          `Booking ${bookingRef}: ${note}`,
+          { type: "general", bookingId: String(bookingId) },
+        );
+      } catch (flagErr) {
+        console.error(
+          "[RECONCILIATION] failed to persist mismatch flag:",
+          flagErr.message,
+        );
+      }
     }
 
     res.status(200).json({

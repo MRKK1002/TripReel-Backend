@@ -103,9 +103,11 @@ router.post("/", operatorProtect, requireApprovedOperator, async (req, res) => {
         .json({ success: false, message: "Start date cannot be in the past" });
     }
 
-    // Check for overlapping date ranges on the same package
+    // Check for overlapping ACTIVE date ranges on the same package
+    // (disabled ranges don't block re-listing new dates over the same window)
     const overlap = await FlexibleAvailability.findOne({
       packageId,
+      isActive: { $ne: false },
       startDate: { $lt: new Date(endDate) },
       endDate: { $gt: new Date(startDate) },
     });
@@ -220,10 +222,11 @@ router.put(
         });
       }
 
-      // Check for overlapping date ranges (exclude self)
+      // Check for overlapping ACTIVE date ranges (exclude self; ignore disabled)
       const overlap = await FlexibleAvailability.findOne({
         packageId: item.packageId,
         _id: { $ne: item._id },
+        isActive: { $ne: false },
         startDate: { $lt: item.endDate },
         endDate: { $gt: item.startDate },
       });
