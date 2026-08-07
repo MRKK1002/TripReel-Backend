@@ -24,7 +24,10 @@ exports.adminGetAllBookings = async (req, res) => {
     const { status, page = 1, limit = 20, search } = req.query;
     const query = {};
     if (status && status !== "all") query.status = status;
-    if (search) query.bookingId = { $regex: search, $options: "i" };
+    if (search) {
+      const escapeRegex = require("../utils/escapeRegex");
+      query.bookingId = { $regex: escapeRegex(String(search)), $options: "i" };
+    }
 
     const skip = (Number(page) - 1) * Number(limit);
     const [bookings, total] = await Promise.all([

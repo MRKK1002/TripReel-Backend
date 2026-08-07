@@ -1,4 +1,5 @@
 const Experience = require("../models/Experience");
+const escapeRegex = require("../utils/escapeRegex");
 
 // GET /api/experiences
 // Supports ?country=India&state=Goa for "Experiences Near You"
@@ -10,19 +11,20 @@ exports.getAllExperiences = async (req, res) => {
 
     // Structured location filter — country + state for "Experiences Near You"
     if (state) {
-      query.state = { $regex: state.trim(), $options: "i" };
+      query.state = { $regex: escapeRegex(state.trim()), $options: "i" };
       if (country) {
-        query.country = { $regex: country.trim(), $options: "i" };
+        query.country = { $regex: escapeRegex(country.trim()), $options: "i" };
       }
     } else if (country && !state) {
       // Country-only filter (e.g. show all India experiences)
-      query.country = { $regex: country.trim(), $options: "i" };
+      query.country = { $regex: escapeRegex(country.trim()), $options: "i" };
     } else if (search) {
+      const safe = escapeRegex(String(search));
       query.$or = [
-        { name: { $regex: search, $options: "i" } },
-        { location: { $regex: search, $options: "i" } },
-        { city: { $regex: search, $options: "i" } },
-        { state: { $regex: search, $options: "i" } },
+        { name: { $regex: safe, $options: "i" } },
+        { location: { $regex: safe, $options: "i" } },
+        { city: { $regex: safe, $options: "i" } },
+        { state: { $regex: safe, $options: "i" } },
       ];
     }
 

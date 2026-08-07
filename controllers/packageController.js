@@ -186,22 +186,26 @@ exports.getAllPackages = async (req, res) => {
     }
 
     if (search) {
+      const escapeRegex = require("../utils/escapeRegex");
+      const safe = escapeRegex(String(search));
       query.$or = [
-        { title: { $regex: search, $options: "i" } },
-        { location: { $regex: search, $options: "i" } },
-        { city: { $regex: search, $options: "i" } },
-        { state: { $regex: search, $options: "i" } },
-        { country: { $regex: search, $options: "i" } },
-        { departureCity: { $regex: search, $options: "i" } },
+        { title: { $regex: safe, $options: "i" } },
+        { location: { $regex: safe, $options: "i" } },
+        { city: { $regex: safe, $options: "i" } },
+        { state: { $regex: safe, $options: "i" } },
+        { country: { $regex: safe, $options: "i" } },
+        { departureCity: { $regex: safe, $options: "i" } },
       ];
     }
     if (category) {
+      const escapeRegex = require("../utils/escapeRegex");
+      const safeCat = escapeRegex(String(category));
       query.$and = [
         ...(query.$and || []),
         {
           $or: [
-            { category: { $regex: category, $options: "i" } },
-            { categories: { $regex: category, $options: "i" } },
+            { category: { $regex: safeCat, $options: "i" } },
+            { categories: { $regex: safeCat, $options: "i" } },
           ],
         },
       ];
@@ -420,9 +424,11 @@ exports.adminGetAllPackages = async (req, res) => {
     const query = {};
 
     if (search) {
+      const escapeRegex = require("../utils/escapeRegex");
+      const safe = escapeRegex(String(search));
       query.$or = [
-        { title: { $regex: search, $options: "i" } },
-        { location: { $regex: search, $options: "i" } },
+        { title: { $regex: safe, $options: "i" } },
+        { location: { $regex: safe, $options: "i" } },
       ];
     }
     if (status && status !== "all") query.status = status;

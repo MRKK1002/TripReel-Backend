@@ -5,6 +5,8 @@ const dotenv = require("dotenv");
 const path = require("path");
 const http = require("http");
 const rateLimit = require("express-rate-limit");
+const helmet = require("helmet");
+const mongoSanitize = require("express-mongo-sanitize");
 
 dotenv.config();
 
@@ -102,6 +104,15 @@ app.use(
     credentials: true,
   }),
 );
+
+// Security headers (CSP, HSTS, X-Frame-Options, X-Content-Type-Options, etc.)
+app.use(
+  helmet({
+    contentSecurityPolicy: false, // CSP can break image/video URLs — revisit when moving to CDN
+    crossOriginResourcePolicy: { policy: "cross-origin" }, // allow mobile app to load images
+  }),
+);
+
 app.use(
   express.json({
     limit: "20mb",
@@ -111,6 +122,10 @@ app.use(
   }),
 );
 app.use(express.urlencoded({ extended: true, limit: "20mb" }));
+
+// Strip MongoDB operators ($, .) from req.body, req.query, req.params
+// Prevents NoSQL injection like {"email": {"$gt": ""}}
+app.use(mongoSanitize());
 
 // Apply general limiter to all /api routes
 app.use("/api", generalLimiter);
@@ -255,7 +270,10 @@ app.use((err, req, res, next) => {
   console.error(err.stack);
   res.status(err.status || 500).json({
     success: false,
-    message: err.message || "Internal Server Error",
+    message:
+      process.env.NODE_ENV === "production"
+        ? "Internal Server Error"
+        : err.message || "Internal Server Error",
   });
 });
 

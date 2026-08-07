@@ -83,11 +83,13 @@ exports.adminGetAllWallets = async (req, res) => {
     let operatorIdFilter = null;
     if (search && search.trim()) {
       const { Operator } = require("../models/Operator");
+      const escapeRegex = require("../utils/escapeRegex");
+      const safe = escapeRegex(String(search));
       const ops = await Operator.find({
         $or: [
-          { businessName: { $regex: search, $options: "i" } },
-          { contactName: { $regex: search, $options: "i" } },
-          { email: { $regex: search, $options: "i" } },
+          { businessName: { $regex: safe, $options: "i" } },
+          { contactName: { $regex: safe, $options: "i" } },
+          { email: { $regex: safe, $options: "i" } },
         ],
       }).select("_id");
       operatorIdFilter = ops.map((o) => o._id);

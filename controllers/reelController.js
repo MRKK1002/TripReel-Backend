@@ -1,4 +1,5 @@
 const Reel = require("../models/Reel");
+const escapeRegex = require("../utils/escapeRegex");
 
 // GET /api/reels
 // Supports ?country=India&state=Goa to filter reels by structured location
@@ -8,16 +9,18 @@ exports.getAllReels = async (req, res) => {
     const query = { isActive: true };
 
     if (state) {
-      query.state = { $regex: state.trim(), $options: "i" };
-      if (country) query.country = { $regex: country.trim(), $options: "i" };
+      query.state = { $regex: escapeRegex(state.trim()), $options: "i" };
+      if (country)
+        query.country = { $regex: escapeRegex(country.trim()), $options: "i" };
     } else if (country && !state) {
-      query.country = { $regex: country.trim(), $options: "i" };
+      query.country = { $regex: escapeRegex(country.trim()), $options: "i" };
     } else if (search) {
+      const safe = escapeRegex(String(search));
       query.$or = [
-        { title: { $regex: search, $options: "i" } },
-        { location: { $regex: search, $options: "i" } },
-        { city: { $regex: search, $options: "i" } },
-        { state: { $regex: search, $options: "i" } },
+        { title: { $regex: safe, $options: "i" } },
+        { location: { $regex: safe, $options: "i" } },
+        { city: { $regex: safe, $options: "i" } },
+        { state: { $regex: safe, $options: "i" } },
       ];
     }
     if (badge) query.badge = badge;
