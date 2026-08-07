@@ -9,6 +9,9 @@ const {
   getMyWithdrawals,
   razorpayxWebhook,
   adminGetWithdrawals,
+  adminProcessWithdrawal,
+  adminRejectWithdrawal,
+  adminGetPendingWithdrawals,
 } = require("../controllers/walletController");
 const { protect, restrictTo } = require("../middleware/authMiddleware");
 const {
@@ -37,6 +40,24 @@ router.get(
   protect,
   restrictTo("admin"),
   adminGetWithdrawals,
+);
+router.get(
+  "/admin/pending-withdrawals",
+  protect,
+  restrictTo("admin"),
+  adminGetPendingWithdrawals,
+);
+router.post(
+  "/admin/withdrawals/:id/process",
+  protect,
+  restrictTo("admin"),
+  adminProcessWithdrawal,
+);
+router.post(
+  "/admin/withdrawals/:id/reject",
+  protect,
+  restrictTo("admin"),
+  adminRejectWithdrawal,
 );
 router.get("/admin/:operatorId", protect, restrictTo("admin"), adminGetWallet);
 

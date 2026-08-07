@@ -140,7 +140,13 @@ exports.adminGetWallet = async (req, res) => {
   }
 };
 
-// ── Withdrawals (RazorpayX payouts) ───────────────────────────────────────────
+// ── Withdrawals (RazorpayX payouts OR manual admin approval) ──────────────────
+
+// Payout mode: "auto" = RazorpayX instant payout; "manual" = admin reviews & pays manually.
+// Set PAYOUT_MODE=manual in .env until RazorpayX is approved, then switch to auto.
+function getPayoutMode() {
+  return (process.env.PAYOUT_MODE || "manual").toLowerCase();
+}
 
 // POST /api/wallet/withdraw  — operator withdraws money to their bank/UPI
 exports.requestWithdrawal = async (req, res) => {
@@ -295,6 +301,33 @@ exports.requestWithdrawal = async (req, res) => {
     }
 
     try {
+      // ── MANUAL MODE: just hold as PENDING for admin to process ──────────────
+      if (getPayoutMode() === "manual") {
+        withdrawal.destination =
+          method === "vpa"
+            ? operator.upiId
+            : `****${String(operator.accountNumber || "").slice(-4)}`;
+        await withdrawal.save();
+
+        await WalletTransaction.create({
+          operatorId,
+          type: "WITHDRAWAL",
+          amount,
+          description: `Withdrawal requested (pending admin approval) to ${withdrawal.destination}`,
+          balanceAfter: wallet.balance,
+        });
+
+        debitedWallet = null; // debit is legitimate — admin will fulfill it
+        return res.json({
+          success: true,
+          withdrawal,
+          balance: wallet.balance,
+          message:
+            "Withdrawal request submitted. Admin will process it shortly.",
+        });
+      }
+
+      // ── AUTO MODE: RazorpayX instant payout ─────────────────────────────────
       // Ensure RazorpayX contact
       let contactId = operator.razorpayContactId;
       if (!contactId) {
@@ -450,6 +483,168 @@ exports.getMyWithdrawals = async (req, res) => {
       Withdrawal.countDocuments({ operatorId: req.operator._id }),
     ]);
     res.json({ success: true, total, page: Number(page), withdrawals });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// ── Admin: manually process a pending withdrawal ──────────────────────────────
+// POST /api/wallet/admin/withdrawals/:id/process
+// Body: { utr, note }  — admin marks it as paid after manual bank transfer
+exports.adminProcessWithdrawal = async (req, res) => {
+  try {
+    const Withdrawal = require("../models/Withdrawal");
+    const { utr, note } = req.body;
+
+    if (!utr || !utr.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "UTR / transaction reference is required.",
+      });
+    }
+
+    const withdrawal = await Withdrawal.findById(req.params.id);
+    if (!withdrawal) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Withdrawal not found" });
+    }
+
+    if (withdrawal.status !== "PENDING") {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot process — withdrawal is already ${withdrawal.status}.`,
+      });
+    }
+
+    withdrawal.status = "PROCESSED";
+    withdrawal.utr = utr.trim();
+    withdrawal.processedBy = "admin_manual";
+    withdrawal.adminNote = (note || "").trim();
+    withdrawal.processedAt = new Date();
+    await withdrawal.save();
+
+    // Increment totalWithdrawn now that it's confirmed
+    await OperatorWallet.updateOne(
+      { operatorId: withdrawal.operatorId },
+      { $inc: { totalWithdrawn: withdrawal.amount } },
+    );
+
+    // Notify the operator
+    try {
+      const { notifyOperator } = require("./notificationController");
+      notifyOperator(
+        withdrawal.operatorId,
+        "Withdrawal Processed ✓",
+        `₹${withdrawal.amount.toLocaleString("en-IN")} has been sent to your account. UTR: ${utr.trim()}`,
+        { type: "wallet_credited" },
+      );
+    } catch {}
+
+    res.json({
+      success: true,
+      message: "Withdrawal marked as processed.",
+      withdrawal,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// POST /api/wallet/admin/withdrawals/:id/reject
+// Body: { reason }  — admin rejects and refunds the amount back to wallet
+exports.adminRejectWithdrawal = async (req, res) => {
+  try {
+    const Withdrawal = require("../models/Withdrawal");
+    const { reason } = req.body;
+
+    const withdrawal = await Withdrawal.findById(req.params.id);
+    if (!withdrawal) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Withdrawal not found" });
+    }
+
+    if (withdrawal.status !== "PENDING") {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot reject — withdrawal is already ${withdrawal.status}.`,
+      });
+    }
+
+    // Refund the amount back to operator wallet
+    const wallet = await OperatorWallet.findOneAndUpdate(
+      { operatorId: withdrawal.operatorId },
+      { $inc: { balance: withdrawal.amount } },
+      { new: true },
+    );
+
+    await WalletTransaction.create({
+      operatorId: withdrawal.operatorId,
+      type: "CREDIT",
+      amount: withdrawal.amount,
+      description:
+        `Withdrawal rejected by admin — amount returned. ${reason ? `Reason: ${reason}` : ""}`.trim(),
+      balanceAfter: wallet?.balance || 0,
+    });
+
+    withdrawal.status = "FAILED";
+    withdrawal.failureReason = reason || "Rejected by admin";
+    withdrawal.refunded = true;
+    await withdrawal.save();
+
+    // Notify the operator
+    try {
+      const { notifyOperator } = require("./notificationController");
+      notifyOperator(
+        withdrawal.operatorId,
+        "Withdrawal Rejected",
+        `Your withdrawal of ₹${withdrawal.amount.toLocaleString("en-IN")} was not approved. ${reason || "Please contact admin."}. The amount has been returned to your wallet.`,
+        { type: "general" },
+      );
+    } catch {}
+
+    res.json({
+      success: true,
+      message: "Withdrawal rejected, amount refunded.",
+      withdrawal,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// ── Admin: get pending withdrawal requests with operator bank details ─────────
+// GET /api/wallet/admin/pending-withdrawals
+exports.adminGetPendingWithdrawals = async (req, res) => {
+  try {
+    const Withdrawal = require("../models/Withdrawal");
+    const { Operator } = require("../models/Operator");
+
+    const withdrawals = await Withdrawal.find({ status: "PENDING" })
+      .sort({ createdAt: 1 }) // oldest first
+      .lean();
+
+    // Attach operator bank details to each withdrawal
+    const operatorIds = [
+      ...new Set(withdrawals.map((w) => String(w.operatorId))),
+    ];
+    const operators = await Operator.find({ _id: { $in: operatorIds } })
+      .select(
+        "contactName businessName email phone accountHolderName bankName accountNumber ifscCode upiId",
+      )
+      .lean();
+    const opMap = {};
+    operators.forEach((op) => {
+      opMap[String(op._id)] = op;
+    });
+
+    const result = withdrawals.map((w) => ({
+      ...w,
+      operator: opMap[String(w.operatorId)] || null,
+    }));
+
+    res.json({ success: true, withdrawals: result, total: result.length });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
