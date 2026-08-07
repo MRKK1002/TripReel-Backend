@@ -29,6 +29,7 @@ router.get("/admin", protect, restrictTo("admin"), async (req, res) => {
       ]);
 
     const Report = mongoose.models.Report;
+    const Withdrawal = mongoose.models.Withdrawal;
 
     const [
       pendingPackages,
@@ -37,6 +38,7 @@ router.get("/admin", protect, restrictTo("admin"), async (req, res) => {
       unreadNotifications,
       failedRefunds,
       pendingReports,
+      pendingWithdrawals,
     ] = await Promise.all([
       Package.countDocuments({
         status: "PENDING",
@@ -59,6 +61,10 @@ router.get("/admin", protect, restrictTo("admin"), async (req, res) => {
       Report
         ? Report.countDocuments({ status: { $in: ["open", "in_progress"] } })
         : Promise.resolve(0),
+      // Pending withdrawal requests awaiting admin action
+      Withdrawal
+        ? Withdrawal.countDocuments({ status: "PENDING" })
+        : Promise.resolve(0),
     ]);
 
     res.json({
@@ -70,6 +76,7 @@ router.get("/admin", protect, restrictTo("admin"), async (req, res) => {
         unreadNotifications,
         failedRefunds,
         pendingReports,
+        pendingWithdrawals,
       },
     });
   } catch (err) {
