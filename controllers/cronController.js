@@ -119,6 +119,11 @@ async function runSnapjaDispatch() {
               "India";
             const time = sched.time || dayInfo?.pickupTime || "10:00";
             const key = `${addonName}_${dayIdx}`;
+            // Skip addon-days that were already dispatched to Snapja. This makes
+            // dispatch idempotent per addon-day, so a post-booking add-on top-up
+            // (which resets addonDispatched=false) only sends the NEW days and
+            // never creates duplicate Snapja bookings for existing ones.
+            if (snapjaBookings[key]?.bookingId) continue;
             try {
               const snapjaRes = await fetch(SNAPJA_API, {
                 method: "POST",
@@ -430,6 +435,21 @@ async function runSnapjaStatusSync() {
             if (b.otp_expires_at)
               snapjaBookings[key].otpExpiresAt = b.otp_expires_at;
             updated = true;
+          }
+
+          // Sync live status (confirmed → in_progress → completed). Once the
+          // shoot is completed the app stops showing OTP + Call.
+          if (b.status) {
+            const liveStatus = String(b.status).toLowerCase();
+            if (liveStatus !== String(snap.status || "").toLowerCase()) {
+              snapjaBookings[key].status = liveStatus;
+              updated = true;
+            }
+            const doneStatuses = ["completed", "delivered", "done", "finished"];
+            if (doneStatuses.includes(liveStatus) && !snap.completedAt) {
+              snapjaBookings[key].completedAt = new Date().toISOString();
+              updated = true;
+            }
           }
 
           // Pull deliverables (photos/videos) from Snapja
@@ -1405,10 +1425,22 @@ exports.runWishlistAlerts = async function () {
 // Job 6 only: abandoned-booking reminders — nudge users who reached the
 // booking screen for a package but didn't complete the booking.
 exports.runAbandonedBookingReminders = async function () {
-  const results = { reminders: 0, errors: [] };
+  const results = { reminders: 0, skipped: false, errors: [] };
   try {
+    // ── Quiet hours guard (IST) ─────────────────────────────────────────────
+    // The server TZ is Asia/Kolkata, so getHours() is IST. Never nudge people
+    // while they're likely asleep — only send between 9 AM and 9 PM IST.
+    const istHour = new Date().getHours();
+    if (istHour < 9 || istHour >= 21) {
+      results.skipped = true;
+      return results;
+    }
+
     const BookingIntent = require("../models/BookingIntent");
+    const User = require("../models/User");
     const { notifyUser } = require("./notificationController");
+    const { sendMail } = require("../utils/sendMail");
+    const baseUrl = process.env.BASE_URL || "https://api.tripreel.in";
     const now = Date.now();
     const twoHoursAgo = new Date(now - 2 * 60 * 60 * 1000);
     const threeDaysAgo = new Date(now - 3 * 24 * 60 * 60 * 1000);
@@ -1423,6 +1455,18 @@ exports.runAbandonedBookingReminders = async function () {
     for (const intent of intents) {
       try {
         const name = intent.packageTitle || "your trip";
+
+        const user = await User.findById(intent.userId).select(
+          "name email lastReengagedAt",
+        );
+        // Global once-a-day cap across all re-engagement tiers
+        if (!canReengage(user)) {
+          intent.notified = true; // don't keep re-checking this one today
+          await intent.save();
+          continue;
+        }
+
+        // ── Push notification ──────────────────────────────────────────────
         await delay(NOTIFICATION_STAGGER_MS);
         notifyUser(
           intent.userId,
@@ -1430,10 +1474,35 @@ exports.runAbandonedBookingReminders = async function () {
           `You were almost there! Tap to complete your booking for ${name}.`,
           {
             type: "abandoned_booking",
-            screen: "DestinationDetail",
+            screen: "ResumeBooking",
             packageId: String(intent.packageId),
+            intentId: String(intent._id),
           },
         );
+
+        // ── Email reminder (best-effort) ───────────────────────────────────
+        try {
+          if (user?.email) {
+            const link = `${baseUrl}/share/package/${String(intent.packageId)}?intent=${String(intent._id)}`;
+            sendMail({
+              to: user.email,
+              subject: `You're one step away — ${name}`,
+              text: `Hi ${user.name || "there"}, you were about to book "${name}" but didn't finish. Complete your booking here: ${link}`,
+              html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:24px;">
+                <h2 style="color:#1F8A70;margin-bottom:8px;">Still thinking about it?</h2>
+                <p style="color:#374151;">Hi <strong>${user.name || "there"}</strong>,</p>
+                <p style="color:#374151;">You were about to book <strong>${name}</strong> but didn't finish. Your spot is still available — pick up right where you left off.</p>
+                <a href="${link}" style="display:inline-block;margin:16px 0;padding:12px 28px;background:#1F8A70;color:#fff;text-decoration:none;border-radius:10px;font-weight:600;">Complete Your Booking</a>
+                <p style="color:#9CA3AF;font-size:12px;margin-top:16px;">If the button doesn't work, open this link: ${link}</p>
+                <p style="color:#6B7280;font-size:13px;">Happy travels,<br/>Team Trip Reel</p>
+              </div>`,
+            }).catch(() => {});
+          }
+        } catch {
+          /* email is best-effort — never block the push/flag on it */
+        }
+
+        await markReengaged(intent.userId);
         intent.notified = true;
         await intent.save();
         results.reminders++;
@@ -1443,6 +1512,271 @@ exports.runAbandonedBookingReminders = async function () {
     }
   } catch (err) {
     results.errors.push(`Abandoned booking reminders: ${err.message}`);
+  }
+  return results;
+};
+
+// ── Re-engagement helpers (shared across all tiers) ──────────────────────────
+// Global frequency cap so a user never gets more than one re-engagement nudge
+// per ~day, regardless of which tier fires. Priority is enforced by schedule
+// order (Tier 3 abandoned booking runs first, then Tier 2 views, then Tier 1
+// inactivity), and the first one to fire sets lastReengagedAt for the day.
+const REENGAGE_CAP_HOURS = 20;
+
+function canReengage(user) {
+  if (!user) return false;
+  if (!user.lastReengagedAt) return true;
+  const ageMs = Date.now() - new Date(user.lastReengagedAt).getTime();
+  return ageMs >= REENGAGE_CAP_HOURS * 60 * 60 * 1000;
+}
+
+async function markReengaged(userId) {
+  try {
+    const User = require("../models/User");
+    await User.updateOne(
+      { _id: userId },
+      { $set: { lastReengagedAt: new Date() } },
+    );
+  } catch {
+    /* best-effort */
+  }
+}
+
+// Only send between 9 AM and 9 PM IST (server TZ is Asia/Kolkata)
+function isQuietHours() {
+  const istHour = new Date().getHours();
+  return istHour < 9 || istHour >= 21;
+}
+
+// ── Tier 2: viewed-package re-engagement ─────────────────────────────────────
+// Nudge users who opened a package's detail page 6h–7d ago but never booked and
+// never reached the booking screen (Tier 3 handles those). One nudge per user:
+// if they viewed several packages, we reference the top 1–2 most-recent ones.
+exports.runViewedPackageReminders = async function () {
+  const results = { reminders: 0, skipped: false, errors: [] };
+  try {
+    if (isQuietHours()) {
+      results.skipped = true;
+      return results;
+    }
+
+    const PackageView = require("../models/PackageView");
+    const BookingIntent = require("../models/BookingIntent");
+    const User = require("../models/User");
+    const { notifyUser } = require("./notificationController");
+    const now = Date.now();
+    const sixHoursAgo = new Date(now - 6 * 60 * 60 * 1000);
+    const sevenDaysAgo = new Date(now - 7 * 24 * 60 * 60 * 1000);
+
+    // Candidate views: seen 6h–7d ago, not converted, not yet notified
+    const views = await PackageView.find({
+      converted: false,
+      notified: false,
+      lastViewedAt: { $lte: sixHoursAgo, $gte: sevenDaysAgo },
+    })
+      .sort({ lastViewedAt: -1 })
+      .limit(500);
+
+    // Group by user (most-recent first thanks to the sort)
+    const byUser = new Map();
+    for (const v of views) {
+      const uid = String(v.userId);
+      if (!byUser.has(uid)) byUser.set(uid, []);
+      byUser.get(uid).push(v);
+    }
+
+    for (const [uid, userViews] of byUser.entries()) {
+      try {
+        const user = await User.findById(uid).select("name lastReengagedAt");
+        if (!canReengage(user)) {
+          // Skip today, but mark so we don't reprocess endlessly
+          await PackageView.updateMany(
+            { _id: { $in: userViews.map((v) => v._id) } },
+            { $set: { notified: true } },
+          );
+          continue;
+        }
+
+        // Drop packages the user already reached the booking screen for —
+        // Tier 3 (abandoned booking) owns those, higher intent.
+        const pkgIds = userViews.map((v) => v.packageId);
+        const intents = await BookingIntent.find({
+          userId: uid,
+          packageId: { $in: pkgIds },
+        }).select("packageId");
+        const intentSet = new Set(intents.map((i) => String(i.packageId)));
+        const fresh = userViews.filter(
+          (v) => !intentSet.has(String(v.packageId)),
+        );
+
+        if (fresh.length === 0) {
+          await PackageView.updateMany(
+            { _id: { $in: userViews.map((v) => v._id) } },
+            { $set: { notified: true } },
+          );
+          continue;
+        }
+
+        // Compose a message — one package vs. multiple
+        let title;
+        let body;
+        const primary = fresh[0];
+        const primaryName = primary.packageTitle || "a trip";
+        if (fresh.length === 1) {
+          title = "Still dreaming about it? ✨";
+          body = `${primaryName} is waiting for you. Tap to take another look.`;
+        } else {
+          const secondName = fresh[1].packageTitle || "another trip";
+          title = "Can't decide? We've got you 🌍";
+          body = `You checked out ${primaryName} and ${secondName}. Which one's calling you?`;
+        }
+
+        await delay(NOTIFICATION_STAGGER_MS);
+        notifyUser(uid, title, body, {
+          type: "general",
+          screen: "DestinationDetail",
+          packageId: String(primary.packageId),
+        });
+
+        await markReengaged(uid);
+        await PackageView.updateMany(
+          { _id: { $in: userViews.map((v) => v._id) } },
+          { $set: { notified: true } },
+        );
+        results.reminders++;
+      } catch (e) {
+        results.errors.push(`Viewed reminder user ${uid}: ${e.message}`);
+      }
+    }
+  } catch (err) {
+    results.errors.push(`Viewed package reminders: ${err.message}`);
+  }
+  return results;
+};
+
+// ── Tier 1: inactive-user re-engagement ──────────────────────────────────────
+// Generic "we miss you" nudge for users who haven't opened the app in a while.
+exports.runInactiveUserReminders = async function () {
+  const results = { reminders: 0, skipped: false, errors: [] };
+  try {
+    if (isQuietHours()) {
+      results.skipped = true;
+      return results;
+    }
+
+    const User = require("../models/User");
+    const { notifyUser } = require("./notificationController");
+    const now = Date.now();
+    const threeDaysAgo = new Date(now - 3 * 24 * 60 * 60 * 1000);
+    const thirtyDaysAgo = new Date(now - 30 * 24 * 60 * 60 * 1000);
+    const capAgo = new Date(now - REENGAGE_CAP_HOURS * 60 * 60 * 1000);
+
+    // Inactive 3–30 days, has a push token, not nudged within the cap window
+    const users = await User.find({
+      role: "user",
+      status: "Active",
+      fcmToken: { $nin: ["", null] },
+      lastActiveAt: { $lte: threeDaysAgo, $gte: thirtyDaysAgo },
+      $or: [
+        { lastReengagedAt: { $exists: false } },
+        { lastReengagedAt: { $lte: capAgo } },
+      ],
+    })
+      .select("_id name")
+      .limit(300);
+
+    const messages = [
+      {
+        title: "Your next adventure awaits 🌴",
+        body: "New trips just dropped. Come see where you could go next.",
+      },
+      {
+        title: "We miss you! ✈️",
+        body: "Handpicked getaways are waiting. Take a quick look?",
+      },
+      {
+        title: "Ready for a getaway? 🏔️",
+        body: "Discover fresh experiences curated just for you.",
+      },
+    ];
+
+    for (const u of users) {
+      try {
+        const msg = messages[results.reminders % messages.length];
+        await delay(NOTIFICATION_STAGGER_MS);
+        notifyUser(u._id, msg.title, msg.body, {
+          type: "general",
+          screen: "Main",
+        });
+        await markReengaged(u._id);
+        results.reminders++;
+      } catch (e) {
+        results.errors.push(`Inactive reminder ${u._id}: ${e.message}`);
+      }
+    }
+  } catch (err) {
+    results.errors.push(`Inactive user reminders: ${err.message}`);
+  }
+  return results;
+};
+
+// ── Nightly sanity check: bookedSeats vs actual bookings ─────────────────────
+// Detects drift (bugs, crashes, race edges) so admin can reconcile manually.
+exports.runBookingSanityCheck = async function () {
+  const results = { checked: 0, mismatches: 0, fixed: 0, errors: [] };
+  try {
+    const Batch = require("../models/Batch");
+    const TripBooking = require("../models/TripBooking");
+
+    // Only check batches that are still active and in the future (past ones don't matter)
+    const now = new Date();
+    const batches = await Batch.find({
+      isActive: true,
+      startDate: { $gt: now },
+    })
+      .select("_id bookedSeats totalSeats")
+      .lean();
+
+    for (const batch of batches) {
+      results.checked++;
+      // Count actual confirmed bookings for this batch
+      const actualSeats = await TripBooking.aggregate([
+        {
+          $match: {
+            batchId: batch._id,
+            status: { $in: ["CONFIRMED", "PENDING"] },
+          },
+        },
+        { $group: { _id: null, total: { $sum: "$seats" } } },
+      ]);
+      const actual = actualSeats[0]?.total || 0;
+      if (actual !== batch.bookedSeats) {
+        results.mismatches++;
+        console.warn(
+          `[SANITY] Batch ${batch._id}: bookedSeats=${batch.bookedSeats} but actual=${actual}`,
+        );
+        // Auto-fix by setting to the actual count (safe — the atomic reservation
+        // guards new bookings, so this only corrects stale drift).
+        await Batch.updateOne(
+          { _id: batch._id },
+          { $set: { bookedSeats: actual } },
+        );
+        results.fixed++;
+      }
+    }
+
+    if (results.mismatches > 0) {
+      try {
+        const { notifyAdmin } = require("./notificationController");
+        notifyAdmin(
+          "Booking Sanity Check — Mismatches Found",
+          `${results.mismatches} batch(es) had bookedSeats drift. Auto-corrected. Check PM2 logs for details.`,
+          { type: "general" },
+        );
+      } catch {}
+    }
+  } catch (err) {
+    results.errors.push(`Sanity check error: ${err.message}`);
   }
   return results;
 };

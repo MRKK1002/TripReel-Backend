@@ -33,7 +33,14 @@ router.get("/package/:id", async (req, res) => {
     ? `From ₹${Number(pkg.pricing.adultPrice).toLocaleString("en-IN")}`
     : "";
   const image = esc(pkg?.image_url || "");
-  const appDeepLink = `tripreel://package/${esc(id)}`;
+  // Preserve an abandoned-booking intent id so the app can resume the draft.
+  const intentId =
+    typeof req.query.intent === "string"
+      ? req.query.intent.replace(/[^a-fA-F0-9]/g, "").slice(0, 40)
+      : "";
+  const appDeepLink = intentId
+    ? `tripreel://package/${esc(id)}?intent=${esc(intentId)}`
+    : `tripreel://package/${esc(id)}`;
 
   res.set("Content-Type", "text/html; charset=utf-8");
   res.send(`<!DOCTYPE html>

@@ -634,3 +634,283 @@ exports.googleLogin = async (req, res) => {
     res.status(500).json({ success: false, message: "Google sign-in failed" });
   }
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Account deletion (DPDP compliance) — OTP-confirmed, erases personal data.
+// Financial/tax records are retained but anonymized (permitted where required
+// by law). Behavioural/personal data is hard-deleted.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// POST /api/auth/delete-account/send-otp   (protected)
+exports.sendDeleteOtp = async (req, res) => {
+  try {
+    const user = req.user;
+    const phone = normalizePhone(user.phone);
+    const email = (user.email || "").toLowerCase();
+    const contact = phone || email;
+    if (!contact) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "No phone or email on file. Please contact support to delete your account.",
+      });
+    }
+    const viaPhone = !!phone;
+
+    await Otp.deleteMany({ phone: contact, purpose: "delete_account" });
+
+    const recent = await Otp.countDocuments({
+      phone: contact,
+      purpose: "delete_account",
+      createdAt: { $gte: new Date(Date.now() - OTP_RATE_LIMIT_WINDOW_MS) },
+    });
+    if (recent >= OTP_RATE_LIMIT_MAX) {
+      return res.status(429).json({
+        success: false,
+        message: "Too many requests. Please wait 5 minutes and try again.",
+      });
+    }
+
+    const code = generateOtp();
+    const expiresAt = new Date(Date.now() + OTP_TTL_MINUTES * 60 * 1000);
+    await Otp.create({
+      phone: contact,
+      code,
+      purpose: "delete_account",
+      expiresAt,
+    });
+
+    if (viaPhone) {
+      const { sendOtpSms } = require("../utils/sendSms");
+      await sendOtpSms(phone, code);
+    } else {
+      const { sendMail } = require("../utils/sendMail");
+      sendMail({
+        to: email,
+        subject: "Confirm account deletion — Trip Reel",
+        text: `Your account deletion code is ${code}. It expires in ${OTP_TTL_MINUTES} minutes. If you didn't request this, ignore this email.`,
+        html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:24px;">
+          <h2 style="color:#EF4444;margin-bottom:8px;">Confirm account deletion</h2>
+          <p style="color:#374151;">Use this code to permanently delete your Trip Reel account:</p>
+          <p style="font-size:28px;font-weight:800;letter-spacing:6px;color:#111827;">${code}</p>
+          <p style="color:#6B7280;font-size:13px;">This code expires in ${OTP_TTL_MINUTES} minutes. If you didn't request this, you can safely ignore this email.</p>
+        </div>`,
+      }).catch(() => {});
+    }
+
+    if (process.env.OTP_DEV_MODE === "true") {
+      console.log(`[DEV] Delete-account OTP for ${contact}: ${code}`);
+    }
+
+    const response = {
+      success: true,
+      message: "Verification code sent",
+      channel: viaPhone ? "phone" : "email",
+      expiresIn: OTP_TTL_MINUTES * 60,
+    };
+    if (process.env.OTP_DEV_MODE === "true") response.otp = code;
+    res.json(response);
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// POST /api/auth/delete-account/confirm   (protected)
+// Body: { code }
+exports.confirmDeleteAccount = async (req, res) => {
+  try {
+    const user = req.user;
+    const code = String(req.body.code || "").trim();
+    const phone = normalizePhone(user.phone);
+    const email = (user.email || "").toLowerCase();
+    const contact = phone || email;
+
+    if (!code) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Verification code is required" });
+    }
+
+    // ── Verify the OTP ────────────────────────────────────────────────────────
+    const record = await Otp.findOne({
+      phone: contact,
+      purpose: "delete_account",
+    });
+    if (!record) {
+      return res.status(400).json({
+        success: false,
+        message: "Code not found. Please request a new one.",
+      });
+    }
+    if (record.expiresAt < new Date()) {
+      await record.deleteOne();
+      return res.status(400).json({
+        success: false,
+        message: "Code has expired. Please request a new one.",
+      });
+    }
+    if (record.attempts >= OTP_MAX_ATTEMPTS) {
+      await record.deleteOne();
+      return res.status(400).json({
+        success: false,
+        message: "Too many invalid attempts. Please request a new code.",
+      });
+    }
+    if (record.code !== code) {
+      record.attempts += 1;
+      await record.save();
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid code. Please try again." });
+    }
+    await record.deleteOne();
+
+    // ── Guard: block deletion while a trip is in flight ───────────────────────
+    const TripBooking = require("../models/TripBooking");
+    const now = new Date();
+    const activeBooking = await TripBooking.findOne({
+      userId: user._id,
+      status: { $in: ["CONFIRMED", "PENDING"] },
+      "snapshot.startDate": { $gt: now },
+    });
+    if (activeBooking) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "You have an upcoming booking. Please wait until your trip is completed, or cancel it, before deleting your account.",
+      });
+    }
+
+    // ── Erase personal data + anonymize financial records ─────────────────────
+    await eraseUserData(user._id);
+
+    res.json({
+      success: true,
+      message: "Your account and personal data have been deleted.",
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// Erase a user's personal/behavioural data and anonymize retained records.
+async function eraseUserData(userId) {
+  const Review = require("../models/Review");
+  const TripBookingModel = require("../models/TripBooking");
+
+  // ── Admin-only archive (compliance / audit retention) ─────────────────────
+  // Snapshot the user's details + booking history BEFORE we anonymize, so the
+  // admin keeps a reference record. Restricted to admins; not for re-marketing.
+  try {
+    const DeletedAccountArchive = require("../models/DeletedAccountArchive");
+    const u = await User.findById(userId);
+    if (u) {
+      const bks = await TripBookingModel.find({ userId }).select(
+        "bookingId snapshot seats status pricing",
+      );
+      await DeletedAccountArchive.create({
+        userId,
+        name: u.name || "",
+        email: u.email || "",
+        phone: u.phone || "",
+        state: u.state || "",
+        country: u.country || "",
+        memberSince: u.createdAt,
+        tripsCount: u.tripsCount || 0,
+        bookings: (bks || []).map((b) => ({
+          bookingId: b.bookingId,
+          packageTitle: b.snapshot?.packageTitle || "",
+          startDate: b.snapshot?.startDate,
+          endDate: b.snapshot?.endDate,
+          seats: b.seats,
+          status: b.status,
+          totalAmount: b.pricing?.totalAmount || 0,
+        })),
+        deletedAt: new Date(),
+      });
+    }
+  } catch (e) {
+    console.warn("[eraseUserData] archive snapshot failed:", e.message);
+  }
+
+  const Wishlist = require("../models/Wishlist");
+  const Trip = require("../models/Trip");
+  const BookingIntent = require("../models/BookingIntent");
+  const PackageView = require("../models/PackageView");
+  const PendingOrder = require("../models/PendingOrder");
+  const LastSeen = require("../models/LastSeen");
+  const Notification = require("../models/Notification");
+  const Conversation = require("../models/Conversation");
+  const Message = require("../models/Message");
+  const TripBooking = require("../models/TripBooking");
+
+  // Reviews — delete, then recalc the affected packages' ratings
+  const reviews = await Review.find({ userId }).select("packageId");
+  const affected = [...new Set(reviews.map((r) => String(r.packageId)))];
+  await Review.deleteMany({ userId });
+  try {
+    const { recalcPackageRating } = require("./reviewController");
+    if (typeof recalcPackageRating === "function") {
+      for (const pid of affected) await recalcPackageRating(pid);
+    }
+  } catch {}
+
+  // Chat — delete this user's conversations + their messages
+  try {
+    const convs = await Conversation.find({ userId }).select("_id");
+    const convIds = convs.map((c) => c._id);
+    if (convIds.length)
+      await Message.deleteMany({ conversationId: { $in: convIds } });
+    await Conversation.deleteMany({ userId });
+    await Message.deleteMany({ senderId: userId, senderType: "user" });
+  } catch {}
+
+  // Behavioural / personal collections — hard delete
+  await Promise.allSettled([
+    Wishlist.deleteMany({ user: userId }),
+    Trip.deleteMany({ user: userId }),
+    BookingIntent.deleteMany({ userId }),
+    PackageView.deleteMany({ userId }),
+    PendingOrder.deleteMany({ userId }),
+    LastSeen.deleteMany({ userId }),
+    Notification.deleteMany({ recipientId: userId, recipientType: "user" }),
+  ]);
+
+  // Financial records — retained for tax/legal, but PII redacted (DPDP allows
+  // retention where required by law). Traveller names are redacted; amounts,
+  // dates and GST are kept intact.
+  try {
+    await TripBooking.updateMany({ userId }, [
+      {
+        $set: {
+          travelers: {
+            $map: {
+              input: { $ifNull: ["$travelers", []] },
+              as: "t",
+              in: { name: "Redacted", gender: "$$t.gender", age: "$$t.age" },
+            },
+          },
+        },
+      },
+    ]);
+  } catch {}
+
+  // Anonymize the user record (keeps referential integrity, frees phone/email)
+  await User.updateOne(
+    { _id: userId },
+    {
+      $set: {
+        name: "Deleted User",
+        email: `deleted_${userId}@deleted.tripreel.in`,
+        avatar: "",
+        profileImage: "",
+        googleId: "",
+        fcmToken: "",
+        status: "Deleted",
+        deletedAt: new Date(),
+      },
+      $unset: { phone: "", password: "" },
+    },
+  );
+}
+exports.eraseUserData = eraseUserData;

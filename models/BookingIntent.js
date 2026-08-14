@@ -25,6 +25,16 @@ const bookingIntentSchema = new mongoose.Schema(
     batchId: { type: mongoose.Schema.Types.ObjectId, ref: "Batch" },
     flexAvailabilityId: { type: mongoose.Schema.Types.ObjectId },
     flexStartDate: { type: Date },
+    // ── Draft snapshot — so we can pre-fill the booking screen when the user
+    // taps the reminder ("pick up where you left off"). Stored loosely.
+    draft: {
+      adults: { type: Number, default: 1 },
+      children: { type: Number, default: 0 },
+      travelers: { type: mongoose.Schema.Types.Mixed, default: [] },
+      addonDays: { type: mongoose.Schema.Types.Mixed, default: {} },
+      addonSchedule: { type: mongoose.Schema.Types.Mixed, default: {} },
+      couponCode: { type: String, default: "" },
+    },
     // Reminder state
     notified: { type: Boolean, default: false },
     converted: { type: Boolean, default: false }, // set true once they book

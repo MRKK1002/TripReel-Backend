@@ -1,6 +1,34 @@
 const User = require("../models/User");
 const escapeRegex = require("../utils/escapeRegex");
 
+// GET /api/users/deleted-archive  (admin) — retention records of deleted users
+exports.getDeletedArchive = async (req, res) => {
+  try {
+    const DeletedAccountArchive = require("../models/DeletedAccountArchive");
+    const { search, page = 1, limit = 20 } = req.query;
+    const query = {};
+    if (search) {
+      const safe = escapeRegex(String(search));
+      query.$or = [
+        { name: { $regex: safe, $options: "i" } },
+        { email: { $regex: safe, $options: "i" } },
+        { phone: { $regex: safe, $options: "i" } },
+      ];
+    }
+    const skip = (Number(page) - 1) * Number(limit);
+    const [records, total] = await Promise.all([
+      DeletedAccountArchive.find(query)
+        .skip(skip)
+        .limit(Number(limit))
+        .sort({ deletedAt: -1 }),
+      DeletedAccountArchive.countDocuments(query),
+    ]);
+    res.json({ success: true, total, page: Number(page), records });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
 // GET /api/users
 exports.getAllUsers = async (req, res) => {
   try {

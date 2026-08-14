@@ -14,7 +14,7 @@ const otpSchema = new mongoose.Schema(
     },
     purpose: {
       type: String,
-      enum: ["signup", "login"],
+      enum: ["signup", "login", "delete_account"],
       required: true,
     },
     // Stored only for signup so we can create the user on verify

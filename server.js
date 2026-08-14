@@ -73,6 +73,19 @@ const generalLimiter = rateLimit({
   skip: skipRateLimit,
 });
 
+// Payment endpoints — per-user, prevents abuse scripts and double-charges
+const paymentLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 5, // 5 payment calls per IP per minute (generous for legit, blocks bots)
+  message: {
+    success: false,
+    message: "Too many payment requests. Please wait a moment.",
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: skipRateLimit,
+});
+
 // ── Middleware ─────────────────────────────────────────────────────────────────
 // CORS whitelist — only these browser origins may call the API. Mobile apps,
 // curl, and server-to-server calls send no Origin header and are always allowed
@@ -214,6 +227,8 @@ app.use(
 );
 app.use("/api/trip-bookings", require("./routes/tripBookingRoutes"));
 app.use("/api/booking-intents", require("./routes/bookingIntentRoutes"));
+app.use("/api/package-views", require("./routes/packageViewRoutes"));
+app.use("/api/places", require("./routes/placesRoutes"));
 // Public share landing pages (smart deep links → app or store)
 app.use("/share", require("./routes/shareRoutes"));
 app.use("/api/operator-bookings", require("./routes/operatorBookingRoutes"));
@@ -223,6 +238,7 @@ app.use("/api/settings", require("./routes/platformSettingsRoutes"));
 app.use("/api/wallet", require("./routes/walletRoutes"));
 app.use("/api/cron", require("./routes/cronRoutes"));
 app.use("/api/coupons", require("./routes/couponRoutes"));
+app.use("/api/platform-coupons", require("./routes/platformCouponRoutes"));
 app.use("/api/admin/revenue", require("./routes/revenueRoutes"));
 app.use("/api/reports", require("./routes/reportRoutes"));
 app.use("/api/notifications", require("./routes/notificationRoutes"));
@@ -230,7 +246,8 @@ app.use("/api/chat", require("./routes/chatRoutes"));
 app.use("/api/sidebar-counts", require("./routes/sidebarCountsRoutes"));
 app.use("/api/campaigns", require("./routes/campaignRoutes"));
 app.use("/api/app-screens", require("./routes/appScreenRoutes"));
-app.use("/api/payments", require("./routes/paymentRoutes"));
+app.use("/api/payments", paymentLimiter, require("./routes/paymentRoutes"));
+app.use("/api/audit", require("./routes/auditRoutes"));
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
@@ -300,6 +317,9 @@ mongoose
       runSnapjaStatusSync,
       runSnapjaAutoCancel,
       runAbandonedBookingReminders,
+      runViewedPackageReminders,
+      runInactiveUserReminders,
+      runBookingSanityCheck,
       runStaleDraftExpiry,
       runCronJobs,
     } = require("./controllers/cronController");
@@ -327,6 +347,18 @@ mongoose
           }
         } catch (err) {
           console.error("❌ Cron draft-expiry error:", err.message);
+        }
+
+        // Nightly sanity check — verify batch.bookedSeats matches actual bookings
+        try {
+          const sanity = await runBookingSanityCheck();
+          if (sanity.mismatches) {
+            console.log(
+              `⚠️ Cron (sanity): ${sanity.mismatches} mismatches found & fixed`,
+            );
+          }
+        } catch (err) {
+          console.error("❌ Cron sanity check error:", err.message);
         }
       },
       { timezone: "Asia/Kolkata" },
@@ -450,6 +482,64 @@ mongoose
           }
         } catch (err) {
           console.error("❌ Cron abandoned booking error:", err.message);
+        }
+      },
+      { timezone: "Asia/Kolkata" },
+    );
+
+    // 1 PM & 8 PM IST — Tier 2: viewed-package re-engagement (opened a package
+    // but didn't book). Runs after the abandoned-booking cron so higher-intent
+    // users are nudged for that first (global once-a-day cap prevents overlap).
+    cron.schedule(
+      "0 13,20 * * *",
+      async () => {
+        try {
+          const result = await runViewedPackageReminders();
+          if (result.reminders) {
+            console.log(
+              `✅ Cron (viewed package): ${result.reminders} reminders sent`,
+            );
+          }
+        } catch (err) {
+          console.error("❌ Cron viewed package error:", err.message);
+        }
+      },
+      { timezone: "Asia/Kolkata" },
+    );
+
+    // Every 10 minutes — recover bookings for orders paid but never verified
+    // (app killed right after checkout). Safety net alongside the webhook.
+    cron.schedule(
+      "*/10 * * * *",
+      async () => {
+        try {
+          const paymentController = require("./controllers/paymentController");
+          const result = await paymentController.runOrphanPaymentRecovery();
+          if (result.recovered || result.expired) {
+            console.log(
+              `✅ Cron (payment recovery): ${result.recovered} recovered, ${result.expired} expired`,
+            );
+          }
+        } catch (err) {
+          console.error("❌ Cron payment recovery error:", err.message);
+        }
+      },
+      { timezone: "Asia/Kolkata" },
+    );
+
+    // 3 PM IST — Tier 1: inactive-user "we miss you" nudge (3–30 days idle).
+    cron.schedule(
+      "0 15 * * *",
+      async () => {
+        try {
+          const result = await runInactiveUserReminders();
+          if (result.reminders) {
+            console.log(
+              `✅ Cron (inactive user): ${result.reminders} reminders sent`,
+            );
+          }
+        } catch (err) {
+          console.error("❌ Cron inactive user error:", err.message);
         }
       },
       { timezone: "Asia/Kolkata" },

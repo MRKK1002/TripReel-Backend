@@ -9,6 +9,8 @@ const {
   loginSendOtp,
   loginVerifyOtp,
   googleLogin,
+  sendDeleteOtp,
+  confirmDeleteAccount,
 } = require("../controllers/authController");
 const { protect } = require("../middleware/authMiddleware");
 
@@ -27,5 +29,9 @@ router.post("/google", googleLogin);
 
 // Session
 router.get("/me", protect, getMe);
+
+// Account deletion (DPDP) — OTP-confirmed, erases personal data
+router.post("/delete-account/send-otp", protect, sendDeleteOtp);
+router.post("/delete-account/confirm", protect, confirmDeleteAccount);
 
 module.exports = router;

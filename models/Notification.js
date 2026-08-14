@@ -35,6 +35,7 @@ const notificationSchema = new mongoose.Schema(
         "account_reinstated",
         "account_approved",
         "offer",
+        "abandoned_booking",
         "general",
       ],
       default: "general",

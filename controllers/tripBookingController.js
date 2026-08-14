@@ -69,7 +69,8 @@ function calcPricing({
   gstPercent,
   addonAmount = 0,
   addonSurcharge = 0,
-  discountAmount = 0,
+  discountAmount = 0, // operator coupon — reduces operator earnings
+  platformDiscountAmount = 0, // admin coupon — absorbed by platform, operator unaffected
 }) {
   // Backward compatible: if an explicit adults count isn't given, treat every
   // seat as an adult (legacy behaviour). Otherwise price adults + children.
@@ -80,15 +81,27 @@ function calcPricing({
   const fareSubtotal = Math.round(
     adultPrice * numAdults + (childPrice || 0) * numChildren,
   );
-  const netFare = Math.max(0, fareSubtotal - discountAmount); // discount applies to fare only
+  // Operator coupon reduces the fare the operator is paid on.
+  const netFare = Math.max(0, fareSubtotal - discountAmount);
   const subtotal = fareSubtotal + addonAmount;
-  // GST charged on (discounted fare + addon)
+  // GST charged on (operator-discounted fare + addon)
   const gstAmount = Math.round(((netFare + addonAmount) * gstPercent) / 100);
   // Platform fee is taken on the operator's fare only (not GST, not Snapja base)
   const platformFeeAmount = Math.round((netFare * platformFeePercent) / 100);
-  const totalAmount = netFare + addonAmount + gstAmount;
+
+  // Platform (admin) coupon is applied on the final bill — the platform pays it
+  // on the user's behalf. It NEVER touches netFare, so the operator's earnings
+  // are unaffected. Cap it so the user total can't go below the addon+GST portion.
+  const grossTotal = netFare + addonAmount + gstAmount;
+  const cappedPlatformDiscount = Math.min(
+    Math.max(0, platformDiscountAmount),
+    netFare, // platform can at most gift the entire fare portion
+  );
+  const totalAmount = Math.max(0, grossTotal - cappedPlatformDiscount);
+
   // Operator earns: net fare minus platform fee, plus their outside-city surcharge.
-  // (The ₹2000/day Snapja base and the GST are NOT operator earnings.)
+  // (The Snapja base and the GST are NOT operator earnings. Platform coupon does
+  // NOT reduce this — the platform absorbs that discount from its own margin.)
   const operatorAmount = netFare - platformFeeAmount + addonSurcharge;
   return {
     adultPrice,
@@ -105,6 +118,7 @@ function calcPricing({
     gstAmount,
     totalAmount,
     discountAmount,
+    platformDiscountAmount: cappedPlatformDiscount,
     operatorAmount,
   };
 }
@@ -121,6 +135,8 @@ async function computeAuthoritativePricing({
   adults,
   children,
   couponCode,
+  platformCouponCode,
+  userId,
   addonDays,
 }) {
   const numSeats = Math.max(1, Number(seats) || 1);
@@ -249,6 +265,23 @@ async function computeAuthoritativePricing({
     }
   }
 
+  // ── Platform (admin) coupon — only if NO operator coupon was applied ─────────
+  // A booking may carry ONE coupon. Operator coupon takes precedence if both a
+  // valid operator coupon and a platform code were somehow sent.
+  let platformDiscountAmount = 0;
+  const platformCode = (platformCouponCode || "").trim().toUpperCase();
+  if (platformCode && discountAmount === 0) {
+    const { resolvePlatformCoupon } = require("../utils/platformCoupon");
+    const res = await resolvePlatformCoupon({
+      code: platformCode,
+      userId,
+      pkg,
+      fareSubtotal: fareSubtotalRaw,
+      numSeats,
+    });
+    if (res.ok) platformDiscountAmount = res.discount;
+  }
+
   const pricing = calcPricing({
     adultPrice,
     childPrice: childPrice || 0,
@@ -260,10 +293,60 @@ async function computeAuthoritativePricing({
     addonAmount: addonTotalPrice,
     addonSurcharge,
     discountAmount,
+    platformDiscountAmount,
   });
   return pricing.totalAmount;
 }
 exports.computeAuthoritativePricing = computeAuthoritativePricing;
+
+// ── Authoritative add-on pricing for a given package + addonDays ──────────────
+// Reused by both booking creation and the post-booking add-on top-up flow.
+// Returns { addonSurcharge, addonTotalPrice, gstOnAddon, gstPercent }.
+//   addonTotalPrice = base (Snapja) + surcharge (operator), summed per day
+//   addonSurcharge  = operator's outside-city + extra-charge portion
+//   gstOnAddon      = GST charged on the add-on total
+async function computeAddonPricing({ pkg, addonDays }) {
+  const photographerPrice =
+    (await getSetting("photographer_base_price")) ?? 2000;
+  const videographerPrice =
+    (await getSetting("videographer_base_price")) ?? 2000;
+  const gstPercent = (await getSetting("gst_percent")) ?? 5;
+
+  let addonSurcharge = 0;
+  let addonTotalPrice = 0;
+  if (addonDays) {
+    for (const name of Object.keys(addonDays)) {
+      const basePrice = pickAddonBasePrice(
+        name,
+        photographerPrice,
+        videographerPrice,
+      );
+      for (const dayIdx of addonDays[name] || []) {
+        const dayInfo = pkg?.itinerary?.[dayIdx];
+        let sc = 0;
+        if (dayInfo?.isOutsideCity) {
+          sc =
+            Number(dayInfo.outsideCityCharge) ||
+            Number(pkg?.outsideCityCharge) ||
+            0;
+          if (Array.isArray(dayInfo.extraCharges)) {
+            for (const ec of dayInfo.extraCharges) sc += Number(ec.amount) || 0;
+          }
+        }
+        addonSurcharge += sc;
+        addonTotalPrice += basePrice + sc;
+      }
+    }
+  }
+  const gstOnAddon = Math.round((addonTotalPrice * gstPercent) / 100);
+  return { addonSurcharge, addonTotalPrice, gstOnAddon, gstPercent };
+}
+exports.computeAddonPricing = computeAddonPricing;
+
+// How many days before the trip start add-ons can still be added. Snapja needs
+// lead time to assign a creator (unassigned add-ons auto-cancel 1 day before).
+const ADDON_ADD_CUTOFF_DAYS = 2;
+exports.ADDON_ADD_CUTOFF_DAYS = ADDON_ADD_CUTOFF_DAYS;
 
 async function creditOperatorWallet(
   operatorId,
@@ -363,7 +446,12 @@ async function processCancellationRefund(
   const p = booking.pricing || {};
   const fareSubtotal = Number(p.fareSubtotal) || 0;
   const discountAmount = Number(p.discountAmount) || 0;
+  // Platform (admin) coupon was funded by the platform — the user did NOT pay
+  // this portion, so it can never be refunded back to the user.
+  const platformDiscountAmount = Number(p.platformDiscountAmount) || 0;
   const netFare = Math.max(0, fareSubtotal - discountAmount);
+  // What the user actually paid toward the fare (after the platform's gift).
+  const userNetFare = Math.max(0, netFare - platformDiscountAmount);
   const gst = Number(p.gstAmount) || 0;
   const addon = Number(p.addonAmount) || 0;
   const platformFeePercent = Number(p.platformFeePercent) || 0;
@@ -374,8 +462,13 @@ async function processCancellationRefund(
     : await resolveRefundPercent(booking.snapshot?.startDate);
 
   // ── Compute the split ──────────────────────────────────────────────────────
-  const fareRefund = Math.round((netFare * refundPercent) / 100);
-  // Split GST: portion on fare vs portion on addons
+  // User's fare refund is on what THEY paid (userNetFare), so the platform's
+  // gifted discount is never refunded as cash to the user.
+  const fareRefund = Math.round((userNetFare * refundPercent) / 100);
+  // Operator's retention is computed on the full netFare (operator was paid on
+  // the full fare — the platform absorbed the coupon, not the operator).
+  const operatorFareRefund = Math.round((netFare * refundPercent) / 100);
+  // Split GST: portion on fare vs portion on addons (GST was paid in full by user)
   const gstOnFare =
     netFare > 0 ? Math.round((gst * netFare) / (netFare + addon)) : 0;
   const gstOnAddon = gst - gstOnFare;
@@ -388,7 +481,7 @@ async function processCancellationRefund(
   const gstAddonRefund = addonRefund > 0 ? gstOnAddon : 0;
   const gstRefund = gstFareRefund + gstAddonRefund;
 
-  const retainedFare = netFare - fareRefund;
+  const retainedFare = netFare - operatorFareRefund;
   const platformFeeOnRetained = fullRefund
     ? 0
     : Math.round((retainedFare * platformFeePercent) / 100);
@@ -449,6 +542,27 @@ async function processCancellationRefund(
 
   await booking.save();
 
+  // ── Refund audit log ────────────────────────────────────────────────────────
+  try {
+    const audit = require("../utils/audit");
+    audit.log({
+      action:
+        booking.refundStatus === "FAILED" ? "refund_failed" : "refund_issued",
+      actor: { type: "system" },
+      target: { type: "booking", id: booking._id, ref: booking.bookingId },
+      details: {
+        cancelledBy,
+        reason,
+        refundAmount: userRefund,
+        refundPercent,
+        refundStatus: booking.refundStatus,
+        refundId: booking.refundId || "",
+        paymentId: booking.razorpayPaymentId || "",
+        breakdown,
+      },
+    });
+  } catch {}
+
   // ── Release seats + bookingCount ──────────────────────────────────────────
   await Batch.findByIdAndUpdate(booking.batchId, {
     $inc: { bookedSeats: -booking.seats },
@@ -467,6 +581,18 @@ async function processCancellationRefund(
         : { packageId: booking.packageId };
       await Coupon.updateOne(
         { ...match, code: usedCoupon, usedCount: { $gt: 0 } },
+        { $inc: { usedCount: -1 } },
+      );
+    } catch {}
+  }
+
+  // ── Return the platform (admin) coupon usage slot too ──────────────────────
+  const usedPlatformCoupon = booking.pricing?.platformCouponCode;
+  if (usedPlatformCoupon) {
+    try {
+      const PlatformCoupon = require("../models/PlatformCoupon");
+      await PlatformCoupon.updateOne(
+        { code: usedPlatformCoupon, usedCount: { $gt: 0 } },
         { $inc: { usedCount: -1 } },
       );
     } catch {}
@@ -819,6 +945,42 @@ exports.createBooking = async (req, res) => {
       }
     }
 
+    // ── Platform (admin) coupon — only if NO operator coupon was applied ──────
+    const platformCouponCode = (req.body.platformCouponCode || "")
+      .trim()
+      .toUpperCase();
+    let platformDiscountAmount = 0;
+    let appliedPlatformCouponId = null;
+    if (platformCouponCode && discountAmount === 0) {
+      const { resolvePlatformCoupon } = require("../utils/platformCoupon");
+      const res = await resolvePlatformCoupon({
+        code: platformCouponCode,
+        userId: req.user._id,
+        pkg,
+        fareSubtotal: fareSubtotalRaw,
+        numSeats,
+      });
+      if (res.ok && res.coupon) {
+        // Atomically claim a usage slot (guards the global usageLimit under races)
+        const PlatformCoupon = require("../models/PlatformCoupon");
+        const claimed = await PlatformCoupon.findOneAndUpdate(
+          {
+            _id: res.coupon._id,
+            $or: [
+              { usageLimit: 0 },
+              { $expr: { $lt: ["$usedCount", "$usageLimit"] } },
+            ],
+          },
+          { $inc: { usedCount: 1 } },
+          { new: true },
+        );
+        if (claimed) {
+          platformDiscountAmount = res.discount;
+          appliedPlatformCouponId = claimed._id;
+        }
+      }
+    }
+
     // ── Calculate pricing (snapshotted forever) ────────────────────────────
     const pricing = calcPricing({
       adultPrice,
@@ -831,8 +993,11 @@ exports.createBooking = async (req, res) => {
       addonAmount: addonTotalPrice,
       addonSurcharge,
       discountAmount,
+      platformDiscountAmount,
     });
     if (discountAmount > 0) pricing.couponCode = couponCode;
+    if (platformDiscountAmount > 0)
+      pricing.platformCouponCode = platformCouponCode;
 
     // ── Build snapshot ─────────────────────────────────────────────────────
     const snapshot = {
@@ -903,6 +1068,15 @@ exports.createBooking = async (req, res) => {
           );
         } catch {}
       }
+      if (appliedPlatformCouponId) {
+        try {
+          const PlatformCoupon = require("../models/PlatformCoupon");
+          await PlatformCoupon.updateOne(
+            { _id: appliedPlatformCouponId, usedCount: { $gt: 0 } },
+            { $inc: { usedCount: -1 } },
+          );
+        } catch {}
+      }
       console.error(
         "[createBooking] booking create failed after payment:",
         createErr.message,
@@ -967,135 +1141,175 @@ exports.createBooking = async (req, res) => {
       text: summaryText,
     });
 
-    // Send push notification to user
-    notifyUser(
-      req.user._id,
-      "Booking Confirmed! 🎉",
-      `Your trip to ${pkg.title} is confirmed. ${booking.seats} seat${booking.seats > 1 ? "s" : ""} booked.`,
-      { type: "booking_confirmed", bookingId: booking._id.toString() },
+    // ── Double-email / notification guard ─────────────────────────────────────
+    // The webhook/cron recovery can fire `createBooking` for the same payment if
+    // the app's /verify also succeeded. `finalizeBookingFromOrder` prevents a
+    // duplicate BOOKING (dedup on razorpayPaymentId), but if both paths succeed
+    // on a tight race, the notifications below would fire twice. We stamp
+    // `confirmationSentAt` atomically and skip if already set.
+    const stampedOk = await TripBooking.findOneAndUpdate(
+      { _id: booking._id, confirmationSentAt: { $exists: false } },
+      { $set: { confirmationSentAt: new Date() } },
     );
-
-    // Notify operator about new booking
-    const { notifyOperator } = require("./notificationController");
-    const { notifyAdmin } = require("./notificationController");
-    notifyOperator(
-      pkg.operatorId,
-      "New Booking! 🎊",
-      `${req.user.name || "A user"} booked ${pkg.title} — ${booking.seats} seat${booking.seats > 1 ? "s" : ""}. ₹${booking.pricing.operatorAmount.toLocaleString("en-IN")} earning.`,
-      { type: "new_booking", bookingId: booking._id.toString() },
-    );
-
-    // ── Auto-send itinerary to traveller on confirmation ──────────────────
-    // The base itinerary is always available from the package. The operator
-    // can later send a richer document with transport/driver details from the
-    // Booking Management page, but the traveller gets something useful NOW.
-    try {
-      if (pkg.itinerary?.length > 0) {
-        const itineraryLines = pkg.itinerary
-          .filter((d) => d.title)
-          .map((d) => {
-            let line = `Day ${d.day}: ${d.title}`;
-            if (d.points?.length > 0) {
-              line +=
-                "\n" +
-                d.points
-                  .filter(Boolean)
-                  .map((p) => `  • ${p}`)
-                  .join("\n");
-            }
-            return line;
-          })
-          .join("\n\n");
-
-        const itineraryMsg = [
-          `📋 Your Itinerary — ${pkg.title}`,
-          `📍 ${pkg.location || ""}`,
-          `📅 ${startFmt} → ${endFmt}`,
-          "",
-          itineraryLines,
-          "",
-          pkg.inclusions?.length > 0
-            ? "✅ Inclusions: " + pkg.inclusions.filter(Boolean).join(", ")
-            : "",
-          pkg.exclusions?.length > 0
-            ? "❌ Exclusions: " + pkg.exclusions.filter(Boolean).join(", ")
-            : "",
-          "",
-          "Your operator will share pickup details and transport info closer to the trip date.",
-        ]
-          .filter(Boolean)
-          .join("\n");
-
-        // Send via the existing chat conversation (already created above)
-        const Message = require("../models/Message");
-        await Message.create({
-          conversationId: conv._id,
-          senderId: pkg.operatorId,
-          senderType: "operator",
-          senderName: "Trip Reel",
-          text: itineraryMsg,
-        });
-      }
-    } catch (itinErr) {
-      // Non-blocking — booking is already confirmed regardless
-      console.warn("Auto-itinerary send failed:", itinErr.message);
-    }
-
-    // Notify admin about new booking
-    notifyAdmin(
-      "New Booking",
-      `${req.user.name || "User"} booked ${pkg.title} — ₹${booking.pricing.totalAmount.toLocaleString("en-IN")}`,
-      { type: "new_booking", bookingId: booking._id.toString() },
-    );
-
-    // Send booking confirmation email
-    try {
-      const { sendBookingConfirmation } = require("../utils/sendMail");
-      const { Operator } = require("../models/Operator");
-      const operator = await Operator.findById(pkg.operatorId).select(
-        "businessName contactName phone",
+    // If stampedOk is null, another path already sent notifications — skip.
+    if (!stampedOk) {
+      console.log(
+        `[createBooking] Notifications already sent for ${booking.bookingId} — skipping`,
       );
-      const fmtDate = (d) =>
-        d
-          ? new Date(d).toLocaleDateString("en-IN", {
-              day: "2-digit",
-              month: "short",
-              year: "numeric",
+    } else {
+      // Send push notification to user
+      notifyUser(
+        req.user._id,
+        "Booking Confirmed! 🎉",
+        `Your trip to ${pkg.title} is confirmed. ${booking.seats} seat${booking.seats > 1 ? "s" : ""} booked.`,
+        { type: "booking_confirmed", bookingId: booking._id.toString() },
+      );
+
+      // Notify operator about new booking
+      const { notifyOperator } = require("./notificationController");
+      const { notifyAdmin } = require("./notificationController");
+      notifyOperator(
+        pkg.operatorId,
+        "New Booking! 🎊",
+        `${req.user.name || "A user"} booked ${pkg.title} — ${booking.seats} seat${booking.seats > 1 ? "s" : ""}. ₹${booking.pricing.operatorAmount.toLocaleString("en-IN")} earning.`,
+        { type: "new_booking", bookingId: booking._id.toString() },
+      );
+
+      // ── Auto-send itinerary to traveller on confirmation ──────────────────
+      // The base itinerary is always available from the package. The operator
+      // can later send a richer document with transport/driver details from the
+      // Booking Management page, but the traveller gets something useful NOW.
+      try {
+        if (pkg.itinerary?.length > 0) {
+          const itineraryLines = pkg.itinerary
+            .filter((d) => d.title)
+            .map((d) => {
+              let line = `Day ${d.day}: ${d.title}`;
+              if (d.points?.length > 0) {
+                line +=
+                  "\n" +
+                  d.points
+                    .filter(Boolean)
+                    .map((p) => `  • ${p}`)
+                    .join("\n");
+              }
+              return line;
             })
-          : "-";
-      sendBookingConfirmation({
-        to: req.user.email,
-        userName: req.user.name || "Traveler",
-        bookingDetails: {
-          bookingId: booking.bookingId,
+            .join("\n\n");
+
+          const itineraryMsg = [
+            `📋 Your Itinerary — ${pkg.title}`,
+            `📍 ${pkg.location || ""}`,
+            `📅 ${startFmt} → ${endFmt}`,
+            "",
+            itineraryLines,
+            "",
+            pkg.inclusions?.length > 0
+              ? "✅ Inclusions: " + pkg.inclusions.filter(Boolean).join(", ")
+              : "",
+            pkg.exclusions?.length > 0
+              ? "❌ Exclusions: " + pkg.exclusions.filter(Boolean).join(", ")
+              : "",
+            "",
+            "Your operator will share pickup details and transport info closer to the trip date.",
+          ]
+            .filter(Boolean)
+            .join("\n");
+
+          // Send via the existing chat conversation (already created above)
+          const Message = require("../models/Message");
+          await Message.create({
+            conversationId: conv._id,
+            senderId: pkg.operatorId,
+            senderType: "operator",
+            senderName: "Trip Reel",
+            text: itineraryMsg,
+          });
+        }
+      } catch (itinErr) {
+        // Non-blocking — booking is already confirmed regardless
+        console.warn("Auto-itinerary send failed:", itinErr.message);
+      }
+
+      // Notify admin about new booking
+      notifyAdmin(
+        "New Booking",
+        `${req.user.name || "User"} booked ${pkg.title} — ₹${booking.pricing.totalAmount.toLocaleString("en-IN")}`,
+        { type: "new_booking", bookingId: booking._id.toString() },
+      );
+
+      // Send booking confirmation email
+      try {
+        const { sendBookingConfirmation } = require("../utils/sendMail");
+        const { Operator } = require("../models/Operator");
+        const operator = await Operator.findById(pkg.operatorId).select(
+          "businessName contactName phone",
+        );
+        const fmtDate = (d) =>
+          d
+            ? new Date(d).toLocaleDateString("en-IN", {
+                day: "2-digit",
+                month: "short",
+                year: "numeric",
+              })
+            : "-";
+        sendBookingConfirmation({
+          to: req.user.email,
           userName: req.user.name || "Traveler",
-          packageName: pkg.title,
-          packageLocation: pkg.location,
-          batchDate: batch
-            ? `${fmtDate(batch.startDate)} - ${fmtDate(batch.endDate)}`
-            : `${fmtDate(snapshot.startDate)} - ${fmtDate(snapshot.endDate)}`,
-          seats: booking.seats,
-          totalAmount: booking.pricing.totalAmount,
-          travelers: req.body.travelers || booking.travelers || [],
-          itinerary: pkg.itinerary || [],
-          inclusions: pkg.inclusions || [],
-          operatorName: operator?.businessName || operator?.contactName,
-          operatorPhone: operator?.phone,
-          paymentId: req.body.paymentId || "",
-          addonNames: addonNames || [],
-          addonTotalPrice: addonTotalPrice || 0,
-          addonDays: addonDaysData,
-          itineraryDays: pkg.itinerary || [],
-        },
-      });
-    } catch (emailErr) {
-      console.warn("Booking email failed:", emailErr.message);
-    }
+          bookingDetails: {
+            bookingId: booking.bookingId,
+            userName: req.user.name || "Traveler",
+            packageName: pkg.title,
+            packageLocation: pkg.location,
+            batchDate: batch
+              ? `${fmtDate(batch.startDate)} - ${fmtDate(batch.endDate)}`
+              : `${fmtDate(snapshot.startDate)} - ${fmtDate(snapshot.endDate)}`,
+            seats: booking.seats,
+            totalAmount: booking.pricing.totalAmount,
+            travelers: req.body.travelers || booking.travelers || [],
+            itinerary: pkg.itinerary || [],
+            inclusions: pkg.inclusions || [],
+            operatorName: operator?.businessName || operator?.contactName,
+            operatorPhone: operator?.phone,
+            paymentId: req.body.paymentId || "",
+            addonNames: addonNames || [],
+            addonTotalPrice: addonTotalPrice || 0,
+            addonDays: addonDaysData,
+            itineraryDays: pkg.itinerary || [],
+          },
+        });
+      } catch (emailErr) {
+        console.warn("Booking email failed:", emailErr.message);
+      }
+
+      // Mark any abandoned-booking reminder intent as converted (best-effort)
+    } // end of notification guard (stampedOk)
 
     // Mark any abandoned-booking reminder intent as converted (best-effort)
     try {
       const { markIntentConverted } = require("./bookingIntentController");
       markIntentConverted(req.user._id, packageId);
+    } catch {}
+    // Mark any viewed-package re-engagement record as converted (best-effort)
+    try {
+      const { markViewConverted } = require("./packageViewController");
+      markViewConverted(req.user._id, packageId);
+    } catch {}
+
+    // ── Audit log ─────────────────────────────────────────────────────────────
+    try {
+      const audit = require("../utils/audit");
+      audit.log({
+        action: "booking_created",
+        actor: { id: req.user._id, type: "user", name: req.user.name },
+        target: { type: "booking", id: booking._id, ref: booking.bookingId },
+        details: {
+          packageId,
+          seats: numSeats,
+          totalAmount: booking.pricing?.totalAmount,
+          paymentId: req.body.paymentId,
+        },
+      });
     } catch {}
 
     res.status(201).json({ success: true, booking });
@@ -1523,6 +1737,22 @@ exports.cancelBooking = async (req, res) => {
       );
     } catch {}
 
+    // ── Audit log ─────────────────────────────────────────────────────────────
+    try {
+      const audit = require("../utils/audit");
+      audit.log({
+        action: "booking_cancelled_user",
+        actor: { id: req.user._id, type: "user", name: req.user.name },
+        target: { type: "booking", id: booking._id, ref: booking.bookingId },
+        details: {
+          reason: reason || "Cancelled by user",
+          refundAmount: summary.refundAmount,
+          refundPercent: summary.refundPercent,
+          refundStatus: summary.refundStatus,
+        },
+      });
+    } catch {}
+
     res.json({
       success: true,
       message: "Booking cancelled successfully",
@@ -1575,11 +1805,14 @@ exports.getRefundPreview = async (req, res) => {
     const p = booking.pricing || {};
     const fareSubtotal = Number(p.fareSubtotal) || 0;
     const discountAmount = Number(p.discountAmount) || 0;
+    const platformDiscountAmount = Number(p.platformDiscountAmount) || 0;
     const netFare = Math.max(0, fareSubtotal - discountAmount);
+    // The platform-funded discount was never paid by the user → not refundable.
+    const userNetFare = Math.max(0, netFare - platformDiscountAmount);
     const gst = Number(p.gstAmount) || 0;
     const addon = Number(p.addonAmount) || 0;
 
-    const fareRefund = Math.round((netFare * refundPercent) / 100);
+    const fareRefund = Math.round((userNetFare * refundPercent) / 100);
     // Split GST: portion on fare vs portion on addons
     const gstOnFare =
       netFare > 0 ? Math.round((gst * netFare) / (netFare + addon)) : 0;
@@ -1612,7 +1845,7 @@ exports.getRefundPreview = async (req, res) => {
         gstRefund,
         addonRefund,
         // what is kept (non-refundable trip fare + its GST per the slab)
-        fareKept: Math.max(0, netFare - fareRefund),
+        fareKept: Math.max(0, userNetFare - fareRefund),
         gstKept: Math.max(0, gst - gstRefund),
       },
     });
@@ -2067,6 +2300,20 @@ exports.syncSnapjaStatus = async (req, res) => {
           if (b.otp_expires_at)
             snapjaBookings[key].otpExpiresAt = b.otp_expires_at;
           updated = true;
+        }
+        // Sync live status (confirmed → in_progress → completed). Once the
+        // shoot is completed the app stops showing OTP + Call.
+        if (b.status) {
+          const liveStatus = String(b.status).toLowerCase();
+          if (liveStatus !== String(snap.status || "").toLowerCase()) {
+            snapjaBookings[key].status = liveStatus;
+            updated = true;
+          }
+          const doneStatuses = ["completed", "delivered", "done", "finished"];
+          if (doneStatuses.includes(liveStatus) && !snap.completedAt) {
+            snapjaBookings[key].completedAt = new Date().toISOString();
+            updated = true;
+          }
         }
         // Pull deliverables (photos/videos)
         if (

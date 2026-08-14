@@ -33,9 +33,12 @@ const userSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ["Active", "Inactive", "Suspended"],
+      enum: ["Active", "Inactive", "Suspended", "Deleted"],
       default: "Active",
     },
+    // Set when the user erases their account (DPDP). The record is anonymized,
+    // not dropped, so legally-required financial history stays consistent.
+    deletedAt: { type: Date },
     avatar: {
       type: String,
       default: "",
@@ -62,6 +65,9 @@ const userSchema = new mongoose.Schema(
     // Google Sign-In
     googleId: { type: String, default: "", sparse: true },
     profileImage: { type: String, default: "" },
+    // Re-engagement tracking
+    lastActiveAt: { type: Date, default: Date.now, index: true },
+    lastReengagedAt: { type: Date }, // last time we sent a re-engagement nudge
   },
   { timestamps: true },
 );

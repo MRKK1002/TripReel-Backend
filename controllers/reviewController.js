@@ -37,6 +37,8 @@ async function recalcPackageRating(packageId) {
   await Package.findByIdAndUpdate(packageId, update);
   return update;
 }
+// Exposed so account-deletion can recalc ratings after removing a user's reviews
+exports.recalcPackageRating = recalcPackageRating;
 
 // ── Public ─────────────────────────────────────────────────────────────────────
 

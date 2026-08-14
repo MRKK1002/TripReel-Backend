@@ -18,10 +18,13 @@ const pricingSchema = new mongoose.Schema(
     gstAmount: { type: Number, default: 0 },
     // What the user pays
     totalAmount: { type: Number, default: 0 },
-    // Discount applied via coupon
+    // Operator coupon discount (reduces operator earnings — operator-funded)
     discountAmount: { type: Number, default: 0 },
     couponCode: { type: String, default: "" },
-    // What the operator receives (totalAmount - platformFeeAmount)
+    // Platform (admin) coupon discount (absorbed by platform — operator unaffected)
+    platformDiscountAmount: { type: Number, default: 0 },
+    platformCouponCode: { type: String, default: "" },
+    // What the operator receives (netFare - platformFeeAmount + addonSurcharge)
     operatorAmount: { type: Number, default: 0 },
   },
   { _id: false },
@@ -221,6 +224,10 @@ const tripBookingSchema = new mongoose.Schema(
       default: false,
     },
 
+    // Guards against sending duplicate confirmation emails/push (webhook + app
+    // verify can both fire for the same payment).
+    confirmationSentAt: { type: Date },
+
     // Set when the amount charged (order) differs from the recomputed booking
     // total (e.g. an admin changed a price/setting between order and payment).
     // Admin is notified to reconcile. Booking is honored at the charged amount.
@@ -245,6 +252,12 @@ const tripBookingSchema = new mongoose.Schema(
     addonDispatchedAt: {
       type: Date,
       default: null,
+    },
+    // Razorpay payment ids of post-booking add-on top-ups (idempotency guard so
+    // the same top-up payment is never applied to the booking twice).
+    addonTopupPaymentIds: {
+      type: [String],
+      default: [],
     },
     // Snapja booking references — saved after dispatch so we can track/cancel each addon-day
     // Structure: { "addonName_dayIdx": { bookingId, snapjaId, otp, status } }
