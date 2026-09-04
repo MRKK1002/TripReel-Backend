@@ -1,11 +1,15 @@
 const TripBooking = require("../models/TripBooking");
+const SnapjaDispatchClaim = require("../models/SnapjaDispatchClaim");
+const { randomUUID } = require("crypto");
 const Batch = require("../models/Batch");
 const { getSetting } = require("./platformSettingsController");
+const { getItineraryDateKey } = require("../utils/addonBookingTiming");
 
 // Helper: stagger notifications to avoid sending all at once
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const NOTIFICATION_STAGGER_MS = 500; // 500ms gap between each push notification
-const SNAPJA_API = "https://api.snapja.com/api/tripreel/bookings";
+const SNAPJA_API =
+  process.env.SNAPJA_API_URL || "https://api.snapja.com/api/tripreel/bookings";
 const SNAPJA_API_KEY = process.env.SNAPJA_API_KEY;
 
 // Effective trip dates — batch bookings use batch dates, flexible bookings have
@@ -54,7 +58,7 @@ async function refundPercentForDate(startDate) {
  * Job: dispatch held Snapja addon money once a booking is locked-in
  * (entered the no-refund window). Sends one Snapja booking per service per day.
  */
-async function runSnapjaDispatch() {
+async function runSnapjaDispatch(bookingId = null) {
   const results = { dispatched: 0, callsMade: 0, errors: [] };
   try {
     const Package = require("../models/Package");
@@ -64,11 +68,17 @@ async function runSnapjaDispatch() {
     const videographerPrice =
       (await getSetting("videographer_base_price")) ?? 2000;
 
-    const bookings = await TripBooking.find({
+    const dispatchQuery = {
       status: "CONFIRMED",
       addonHeld: true,
       addonDispatched: { $ne: true },
-    }).populate("batchId", "startDate");
+    };
+    if (bookingId) dispatchQuery._id = bookingId;
+
+    const bookings = await TripBooking.find(dispatchQuery).populate(
+      "batchId",
+      "startDate",
+    );
 
     console.log(
       `[SNAPJA DISPATCH] Found ${bookings.length} bookings to dispatch`,
@@ -82,8 +92,6 @@ async function runSnapjaDispatch() {
           booking.snapshot?.startDate ||
           booking.tripStartDate;
         if (!startDate) continue;
-        // Dispatch immediately — creator needs time to prepare/accept
-        if (new Date(startDate) < new Date()) continue; // skip if trip already started
 
         const pkg = await Package.findById(booking.packageId).select(
           "itinerary location title",
@@ -93,6 +101,9 @@ async function runSnapjaDispatch() {
         );
         const addonDays = booking.addonDays || {};
         const snapjaBookings = booking.snapjaBookings || {};
+        const addonBookingTypes = booking.addonBookingTypes || {};
+        const newlyDispatchedKeys = [];
+        const requiredKeys = [];
 
         for (const addonName of Object.keys(addonDays)) {
           const serviceType = addonName.toLowerCase().includes("photographer")
@@ -102,34 +113,137 @@ async function runSnapjaDispatch() {
             serviceType === "reelmaker" ? videographerPrice : photographerPrice;
           for (const dayIdx of addonDays[addonName] || []) {
             const dayInfo = pkg?.itinerary?.[dayIdx];
-            const actualDate = new Date(startDate);
-            actualDate.setDate(actualDate.getDate() + dayIdx);
+            const actualDate = getItineraryDateKey(booking, dayIdx);
+            const key = `${addonName}_${dayIdx}`;
+            const bookingType = addonBookingTypes[key] || "scheduled";
+            requiredKeys.push(key);
 
-            // User-chosen schedule for this addon-day (preferred), else operator defaults
+            // Same-day instant entries were fixed server-side at payment
+            // verification. Future scheduled entries retain user-selected
+            // schedule with operator/package fallbacks for legacy bookings.
             const sched =
               (booking.addonSchedule &&
                 booking.addonSchedule[addonName] &&
                 booking.addonSchedule[addonName][dayIdx]) ||
               {};
+            if (
+              bookingType === "instant" &&
+              (!sched.fixedByOperator ||
+                !sched.placeName ||
+                !sched.time ||
+                !Number.isFinite(Number(sched.lat)) ||
+                !Number.isFinite(Number(sched.lng)))
+            ) {
+              results.errors.push(
+                `Snapja ${booking.bookingId} day ${dayIdx + 1}: fixed operator schedule is missing`,
+              );
+              continue;
+            }
+            if (!actualDate) {
+              results.errors.push(
+                `Snapja ${booking.bookingId} day ${dayIdx + 1}: itinerary date is invalid`,
+              );
+              continue;
+            }
+
             const location =
-              sched.placeName ||
-              dayInfo?.pickupPoint ||
-              pkg?.location ||
-              pkg?.title ||
-              "India";
-            const time = sched.time || dayInfo?.pickupTime || "10:00";
-            const key = `${addonName}_${dayIdx}`;
+              bookingType === "instant"
+                ? sched.placeName
+                : sched.placeName ||
+                  dayInfo?.pickupPoint ||
+                  pkg?.location ||
+                  pkg?.title ||
+                  "India";
+            const time =
+              bookingType === "instant"
+                ? sched.time
+                : sched.time || dayInfo?.pickupTime || "10:00";
             // Skip addon-days that were already dispatched to Snapja. This makes
             // dispatch idempotent per addon-day, so a post-booking add-on top-up
             // (which resets addonDispatched=false) only sends the NEW days and
             // never creates duplicate Snapja bookings for existing ones.
             if (snapjaBookings[key]?.bookingId) continue;
+
+            // Claim this external side effect in Mongo before calling Snapja.
+            // This prevents the immediate verifier and the five-minute cron
+            // from posting the same entry concurrently, even across processes.
+            try {
+              await SnapjaDispatchClaim.updateOne(
+                { tripBookingId: booking._id, entryKey: key },
+                {
+                  $setOnInsert: {
+                    operationId: randomUUID(),
+                    state: "RETRYABLE",
+                  },
+                },
+                { upsert: true },
+              );
+            } catch (claimSeedError) {
+              if (claimSeedError.code !== 11000) throw claimSeedError;
+            }
+
+            let existingClaim = await SnapjaDispatchClaim.findOne({
+              tripBookingId: booking._id,
+              entryKey: key,
+            });
+            if (existingClaim?.state === "DISPATCHED") {
+              if (existingClaim.snapjaBooking?.bookingId) {
+                snapjaBookings[key] = existingClaim.snapjaBooking;
+              }
+              continue;
+            }
+            if (existingClaim?.state === "UNCERTAIN") {
+              results.errors.push(
+                `Snapja ${booking.bookingId} day ${dayIdx + 1}: dispatch result is uncertain; manual reconciliation required`,
+              );
+              continue;
+            }
+            if (
+              existingClaim?.state === "DISPATCHING" &&
+              existingClaim.leaseUntil &&
+              existingClaim.leaseUntil <= new Date()
+            ) {
+              await SnapjaDispatchClaim.updateOne(
+                { _id: existingClaim._id, state: "DISPATCHING" },
+                {
+                  $set: {
+                    state: "UNCERTAIN",
+                    lastError:
+                      "Dispatcher lease expired before the Snapja response was persisted",
+                  },
+                },
+              );
+              results.errors.push(
+                `Snapja ${booking.bookingId} day ${dayIdx + 1}: expired dispatch requires manual reconciliation`,
+              );
+              continue;
+            }
+
+            const claim = await SnapjaDispatchClaim.findOneAndUpdate(
+              {
+                tripBookingId: booking._id,
+                entryKey: key,
+                state: "RETRYABLE",
+              },
+              {
+                $set: {
+                  state: "DISPATCHING",
+                  leaseUntil: new Date(Date.now() + 10 * 60 * 1000),
+                  lastError: "",
+                },
+                $inc: { attempts: 1 },
+              },
+              { new: true },
+            );
+            if (!claim) continue;
+
             try {
               const snapjaRes = await fetch(SNAPJA_API, {
                 method: "POST",
                 headers: {
                   "Content-Type": "application/json",
                   "X-API-Key": SNAPJA_API_KEY,
+                  "X-Idempotency-Key": claim.operationId,
                 },
                 body: JSON.stringify({
                   service_type: serviceType,
@@ -137,18 +251,24 @@ async function runSnapjaDispatch() {
                   // reads location.lat/lng and ignores top-level latitude/longitude.
                   location: {
                     address: location,
-                    lat: sched.lat || dayInfo?.pickupLat || 0,
-                    lng: sched.lng || dayInfo?.pickupLng || 0,
+                    lat:
+                      bookingType === "instant"
+                        ? Number(sched.lat)
+                        : Number(sched.lat ?? dayInfo?.pickupLat ?? 0),
+                    lng:
+                      bookingType === "instant"
+                        ? Number(sched.lng)
+                        : Number(sched.lng ?? dayInfo?.pickupLng ?? 0),
                   },
                   price: addonPrice,
                   duration: 1,
-                  date: actualDate.toISOString().split("T")[0],
+                  date: actualDate,
                   time,
-                  booking_type: "scheduled",
+                  booking_type: bookingType,
                   customer_name: user?.name || "Trip Reel User",
                   customer_phone: user?.phone || "",
                   customer_email: user?.email || "",
-                  notes: `Trip Reel: ${pkg?.title || "Trip"} — ${addonName} — Day ${dayIdx + 1} — Booking ${booking.bookingId}`,
+                  notes: `Trip Reel: ${pkg?.title || "Trip"} — ${addonName} — Day ${dayIdx + 1} — Booking ${booking.bookingId} — Dispatch ${claim.operationId}`,
                   timezone: "Asia/Kolkata",
                   auto_confirm_payment: true,
                 }),
@@ -156,43 +276,122 @@ async function runSnapjaDispatch() {
               const snapjaData = await snapjaRes.json().catch(() => ({}));
               results.callsMade++;
 
-              if (snapjaRes.ok && snapjaData.success) {
-                // Save Snapja booking reference per addon-day
-                snapjaBookings[key] = {
-                  bookingId: snapjaData.booking?.booking_id || "",
+              const returnedBookingId =
+                snapjaData.booking?.booking_id || snapjaData.booking?.id || "";
+              if (snapjaRes.ok && snapjaData.success && returnedBookingId) {
+                const dispatchedEntry = {
+                  bookingId:
+                    snapjaData.booking?.booking_id || returnedBookingId,
                   snapjaId: snapjaData.booking?.id || "",
                   otp: snapjaData.booking?.otp || "",
                   otpExpiresAt: snapjaData.booking?.otp_expires_at || "",
                   status: snapjaData.booking?.status || "confirmed",
+                  bookingType,
                   dispatchedAt: new Date().toISOString(),
                 };
-              } else {
-                results.errors.push(
-                  `Snapja ${booking.bookingId} day ${dayIdx + 1}: ${snapjaData?.message || snapjaRes.status}`,
+                // Persist the external result in the claim first. If the
+                // TripBooking save fails, the next worker repairs it from here
+                // instead of posting a duplicate booking.
+                await SnapjaDispatchClaim.updateOne(
+                  { _id: claim._id, state: "DISPATCHING" },
+                  {
+                    $set: {
+                      state: "DISPATCHED",
+                      snapjaBooking: dispatchedEntry,
+                      leaseUntil: null,
+                    },
+                  },
                 );
+                snapjaBookings[key] = dispatchedEntry;
+                newlyDispatchedKeys.push(key);
+              } else {
+                const responseState =
+                  snapjaRes.status >= 500 ||
+                  (snapjaRes.ok && snapjaData.success && !returnedBookingId)
+                    ? "UNCERTAIN"
+                    : "RETRYABLE";
+                const responseError =
+                  snapjaData?.message ||
+                  (snapjaRes.ok && !returnedBookingId
+                    ? "Snapja response did not include a booking id"
+                    : `HTTP ${snapjaRes.status}`);
+                await SnapjaDispatchClaim.updateOne(
+                  { _id: claim._id, state: "DISPATCHING" },
+                  {
+                    $set: {
+                      state: responseState,
+                      leaseUntil: null,
+                      lastError: responseError,
+                    },
+                  },
+                );
+                results.errors.push(
+                  `Snapja ${booking.bookingId} day ${dayIdx + 1}: ${responseError}${
+                    responseState === "UNCERTAIN"
+                      ? "; manual reconciliation required"
+                      : ""
+                  }`,
+                );
+                if (responseState === "UNCERTAIN") {
+                  try {
+                    const { notifyAdmin } = require("./notificationController");
+                    notifyAdmin(
+                      "Snapja Dispatch Needs Reconciliation",
+                      `Booking ${booking.bookingId}, ${addonName} day ${dayIdx + 1}: ${responseError}. Dispatch reference ${claim.operationId}.`,
+                      { type: "general", bookingId: booking._id.toString() },
+                    );
+                  } catch {}
+                }
               }
             } catch (e) {
+              // A transport failure may happen after Snapja accepted the POST.
+              // Do not blindly retry and risk a duplicate paid booking.
+              await SnapjaDispatchClaim.updateOne(
+                { _id: claim._id, state: "DISPATCHING" },
+                {
+                  $set: {
+                    state: "UNCERTAIN",
+                    leaseUntil: null,
+                    lastError: e.message,
+                  },
+                },
+              ).catch(() => {});
               results.errors.push(
-                `Snapja ${booking.bookingId} day ${dayIdx + 1}: ${e.message}`,
+                `Snapja ${booking.bookingId} day ${dayIdx + 1}: ${e.message}; manual reconciliation required`,
               );
+              try {
+                const { notifyAdmin } = require("./notificationController");
+                notifyAdmin(
+                  "Snapja Dispatch Needs Reconciliation",
+                  `Booking ${booking.bookingId}, ${addonName} day ${dayIdx + 1}: Snapja may have accepted dispatch ${claim.operationId}, but TripReel did not receive a reliable response.`,
+                  { type: "general", bookingId: booking._id.toString() },
+                );
+              } catch {}
             }
           }
         }
 
-        booking.addonDispatched = true;
-        booking.addonDispatchedAt = new Date();
+        const allDispatched =
+          requiredKeys.length > 0 &&
+          requiredKeys.every((key) => Boolean(snapjaBookings[key]?.bookingId));
+        booking.addonDispatched = allDispatched;
+        booking.addonDispatchedAt = allDispatched ? new Date() : null;
         booking.snapjaBookings = snapjaBookings;
         booking.markModified("snapjaBookings");
         await booking.save();
-        results.dispatched++;
+        if (allDispatched) results.dispatched++;
 
-        // Notify user with OTP for each dispatched addon-day
+        // Notify only for entries created in this attempt; a partial retry must
+        // not repeat OTP notifications for older successful entries.
         const { notifyUser } = require("./notificationController");
-        const otpLines = Object.entries(snapjaBookings)
-          .filter(([, v]) => v.otp)
-          .map(([k, v]) => {
-            const [name, dayIdx] = k.split("_");
-            return `${name} Day ${Number(dayIdx) + 1}: OTP ${v.otp} (Snapja ID: ${v.bookingId})`;
+        const otpLines = newlyDispatchedKeys
+          .map((key) => [key, snapjaBookings[key]])
+          .filter(([, value]) => value?.otp)
+          .map(([key, value]) => {
+            const separator = key.lastIndexOf("_");
+            const name = key.slice(0, separator);
+            const dayIdx = key.slice(separator + 1);
+            return `${name} Day ${Number(dayIdx) + 1}: OTP ${value.otp} (Snapja ID: ${value.bookingId})`;
           });
         if (otpLines.length > 0) {
           notifyUser(
@@ -872,7 +1071,7 @@ async function runCronJobs() {
                 {
                   type: "offer",
                   packageId: packageId.toString(),
-                  screen: "PackageDetail",
+                  screen: "DestinationDetail",
                 },
               );
               results.urgencyAlerts = (results.urgencyAlerts || 0) + 1;
@@ -900,7 +1099,7 @@ async function runCronJobs() {
                 {
                   type: "offer",
                   packageId: packageId.toString(),
-                  screen: "PackageDetail",
+                  screen: "DestinationDetail",
                 },
               );
               results.urgencyAlerts = (results.urgencyAlerts || 0) + 1;
@@ -1379,7 +1578,7 @@ exports.runWishlistAlerts = async function () {
                 {
                   type: "offer",
                   packageId: packageId.toString(),
-                  screen: "PackageDetail",
+                  screen: "DestinationDetail",
                 },
               );
               results.urgencyAlerts++;
@@ -1406,7 +1605,7 @@ exports.runWishlistAlerts = async function () {
                 {
                   type: "offer",
                   packageId: packageId.toString(),
-                  screen: "PackageDetail",
+                  screen: "DestinationDetail",
                 },
               );
               results.urgencyAlerts++;

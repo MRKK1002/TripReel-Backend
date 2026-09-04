@@ -41,9 +41,21 @@ const notificationSchema = new mongoose.Schema(
       default: "general",
     },
 
-    // Optional reference
+    // Optional routing metadata. Keep this contract aligned with the app's
+    // notification route whitelist; legacy records may rely on type/id inference.
     bookingId: { type: mongoose.Schema.Types.ObjectId, ref: "TripBooking" },
     packageId: { type: mongoose.Schema.Types.ObjectId, ref: "Package" },
+    screen: {
+      type: String,
+      enum: [
+        "DestinationDetail",
+        "BookingDetails",
+        "ReviewScreen",
+        "MyTrip",
+        "ResumeBooking",
+      ],
+    },
+    intentId: { type: mongoose.Schema.Types.ObjectId, ref: "BookingIntent" },
 
     // Read status
     read: { type: Boolean, default: false },

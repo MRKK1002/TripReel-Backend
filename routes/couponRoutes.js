@@ -14,8 +14,10 @@ const {
   requireApprovedOperator,
 } = require("../middleware/operatorAuthMiddleware");
 
-// Public — get available coupons for a batch (shown in app)
-router.get("/", getCouponsForBatch);
+// Signed-in users — available coupons for a batch/package (shown in app).
+// This was public, which let anyone enumerate every operator's live codes,
+// discount values and caps for an arbitrary packageId.
+router.get("/", protect, getCouponsForBatch);
 
 // User — validate a coupon code
 router.post("/validate", protect, validateCoupon);

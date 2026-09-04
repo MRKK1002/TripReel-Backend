@@ -203,6 +203,13 @@ const tripBookingSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.Mixed,
       default: null,
     },
+    // Per addon-day Snapja mode, keyed as `${addonName}_${dayIndex}`.
+    // Same-day purchases are persisted as instant so retries remain instant
+    // even if the dispatch worker runs after midnight.
+    addonBookingTypes: {
+      type: mongoose.Schema.Types.Mixed,
+      default: {},
+    },
     // Pre-computed outside-city surcharge to credit operator (via cron with package earnings)
     addonSurcharge: {
       type: Number,
@@ -257,6 +264,26 @@ const tripBookingSchema = new mongoose.Schema(
     // the same top-up payment is never applied to the booking twice).
     addonTopupPaymentIds: {
       type: [String],
+      default: [],
+    },
+    // Audit trail for top-up payments refunded because server-side eligibility
+    // changed between Razorpay order creation and payment verification.
+    addonTopupRefunds: {
+      type: [
+        {
+          paymentId: String,
+          orderId: String,
+          amount: Number,
+          reason: String,
+          status: {
+            type: String,
+            enum: ["REFUNDED", "FAILED", "PROCESSING"],
+          },
+          refundId: String,
+          error: String,
+          createdAt: { type: Date, default: Date.now },
+        },
+      ],
       default: [],
     },
     // Snapja booking references — saved after dispatch so we can track/cancel each addon-day

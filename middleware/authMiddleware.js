@@ -61,6 +61,21 @@ exports.protect = async (req, res, next) => {
   }
 };
 
+// Require server-authoritative phone verification for transaction initiation.
+// This must run after `protect`, which loads a fresh user record into req.user.
+exports.requireVerifiedPhone = (req, res, next) => {
+  if (!req.user?.phone || !req.user.phoneVerifiedAt) {
+    return res.status(403).json({
+      success: false,
+      code: "PHONE_VERIFICATION_REQUIRED",
+      message: "Verify your phone number to continue.",
+      recoverable: true,
+    });
+  }
+
+  next();
+};
+
 // Restrict to specific roles
 exports.restrictTo = (...roles) => {
   return (req, res, next) => {

@@ -4,6 +4,7 @@ const {
   sendBookingConfirmation,
   sendPaymentReceipt,
 } = require("../utils/sendMail");
+const { buildAddonBookingPlan } = require("../utils/addonBookingTiming");
 
 // Initialize lazily so dotenv has time to load
 let razorpay;
@@ -16,6 +17,233 @@ function getRazorpay() {
   }
   return razorpay;
 }
+
+const RELEASE_OUTCOMES = new Set(["user_closed", "definitive_decline"]);
+const PROTECTED_PAYMENT_STATUSES = new Set([
+  "authorized",
+  "captured",
+  "refunded",
+  "partially_refunded",
+]);
+
+function inspectReleaseProviderState({ order, paymentList, outcome }) {
+  const orderStatus =
+    typeof order?.status === "string" ? order.status.toLowerCase() : "";
+  const attempts = Number(order?.attempts);
+  const amountPaid = Number(order?.amount_paid);
+  const payments = Array.isArray(paymentList?.items) ? paymentList.items : null;
+  const listedCount = Number(paymentList?.count);
+
+  if (
+    !["created", "attempted", "paid"].includes(orderStatus) ||
+    !Number.isInteger(attempts) ||
+    attempts < 0 ||
+    !Number.isFinite(amountPaid) ||
+    amountPaid < 0 ||
+    !payments ||
+    !Number.isInteger(listedCount) ||
+    listedCount !== payments.length ||
+    payments.some(
+      (payment) =>
+        !payment ||
+        typeof payment.status !== "string" ||
+        (payment.order_id && payment.order_id !== order.id),
+    )
+  ) {
+    return { releasable: false, reason: "ambiguous_provider_state" };
+  }
+
+  const paymentStatuses = payments.map((payment) =>
+    payment.status.toLowerCase(),
+  );
+  if (
+    orderStatus === "paid" ||
+    amountPaid > 0 ||
+    paymentStatuses.some((status) => PROTECTED_PAYMENT_STATUSES.has(status))
+  ) {
+    return { releasable: false, reason: "payment_recoverable" };
+  }
+
+  if (outcome === "user_closed") {
+    return orderStatus === "created" && attempts === 0 && listedCount === 0
+      ? { releasable: true }
+      : { releasable: false, reason: "checkout_was_attempted" };
+  }
+
+  const allAttemptsFailed =
+    orderStatus === "attempted" &&
+    attempts > 0 &&
+    attempts === listedCount &&
+    listedCount > 0 &&
+    paymentStatuses.every((status) => status === "failed");
+
+  return allAttemptsFailed
+    ? { releasable: true }
+    : { releasable: false, reason: "decline_not_definitive" };
+}
+
+/**
+ * POST /api/payments/release-order
+ * Expires only an authenticated user's provider-confirmed abandoned booking
+ * order. Client outcomes are hints; Razorpay remains authoritative.
+ */
+exports.releaseOrder = async (req, res) => {
+  const body = req.body || {};
+  const allowedFields = new Set(["razorpayOrderId", "outcome"]);
+  if (Object.keys(body).some((field) => !allowedFields.has(field))) {
+    return res.status(400).json({
+      success: false,
+      released: false,
+      message: "Only razorpayOrderId and outcome are accepted",
+    });
+  }
+
+  const { razorpayOrderId, outcome } = body;
+  if (
+    typeof razorpayOrderId !== "string" ||
+    !razorpayOrderId.trim() ||
+    !RELEASE_OUTCOMES.has(outcome)
+  ) {
+    return res.status(400).json({
+      success: false,
+      released: false,
+      message:
+        "razorpayOrderId and outcome (user_closed or definitive_decline) are required",
+    });
+  }
+
+  try {
+    const PendingOrder = require("../models/PendingOrder");
+    const pending = await PendingOrder.findOne({
+      razorpayOrderId,
+      userId: req.user._id,
+    });
+
+    if (!pending) {
+      return res.status(404).json({
+        success: false,
+        released: false,
+        message: "Payment order not found",
+      });
+    }
+
+    if (pending.status === "expired") {
+      return res.status(200).json({
+        success: true,
+        released: true,
+        idempotent: true,
+      });
+    }
+
+    if (pending.status !== "pending") {
+      return res.status(200).json({
+        success: true,
+        released: false,
+        reason: "order_not_pending",
+      });
+    }
+
+    // PendingOrder ownership is necessary but not sufficient: only normal
+    // booking orders created by createOrder may use this transition.
+    if (!pending.payload?.packageId) {
+      return res.status(200).json({
+        success: true,
+        released: false,
+        reason: "not_a_booking_order",
+      });
+    }
+
+    let order;
+    let paymentList;
+    try {
+      order = await getRazorpay().orders.fetch(razorpayOrderId);
+      paymentList = await getRazorpay().orders.fetchPayments(razorpayOrderId);
+    } catch (providerError) {
+      console.warn(
+        `[releaseOrder] Provider check failed for ${razorpayOrderId}:`,
+        providerError.message,
+      );
+      return res.status(200).json({
+        success: true,
+        released: false,
+        reason: "provider_check_failed",
+      });
+    }
+
+    const providerUserId = order?.notes?.userId;
+    if (
+      order?.id !== razorpayOrderId ||
+      order?.notes?.purpose ||
+      (providerUserId && String(providerUserId) !== String(req.user._id))
+    ) {
+      return res.status(200).json({
+        success: true,
+        released: false,
+        reason: "provider_order_mismatch",
+      });
+    }
+
+    const decision = inspectReleaseProviderState({
+      order,
+      paymentList,
+      outcome,
+    });
+    if (!decision.releasable) {
+      return res.status(200).json({
+        success: true,
+        released: false,
+        reason: decision.reason,
+      });
+    }
+
+    const expiredAt = new Date();
+    const releasedOrder = await PendingOrder.findOneAndUpdate(
+      {
+        _id: pending._id,
+        userId: req.user._id,
+        status: "pending",
+      },
+      {
+        $set: {
+          status: "expired",
+          expiredAt,
+          expirationReason: outcome,
+        },
+      },
+      { new: true },
+    );
+
+    if (releasedOrder) {
+      return res.status(200).json({
+        success: true,
+        released: true,
+        expiredAt: releasedOrder.expiredAt,
+      });
+    }
+
+    // Verification/webhook may have completed it while provider state was
+    // being checked. Only a concurrently expired record is a successful retry.
+    const current = await PendingOrder.findById(pending._id).select(
+      "status expiredAt",
+    );
+    return res.status(200).json({
+      success: true,
+      released: current?.status === "expired",
+      idempotent: current?.status === "expired",
+      expiredAt: current?.expiredAt,
+      ...(current?.status === "expired"
+        ? {}
+        : { reason: "order_state_changed" }),
+    });
+  } catch (err) {
+    console.error("[releaseOrder] Error:", err.message);
+    return res.status(500).json({
+      success: false,
+      released: false,
+      message: "Could not release payment order",
+    });
+  }
+};
 
 /**
  * POST /api/payments/create-order
@@ -69,22 +297,24 @@ exports.createOrder = async (req, res) => {
 
     // ── Recompute the authoritative amount SERVER-SIDE (never trust client) ──
     let authoritativeAmount;
+    let couponIssue = null;
     try {
-      authoritativeAmount =
-        await tripBookingController.computeAuthoritativePricing({
-          packageId,
-          batchId: isFlexible ? null : batchId,
-          bookingMode: isFlexible ? "flexible" : "batch",
-          flexAvailabilityId: isFlexible ? flexAvailabilityId : undefined,
-          flexStartDate: isFlexible ? flexStartDate : undefined,
-          seats: numSeats,
-          adults: numAdults,
-          children: numChildren,
-          couponCode,
-          platformCouponCode,
-          userId: req.user._id,
-          addonDays,
-        });
+      const priced = await tripBookingController.computeAuthoritativePricing({
+        packageId,
+        batchId: isFlexible ? null : batchId,
+        bookingMode: isFlexible ? "flexible" : "batch",
+        flexAvailabilityId: isFlexible ? flexAvailabilityId : undefined,
+        flexStartDate: isFlexible ? flexStartDate : undefined,
+        seats: numSeats,
+        adults: numAdults,
+        children: numChildren,
+        couponCode,
+        platformCouponCode,
+        userId: req.user._id,
+        addonDays,
+      });
+      authoritativeAmount = priced.totalAmount;
+      couponIssue = priced.couponIssue;
     } catch (e) {
       return res.status(400).json({ success: false, message: e.message });
     }
@@ -93,6 +323,20 @@ exports.createOrder = async (req, res) => {
       return res
         .status(400)
         .json({ success: false, message: "Invalid booking amount" });
+    }
+
+    // ── Coupon no longer applicable ──────────────────────────────────────────
+    // The user applied a coupon that has since expired, been deactivated, or run
+    // out of uses. Charging silently at full price is what caused billing
+    // disputes, so stop before creating the Razorpay order and report the real
+    // amount so the app can show the updated price.
+    if (couponIssue) {
+      return res.status(409).json({
+        success: false,
+        code: "COUPON_NOT_APPLICABLE",
+        message: couponIssue,
+        amount: authoritativeAmount,
+      });
     }
 
     const amountInPaise = Math.round(authoritativeAmount * 100);
@@ -689,6 +933,68 @@ function sanitizeNewAddonDays(requested, existing, itineraryLen) {
   return clean;
 }
 
+async function refundIneligibleAddonPayment({
+  booking,
+  order,
+  paymentId,
+  reason,
+}) {
+  const existing = (booking.addonTopupRefunds || []).find(
+    (entry) => entry.paymentId === paymentId,
+  );
+  if (existing?.status === "REFUNDED") {
+    return { refunded: true, refundId: existing.refundId, duplicate: true };
+  }
+
+  let record = existing;
+  if (!record) {
+    booking.addonTopupRefunds.push({
+      paymentId,
+      orderId: order.id,
+      amount: Number(order.amount) / 100,
+      reason,
+      status: "PROCESSING",
+      createdAt: new Date(),
+    });
+    record = booking.addonTopupRefunds[booking.addonTopupRefunds.length - 1];
+  } else {
+    record.status = "PROCESSING";
+    record.reason = reason;
+    record.error = "";
+  }
+  await booking.save();
+
+  try {
+    const refund = await getRazorpay().payments.refund(paymentId, {
+      amount: Number(order.amount),
+      notes: {
+        purpose: "addon_topup_eligibility_refund",
+        bookingId: String(booking._id),
+      },
+    });
+    record.status = "REFUNDED";
+    record.refundId = refund.id || "";
+    record.error = "";
+    booking.markModified("addonTopupRefunds");
+    await booking.save();
+    return { refunded: true, refundId: record.refundId };
+  } catch (refundError) {
+    record.status = "FAILED";
+    record.error = refundError.message || "Refund failed";
+    booking.markModified("addonTopupRefunds");
+    await booking.save();
+    try {
+      const { notifyAdmin } = require("./notificationController");
+      notifyAdmin(
+        "Urgent: Add-on Payment Refund Failed",
+        `Booking ${booking.bookingId}: payment ${paymentId} was captured but the add-on became ineligible. Refund manually. Reason: ${reason}. Error: ${record.error}`,
+        { type: "general", bookingId: booking._id.toString() },
+      );
+    } catch {}
+    return { refunded: false, error: record.error };
+  }
+}
+
 /**
  * POST /api/payments/create-addon-order
  * Body: { bookingId, addonDays, addonSchedule }
@@ -723,22 +1029,6 @@ exports.createAddonOrder = async (req, res) => {
         message: "Add-ons can only be added to a confirmed booking.",
       });
 
-    // ── Timing gate — must be before the add-on cutoff ────────────────────────
-    const startDate = booking.snapshot?.startDate;
-    const cutoffDays = tripBookingController.ADDON_ADD_CUTOFF_DAYS || 2;
-    if (startDate) {
-      const start = new Date(startDate);
-      const cutoff = new Date(
-        start.getTime() - cutoffDays * 24 * 60 * 60 * 1000,
-      );
-      if (Date.now() > cutoff.getTime()) {
-        return res.status(400).json({
-          success: false,
-          message: `Add-ons close ${cutoffDays} days before departure.`,
-        });
-      }
-    }
-
     const pkg = await Package.findById(booking.packageId).select(
       "itinerary outsideCityCharge title",
     );
@@ -759,6 +1049,15 @@ exports.createAddonOrder = async (req, res) => {
         message: "These add-on days are already booked or invalid.",
       });
     }
+
+    // Per-day timing replaces the old trip-level two-day cutoff. Future days
+    // remain scheduled; an eligible itinerary day that is today becomes an
+    // instant booking with the operator's fixed pickup details.
+    const addonPlan = buildAddonBookingPlan({
+      booking,
+      pkg,
+      addonDays: cleanDays,
+    });
 
     const { addonTotalPrice, gstOnAddon } =
       await tripBookingController.computeAddonPricing({
@@ -794,12 +1093,14 @@ exports.createAddonOrder = async (req, res) => {
       amountInPaise: order.amount,
       currency: order.currency,
       keyId: process.env.RAZORPAY_KEY_ID,
+      instantEntries: addonPlan.instantEntries,
     });
   } catch (err) {
     console.error("Add-on order error:", err);
-    res
-      .status(500)
-      .json({ success: false, message: "Could not create add-on order" });
+    res.status(err.statusCode || 500).json({
+      success: false,
+      message: err.message || "Could not create add-on order",
+    });
   }
 };
 
@@ -862,6 +1163,24 @@ exports.verifyAddonPayment = async (req, res) => {
         bookingId: booking._id,
       });
     }
+    const priorRefund = (booking.addonTopupRefunds || []).find(
+      (entry) => entry.paymentId === razorpay_payment_id,
+    );
+    if (priorRefund) {
+      return res.status(priorRefund.status === "REFUNDED" ? 409 : 500).json({
+        success: false,
+        paymentRefunded: priorRefund.status === "REFUNDED",
+        refundId: priorRefund.refundId || "",
+        code:
+          priorRefund.status === "REFUNDED"
+            ? "ADDON_PAYMENT_REFUNDED"
+            : "ADDON_REFUND_REQUIRES_RECONCILIATION",
+        message:
+          priorRefund.status === "REFUNDED"
+            ? "This add-on payment was refunded because the booking window closed."
+            : "This add-on payment is awaiting refund reconciliation.",
+      });
+    }
 
     // Confirm the captured amount matches the order
     try {
@@ -901,6 +1220,36 @@ exports.verifyAddonPayment = async (req, res) => {
       });
     }
 
+    // Revalidate at verification time. If eligibility changed while Razorpay
+    // checkout was open, refund the captured amount instead of leaving a paid
+    // customer without either the add-on or their money.
+    let addonPlan;
+    try {
+      addonPlan = buildAddonBookingPlan({
+        booking,
+        pkg,
+        addonDays: cleanDays,
+      });
+    } catch (eligibilityError) {
+      const refundResult = await refundIneligibleAddonPayment({
+        booking,
+        order,
+        paymentId: razorpay_payment_id,
+        reason: eligibilityError.message,
+      });
+      return res.status(refundResult.refunded ? 409 : 500).json({
+        success: false,
+        paymentRefunded: refundResult.refunded,
+        refundId: refundResult.refundId || "",
+        code: refundResult.refunded
+          ? "ADDON_PAYMENT_REFUNDED"
+          : "ADDON_REFUND_REQUIRES_RECONCILIATION",
+        message: refundResult.refunded
+          ? `${eligibilityError.message} Your payment has been refunded.`
+          : `${eligibilityError.message} Your payment was received, but the automatic refund needs support review.`,
+      });
+    }
+
     const { addonSurcharge, addonTotalPrice, gstOnAddon } =
       await tripBookingController.computeAddonPricing({
         pkg,
@@ -917,18 +1266,34 @@ exports.verifyAddonPayment = async (req, res) => {
     booking.addonDays = mergedDays;
     booking.markModified("addonDays");
 
-    // Merge schedule (user-chosen time/place per day), if provided
-    if (req.body.addonSchedule && typeof req.body.addonSchedule === "object") {
-      const sched = { ...(booking.addonSchedule || {}) };
-      for (const name of Object.keys(req.body.addonSchedule)) {
-        sched[name] = {
-          ...(sched[name] || {}),
-          ...req.body.addonSchedule[name],
-        };
+    // Merge only schedules for the paid addon-days. Same-day entries always
+    // use the server-built operator schedule and cannot be overridden by the
+    // client; future scheduled entries retain the existing custom schedule.
+    const sched = { ...(booking.addonSchedule || {}) };
+    const requestedSchedule =
+      req.body.addonSchedule && typeof req.body.addonSchedule === "object"
+        ? req.body.addonSchedule
+        : {};
+    for (const [name, days] of Object.entries(cleanDays)) {
+      sched[name] = { ...(sched[name] || {}) };
+      for (const dayIdx of days) {
+        const key = `${name}_${dayIdx}`;
+        const fixedSchedule = addonPlan.schedule?.[name]?.[dayIdx];
+        if (addonPlan.bookingTypes[key] === "instant") {
+          sched[name][dayIdx] = fixedSchedule;
+        } else if (requestedSchedule?.[name]?.[dayIdx]) {
+          sched[name][dayIdx] = requestedSchedule[name][dayIdx];
+        }
       }
-      booking.addonSchedule = sched;
-      booking.markModified("addonSchedule");
     }
+    booking.addonSchedule = sched;
+    booking.markModified("addonSchedule");
+
+    booking.addonBookingTypes = {
+      ...(booking.addonBookingTypes || {}),
+      ...addonPlan.bookingTypes,
+    };
+    booking.markModified("addonBookingTypes");
 
     booking.addonNames = Object.keys(mergedDays);
     booking.addonSurcharge = (booking.addonSurcharge || 0) + addonSurcharge;
@@ -950,6 +1315,19 @@ exports.verifyAddonPayment = async (req, res) => {
     booking.addonDispatched = false;
     booking.addonTopupPaymentIds.push(razorpay_payment_id);
     await booking.save();
+
+    // Same-day instant add-ons are sent immediately after payment. The existing
+    // five-minute cron calls the same idempotent dispatcher as a retry safety net.
+    let dispatchResult = null;
+    try {
+      const { runSnapjaDispatch } = require("./cronController");
+      dispatchResult = await runSnapjaDispatch(booking._id);
+    } catch (dispatchError) {
+      console.error(
+        `[verifyAddonPayment] Immediate Snapja dispatch failed for ${booking.bookingId}:`,
+        dispatchError.message,
+      );
+    }
 
     // Notify operator + admin
     try {
@@ -973,10 +1351,12 @@ exports.verifyAddonPayment = async (req, res) => {
       success: true,
       message: "Add-ons added to your booking",
       bookingId: booking._id,
+      dispatched: Boolean(dispatchResult?.dispatched),
+      dispatchErrors: dispatchResult?.errors || [],
     });
   } catch (err) {
     console.error("[verifyAddonPayment] Error:", err.message);
-    res.status(500).json({
+    res.status(err.statusCode || 500).json({
       success: false,
       message: err.message || "Add-on verification failed",
     });

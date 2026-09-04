@@ -21,6 +21,34 @@ const userSchema = new mongoose.Schema(
       unique: true,
       sparse: true,
     },
+    phoneVerifiedAt: {
+      type: Date,
+      default: null,
+    },
+    phoneVerificationSource: {
+      type: String,
+      enum: [
+        "otp_signup",
+        "otp_login",
+        "authenticated_link",
+        "authenticated_change",
+        "legacy_otp_signup",
+        "legacy_audited_otp",
+        null,
+      ],
+      default: null,
+    },
+    // Email ownership. Existing accounts have never proven their address, so
+    // this stays null until they complete a verified email change.
+    emailVerifiedAt: {
+      type: Date,
+      default: null,
+    },
+    emailVerificationSource: {
+      type: String,
+      enum: ["authenticated_change", null],
+      default: null,
+    },
     password: {
       type: String,
       minlength: 6,

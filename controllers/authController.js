@@ -1,3 +1,5 @@
+const crypto = require("crypto");
+const mongoose = require("mongoose");
 const jwt = require("jsonwebtoken");
 const User = require("../models/User");
 const Otp = require("../models/Otp");
@@ -12,10 +14,12 @@ const OTP_TTL_MINUTES = 5;
 const OTP_MAX_ATTEMPTS = 5;
 const OTP_RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
 const OTP_RATE_LIMIT_MAX = 3; // max OTP requests per phone per window
+const PHONE_LINK_RESEND_SECONDS = 30;
+const PHONE_LINK_PURPOSE = "phone_link";
 
 function generateOtp() {
   // 6-digit numeric OTP
-  return String(Math.floor(100000 + Math.random() * 900000));
+  return String(crypto.randomInt(100000, 1000000));
 }
 
 function normalizePhone(p) {
@@ -24,15 +28,186 @@ function normalizePhone(p) {
     .trim();
 }
 
+function normalizeIndianPhone(p) {
+  let phone = normalizePhone(p);
+  if (phone.length === 12 && phone.startsWith("91")) phone = phone.slice(2);
+  if (phone.length === 11 && phone.startsWith("0")) phone = phone.slice(1);
+  return /^\d{10}$/.test(phone) ? phone : null;
+}
+
+function hashPhoneLinkCode({ challengeId, userId, phone, code }) {
+  const secret = process.env.PHONE_LINK_OTP_SECRET || process.env.JWT_SECRET;
+  if (!secret) throw new Error("Phone-link OTP secret is not configured");
+  return crypto
+    .createHmac("sha256", secret)
+    .update(`${PHONE_LINK_PURPOSE}:${userId}:${phone}:${challengeId}:${code}`)
+    .digest("hex");
+}
+
+function constantTimeHashEqual(expectedHex, actualHex) {
+  const expected = Buffer.alloc(32);
+  const decoded = Buffer.from(String(expectedHex || ""), "hex");
+  decoded.copy(expected, 0, 0, Math.min(decoded.length, expected.length));
+  const actual = Buffer.from(actualHex, "hex");
+  return (
+    decoded.length === expected.length &&
+    actual.length === expected.length &&
+    crypto.timingSafeEqual(expected, actual)
+  );
+}
+
+function phoneLinkError(code) {
+  const error = new Error(code);
+  error.phoneLinkCode = code;
+  return error;
+}
+
+function isSameVerifiedPhone(user, phone) {
+  return Boolean(user?.phoneVerifiedAt && user.phone === phone);
+}
+
+function isTransactionUnsupported(error) {
+  return (
+    error?.code === 20 ||
+    error?.codeName === "IllegalOperation" ||
+    /transaction numbers are only allowed|replica set/i.test(
+      error?.message || "",
+    )
+  );
+}
+
+async function claimPhoneLinkChallenge(challenge, consumedAt, session) {
+  return Otp.findOneAndUpdate(
+    {
+      _id: challenge._id,
+      userId: challenge.userId,
+      purpose: PHONE_LINK_PURPOSE,
+      phone: challenge.phone,
+      active: true,
+      consumedAt: null,
+      invalidatedAt: null,
+      expiresAt: { $gt: consumedAt },
+      attempts: { $lt: OTP_MAX_ATTEMPTS },
+    },
+    { $set: { active: false, consumedAt } },
+    { new: true, session },
+  );
+}
+
+async function updateUserForPhoneLink(userId, phone, verifiedAt, session) {
+  return User.findOneAndUpdate(
+    { _id: userId, phoneVerifiedAt: null },
+    {
+      $set: {
+        phone,
+        phoneVerifiedAt: verifiedAt,
+        phoneVerificationSource: "authenticated_link",
+      },
+    },
+    { new: true, runValidators: true, session },
+  ).select("+password");
+}
+
+async function resolvePhoneLinkOwner(userId, phone, session) {
+  const user = await User.findById(userId)
+    .session(session || null)
+    .select("+password");
+  if (isSameVerifiedPhone(user, phone)) return user;
+  throw phoneLinkError("PHONE_LINK_CONFLICT");
+}
+
+async function commitPhoneLinkInTransaction(challenge, userId) {
+  const session = await mongoose.startSession();
+  const verifiedAt = new Date();
+  try {
+    session.startTransaction();
+    const claimed = await claimPhoneLinkChallenge(
+      challenge,
+      verifiedAt,
+      session,
+    );
+    if (!claimed) throw phoneLinkError("INVALID_PHONE_LINK_CHALLENGE");
+
+    let user = await updateUserForPhoneLink(
+      userId,
+      challenge.phone,
+      verifiedAt,
+      session,
+    );
+    if (!user) {
+      user = await resolvePhoneLinkOwner(userId, challenge.phone, session);
+    }
+
+    await session.commitTransaction();
+    return user;
+  } catch (error) {
+    if (session.inTransaction()) await session.abortTransaction();
+    if (!isTransactionUnsupported(error)) throw error;
+  } finally {
+    await session.endSession();
+  }
+
+  // Standalone Mongo deployments do not support transactions. Keep both writes
+  // individually atomic, and release the challenge claim if the user update fails.
+  const claimedAt = new Date();
+  const claimed = await claimPhoneLinkChallenge(challenge, claimedAt);
+  if (!claimed) throw phoneLinkError("INVALID_PHONE_LINK_CHALLENGE");
+  try {
+    let user = await updateUserForPhoneLink(userId, challenge.phone, claimedAt);
+    if (!user) user = await resolvePhoneLinkOwner(userId, challenge.phone);
+    return user;
+  } catch (error) {
+    await Otp.updateOne(
+      { _id: challenge._id, consumedAt: claimedAt, active: false },
+      { $set: { active: true }, $unset: { consumedAt: "" } },
+    ).catch(() => {});
+    throw error;
+  }
+}
+
+// Exported so the contact-change controller returns an identical user shape.
+exports.publicUser = (user) => publicUser(user);
+
 function publicUser(user) {
+  const phone = user.phone || null;
+  const phoneVerifiedAt = user.phoneVerifiedAt
+    ? new Date(user.phoneVerifiedAt).toISOString()
+    : null;
+  const phoneVerified = Boolean(phone && phoneVerifiedAt);
+  const emailVerifiedAt = user.emailVerifiedAt
+    ? new Date(user.emailVerifiedAt).toISOString()
+    : null;
+  const emailVerified = Boolean(user.email && emailVerifiedAt);
+  const authProvider = user.googleId
+    ? "google"
+    : user.password
+      ? "password"
+      : "otp";
+
   return {
     _id: user._id,
     name: user.name,
     email: user.email,
-    phone: user.phone,
+    phone,
     role: user.role,
     status: user.status,
     avatar: user.avatar,
+    profileImage: user.profileImage,
+    state: user.state,
+    country: user.country,
+    tripsCount: user.tripsCount,
+    createdAt: user.createdAt,
+    updatedAt: user.updatedAt,
+    phoneVerified,
+    phoneVerifiedAt,
+    emailVerified,
+    emailVerifiedAt,
+    // A Google account authenticates by its Google address, so that email is
+    // not editable in the app.
+    emailChangeable: !user.googleId,
+    authProvider,
+    requiresPhoneCompletion: authProvider === "google" && !phoneVerified,
+    verificationStateVersion: 1,
   };
 }
 
@@ -104,8 +279,8 @@ exports.login = async (req, res) => {
 // GET /api/auth/me
 exports.getMe = async (req, res) => {
   try {
-    const user = await User.findById(req.user.id);
-    res.json({ success: true, user });
+    const user = await User.findById(req.user.id).select("+password");
+    res.json({ success: true, user: publicUser(user) });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -289,6 +464,8 @@ exports.signupVerifyOtp = async (req, res) => {
       phone,
       state: state || "",
       country: country || "India",
+      phoneVerifiedAt: new Date(),
+      phoneVerificationSource: "otp_signup",
     });
     await record.deleteOne();
 
@@ -422,7 +599,7 @@ exports.loginVerifyOtp = async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid OTP" });
     }
 
-    const user = await User.findOne({ phone });
+    const user = await User.findOne({ phone }).select("+password");
     if (!user) {
       await record.deleteOne();
       return res
@@ -435,6 +612,12 @@ exports.loginVerifyOtp = async (req, res) => {
       return res
         .status(403)
         .json({ success: false, message: "Your account has been suspended" });
+    }
+
+    if (!user.phoneVerifiedAt) {
+      user.phoneVerifiedAt = new Date();
+      user.phoneVerificationSource = "otp_login";
+      await user.save();
     }
 
     await record.deleteOne();
@@ -451,12 +634,309 @@ exports.loginVerifyOtp = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Authenticated phone linking
+// ─────────────────────────────────────────────────────────────────────────────
+
+// POST /api/auth/phone-link/send-otp (protected)
+// Body: { phone }
+exports.phoneLinkSendOtp = async (req, res) => {
+  try {
+    const phone = normalizeIndianPhone(req.body.phone);
+    if (!phone) {
+      return res.status(400).json({
+        success: false,
+        message: "Please enter a valid 10-digit phone number.",
+      });
+    }
+
+    const user = await User.findById(req.user.id);
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Not authorized.",
+      });
+    }
+    if (user.phoneVerifiedAt) {
+      return res.status(409).json({
+        success: false,
+        message: "A verified phone is already linked to this account.",
+      });
+    }
+
+    const phoneOwner = await User.exists({
+      phone,
+      _id: { $ne: user._id },
+    });
+    if (phoneOwner) {
+      return res.status(409).json({
+        success: false,
+        message: "This phone number cannot be linked to this account.",
+      });
+    }
+
+    const now = new Date();
+    const windowStart = new Date(now.getTime() - OTP_RATE_LIMIT_WINDOW_MS);
+    const [recentForUser, recentForPhone, latestForUser] = await Promise.all([
+      Otp.countDocuments({
+        purpose: PHONE_LINK_PURPOSE,
+        userId: user._id,
+        createdAt: { $gte: windowStart },
+      }),
+      Otp.countDocuments({
+        purpose: PHONE_LINK_PURPOSE,
+        phone,
+        createdAt: { $gte: windowStart },
+      }),
+      Otp.findOne({ purpose: PHONE_LINK_PURPOSE, userId: user._id })
+        .sort({ createdAt: -1 })
+        .select("resendAvailableAt"),
+    ]);
+
+    if (
+      recentForUser >= OTP_RATE_LIMIT_MAX ||
+      recentForPhone >= OTP_RATE_LIMIT_MAX
+    ) {
+      return res.status(429).json({
+        success: false,
+        message: "Too many verification requests. Please try again later.",
+      });
+    }
+
+    if (latestForUser?.resendAvailableAt > now) {
+      const resendAfter = Math.max(
+        1,
+        Math.ceil(
+          (latestForUser.resendAvailableAt.getTime() - now.getTime()) / 1000,
+        ),
+      );
+      return res.status(429).json({
+        success: false,
+        message: "Please wait before requesting another verification code.",
+        resendAfter,
+      });
+    }
+
+    await Otp.updateMany(
+      {
+        purpose: PHONE_LINK_PURPOSE,
+        userId: user._id,
+        active: true,
+      },
+      { $set: { active: false, invalidatedAt: now } },
+    );
+
+    const challengeId = crypto.randomUUID();
+    const code = generateOtp();
+    const expiresAt = new Date(now.getTime() + OTP_TTL_MINUTES * 60 * 1000);
+    const resendAvailableAt = new Date(
+      now.getTime() + PHONE_LINK_RESEND_SECONDS * 1000,
+    );
+    const codeHash = hashPhoneLinkCode({
+      challengeId,
+      userId: user._id,
+      phone,
+      code,
+    });
+
+    const challenge = await Otp.create({
+      phone,
+      purpose: PHONE_LINK_PURPOSE,
+      userId: user._id,
+      challengeId,
+      codeHash,
+      active: true,
+      expiresAt,
+      resendAvailableAt,
+    });
+
+    const { sendOtpSms } = require("../utils/sendSms");
+    let smsResult;
+    try {
+      smsResult = await sendOtpSms(phone, code);
+    } catch {
+      smsResult = { success: false };
+    }
+    if (!smsResult.success && process.env.OTP_DEV_MODE !== "true") {
+      await Otp.updateOne(
+        { _id: challenge._id, active: true },
+        { $set: { active: false, invalidatedAt: new Date() } },
+      );
+      console.error("[PHONE_LINK] SMS delivery failed");
+      return res.status(503).json({
+        success: false,
+        message: "Unable to send a verification code. Please try again.",
+      });
+    }
+
+    if (process.env.OTP_DEV_MODE === "true") {
+      console.log(`[DEV] Phone-link OTP for ${phone}: ${code}`);
+    }
+
+    const response = {
+      success: true,
+      challengeId,
+      expiresIn: OTP_TTL_MINUTES * 60,
+      resendAfter: PHONE_LINK_RESEND_SECONDS,
+    };
+    if (process.env.OTP_DEV_MODE === "true") response.otp = code;
+    return res.json(response);
+  } catch (error) {
+    if (error?.code === 11000) {
+      return res.status(429).json({
+        success: false,
+        message: "Please wait before requesting another verification code.",
+      });
+    }
+    return res.status(500).json({
+      success: false,
+      message: "Unable to send a verification code. Please try again.",
+    });
+  }
+};
+
+// POST /api/auth/phone-link/verify (protected)
+// Body: { challengeId, code }
+exports.phoneLinkVerify = async (req, res) => {
+  try {
+    const challengeId = String(req.body.challengeId || "").trim();
+    const code = String(req.body.code || "").trim();
+    if (!challengeId || !code) {
+      return res.status(400).json({
+        success: false,
+        message: "Challenge and verification code are required.",
+      });
+    }
+
+    const challenge = await Otp.findOne({
+      challengeId,
+      userId: req.user.id,
+      purpose: PHONE_LINK_PURPOSE,
+    }).select("+codeHash");
+    if (!challenge) {
+      return res.status(400).json({
+        success: false,
+        message: "Verification challenge is invalid or expired.",
+      });
+    }
+
+    const currentUser = await User.findById(req.user.id).select("+password");
+    if (challenge.consumedAt) {
+      if (isSameVerifiedPhone(currentUser, challenge.phone)) {
+        return res.json({ success: true, user: publicUser(currentUser) });
+      }
+      return res.status(400).json({
+        success: false,
+        message: "Verification challenge is invalid or expired.",
+      });
+    }
+
+    const now = new Date();
+    if (
+      !challenge.active ||
+      challenge.invalidatedAt ||
+      challenge.expiresAt <= now ||
+      challenge.attempts >= OTP_MAX_ATTEMPTS
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Verification challenge is invalid or expired.",
+      });
+    }
+
+    const submittedHash = hashPhoneLinkCode({
+      challengeId,
+      userId: req.user.id,
+      phone: challenge.phone,
+      code,
+    });
+    if (!constantTimeHashEqual(challenge.codeHash, submittedHash)) {
+      await Otp.updateOne(
+        {
+          _id: challenge._id,
+          active: true,
+          consumedAt: null,
+          invalidatedAt: null,
+          expiresAt: { $gt: now },
+          attempts: { $lt: OTP_MAX_ATTEMPTS },
+        },
+        { $inc: { attempts: 1 } },
+      );
+      return res.status(400).json({
+        success: false,
+        message: "Invalid verification code.",
+      });
+    }
+
+    if (currentUser?.phoneVerifiedAt) {
+      if (isSameVerifiedPhone(currentUser, challenge.phone)) {
+        await Otp.updateOne(
+          { _id: challenge._id, active: true, consumedAt: null },
+          { $set: { active: false, consumedAt: now } },
+        );
+        return res.json({ success: true, user: publicUser(currentUser) });
+      }
+      await Otp.updateOne(
+        { _id: challenge._id, active: true },
+        { $set: { active: false, invalidatedAt: now } },
+      );
+      return res.status(409).json({
+        success: false,
+        message: "A verified phone is already linked to this account.",
+      });
+    }
+
+    const user = await commitPhoneLinkInTransaction(challenge, req.user.id);
+    return res.json({ success: true, user: publicUser(user) });
+  } catch (error) {
+    if (
+      error?.code === 11000 ||
+      error?.phoneLinkCode === "PHONE_LINK_CONFLICT"
+    ) {
+      return res.status(409).json({
+        success: false,
+        message: "This phone number cannot be linked to this account.",
+      });
+    }
+    if (error?.phoneLinkCode === "INVALID_PHONE_LINK_CHALLENGE") {
+      return res.status(400).json({
+        success: false,
+        message: "Verification challenge is invalid or expired.",
+      });
+    }
+    return res.status(500).json({
+      success: false,
+      message: "Unable to verify this phone number. Please try again.",
+    });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Profile (mobile user self-service)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// PATCH /api/profile  — update own name / email / phone / state
+// PATCH /api/profile  — update own non-identity profile fields
 exports.updateProfile = async (req, res) => {
   try {
+    const identityFields = [
+      "phone",
+      "phoneVerified",
+      "phoneVerifiedAt",
+      "phoneVerificationSource",
+      "verificationSource",
+      "source",
+    ];
+    if (
+      identityFields.some((field) =>
+        Object.prototype.hasOwnProperty.call(req.body, field),
+      )
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Phone identity fields cannot be updated through the profile endpoint.",
+      });
+    }
+
     const { name, state, country } = req.body;
     const update = {};
 
@@ -465,37 +945,11 @@ exports.updateProfile = async (req, res) => {
     if (typeof country !== "undefined")
       update.country = (country || "India").trim();
 
-    // Email and phone are identity fields — cannot be changed without re-verification.
-    // Exception: Google users can SET phone once (it starts empty).
-    const { phone } = req.body;
-    if (phone && String(phone).trim()) {
-      const currentUser = await User.findById(req.user.id).select("phone");
-      if (!currentUser.phone) {
-        // First-time phone setup (Google user) — allow it
-        const p = String(phone).replace(/\D/g, "").trim();
-        if (p.length === 10) {
-          const conflict = await User.findOne({
-            phone: p,
-            _id: { $ne: req.user.id },
-          });
-          if (conflict) {
-            return res.status(400).json({
-              success: false,
-              message:
-                "This phone number is already linked to another account.",
-            });
-          }
-          update.phone = p;
-        }
-      }
-      // If phone already exists, silently ignore (locked)
-    }
-
     const user = await User.findByIdAndUpdate(req.user.id, update, {
       new: true,
       runValidators: true,
-    });
-    res.json({ success: true, user });
+    }).select("+password");
+    res.json({ success: true, user: publicUser(user) });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -520,8 +974,12 @@ exports.uploadAvatar = async (req, res) => {
       req.user.id,
       { avatar: avatarPath },
       { new: true },
-    );
-    res.json({ success: true, avatar: avatarPath, user });
+    ).select("+password");
+    res.json({
+      success: true,
+      avatar: avatarPath,
+      user: publicUser(user),
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -586,7 +1044,7 @@ exports.googleLogin = async (req, res) => {
     // Find existing user by email or googleId
     let user = await User.findOne({
       $or: [{ email: email.toLowerCase() }, { googleId }],
-    });
+    }).select("+password");
 
     if (user) {
       // Link Google account if not already linked
@@ -618,16 +1076,8 @@ exports.googleLogin = async (req, res) => {
     res.json({
       success: true,
       token,
-      user: {
-        _id: user._id,
-        name: user.name,
-        email: user.email,
-        phone: user.phone,
-        profileImage: user.profileImage,
-        state: user.state,
-        country: user.country,
-      },
-      isNewUser: !user.phone, // hint to app: show "add phone" prompt if no phone
+      user: publicUser(user),
+      isNewUser: !user.phone, // compatibility hint for the current app
     });
   } catch (err) {
     console.error("Google login error:", err.message);

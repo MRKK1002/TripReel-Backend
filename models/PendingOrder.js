@@ -31,6 +31,9 @@ const pendingOrderSchema = new mongoose.Schema(
     // Set once a booking has been created from this order (idempotency)
     bookingId: { type: mongoose.Schema.Types.ObjectId, ref: "TripBooking" },
     completedAt: { type: Date },
+    // Audit fields for provider-confirmed abandoned checkout attempts.
+    expiredAt: { type: Date },
+    expirationReason: { type: String },
   },
   { timestamps: true },
 );

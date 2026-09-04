@@ -13,14 +13,19 @@ const {
   adminRetryRefund,
   adminMarkRefundDone,
   syncSnapjaStatus,
+  confirmSnapjaDelivery,
 } = require("../controllers/tripBookingController");
-const { protect, restrictTo } = require("../middleware/authMiddleware");
+const {
+  protect,
+  requireVerifiedPhone,
+  restrictTo,
+} = require("../middleware/authMiddleware");
 const { operatorProtect } = require("../middleware/operatorAuthMiddleware");
 
 // ── User (requires login) ─────────────────────────────────────────────────────
 router.use(protect);
 
-router.post("/", createBooking);
+router.post("/", requireVerifiedPhone, createBooking);
 router.get("/my", getMyBookings);
 
 // ── Admin refunds (must be before /:id to avoid route clash) ──────────────────
@@ -35,6 +40,7 @@ router.post(
 router.get("/:id", getBookingById);
 router.get("/:id/refund-preview", getRefundPreview);
 router.get("/:id/sync-snapja", syncSnapjaStatus);
+router.post("/:id/snapja/:entryKey/confirm-delivery", confirmSnapjaDelivery);
 router.post("/:id/cancel", cancelBooking);
 
 // ── Admin ─────────────────────────────────────────────────────────────────────

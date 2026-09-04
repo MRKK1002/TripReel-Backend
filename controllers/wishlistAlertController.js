@@ -27,10 +27,10 @@ async function alertWishlistedUsers(packageId, title, body, data = {}) {
       if (todayCount >= 2) continue;
 
       notifyUser(userId, title, body, {
+        ...data,
         type: "offer",
         packageId: packageId.toString(),
-        screen: "PackageDetail",
-        ...data,
+        screen: "DestinationDetail",
       });
       sent++;
     }

@@ -49,13 +49,13 @@ exports.recordIntent = async (req, res) => {
       };
     }
 
-    await BookingIntent.findOneAndUpdate(
+    const intent = await BookingIntent.findOneAndUpdate(
       { userId: req.user._id, packageId },
       { $set: set },
       { upsert: true, new: true, setDefaultsOnInsert: true },
     );
 
-    res.json({ success: true });
+    res.json({ success: true, intentId: intent._id.toString() });
   } catch (err) {
     // Non-critical — never block the booking screen on this
     res.status(200).json({ success: false, message: err.message });

@@ -98,10 +98,23 @@ exports.adminSendNotification = async (req, res) => {
   }
 };
 
+const PERSISTED_USER_NOTIFICATION_SCREENS = new Set([
+  "DestinationDetail",
+  "BookingDetails",
+  "ReviewScreen",
+  "MyTrip",
+  "ResumeBooking",
+]);
+
 // ── Helper: send booking notification to a user + save to DB ─────────────────
 exports.notifyUser = async (userId, title, body, data = {}) => {
   try {
-    // Save to DB
+    const screen = PERSISTED_USER_NOTIFICATION_SCREENS.has(data.screen)
+      ? data.screen
+      : undefined;
+
+    // Persist only the routing contract consumed by the app. The complete data
+    // object still goes to Firebase so non-routing delivery behavior is unchanged.
     await Notification.create({
       recipientId: userId,
       recipientType: "user",
@@ -110,6 +123,9 @@ exports.notifyUser = async (userId, title, body, data = {}) => {
       type: data.type || "general",
       bookingId: data.bookingId || undefined,
       packageId: data.packageId || undefined,
+      screen,
+      intentId:
+        screen === "ResumeBooking" ? data.intentId || undefined : undefined,
     });
     // Push notification
     const user = await User.findById(userId).select("fcmToken");

@@ -180,19 +180,33 @@ app.use("/uploads/operators", (req, res) => {
 });
 
 // Static folder for public uploaded images and videos (packages, banners, etc.)
+// Uploaded files are content-addressed by a timestamped name and never rewritten,
+// so they can be cached aggressively. This avoids re-downloading reel video on
+// every view, which is the main cause of slow playback starts.
 app.use(
   "/uploads",
   (req, res, next) => {
     res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
     next();
   },
-  express.static(path.join(__dirname, "uploads")),
+  express.static(path.join(__dirname, "uploads"), {
+    acceptRanges: true,
+    etag: true,
+    lastModified: true,
+  }),
 );
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 // Auth — stricter limits; OTP send endpoints get their own even tighter limiter
 app.use("/api/auth/signup/send-otp", otpSendLimiter);
 app.use("/api/auth/login/send-otp", otpSendLimiter);
+app.use("/api/auth/phone-link/send-otp", otpSendLimiter);
+// Every step that dispatches a code is throttled like any other OTP sender.
+app.use("/api/auth/phone-change/start", otpSendLimiter);
+app.use("/api/auth/phone-change/send-new-otp", otpSendLimiter);
+app.use("/api/auth/email-change/start", otpSendLimiter);
+app.use("/api/auth/email-change/send-new-otp", otpSendLimiter);
 app.use("/api/auth", authLimiter);
 app.use("/api/auth", require("./routes/authRoutes"));
 app.use("/api/profile", require("./routes/profileRoutes"));

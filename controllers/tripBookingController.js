@@ -230,6 +230,9 @@ async function computeAuthoritativePricing({
   // Coupon (read-only — no usage increment here)
   const code = (couponCode || "").trim().toUpperCase();
   let discountAmount = 0;
+  // When a code was supplied but cannot be honoured, the caller must be told
+  // instead of silently charging full price.
+  let couponIssue = null;
   const fareSubtotalRaw = Math.round(
     adultPrice * numAdults + (childPrice || 0) * numChildren,
   );
@@ -246,7 +249,9 @@ async function computeAuthoritativePricing({
       validFrom: { $lte: now },
       validUntil: { $gte: now },
     });
-    if (coupon) {
+    if (!coupon) {
+      couponIssue = "This coupon is no longer valid.";
+    } else {
       const withinUsage =
         coupon.usageLimit === 0 || coupon.usedCount < coupon.usageLimit;
       const meetsGuests =
@@ -261,6 +266,14 @@ async function computeAuthoritativePricing({
         } else {
           discountAmount = Math.min(coupon.value, fareSubtotalRaw);
         }
+      } else if (!withinUsage) {
+        couponIssue = "This coupon has reached its usage limit.";
+      } else if (!meetsGuests) {
+        couponIssue = `This coupon needs at least ${coupon.minGuests} travellers.`;
+      } else {
+        couponIssue = `This coupon needs a minimum order of ₹${coupon.minOrderAmount.toLocaleString(
+          "en-IN",
+        )}.`;
       }
     }
   }
@@ -279,7 +292,12 @@ async function computeAuthoritativePricing({
       fareSubtotal: fareSubtotalRaw,
       numSeats,
     });
-    if (res.ok) platformDiscountAmount = res.discount;
+    if (res.ok) {
+      platformDiscountAmount = res.discount;
+      couponIssue = null;
+    } else {
+      couponIssue = res.reason || "This coupon is no longer valid.";
+    }
   }
 
   const pricing = calcPricing({
@@ -295,7 +313,8 @@ async function computeAuthoritativePricing({
     discountAmount,
     platformDiscountAmount,
   });
-  return pricing.totalAmount;
+  // `couponIssue` is set only when a code was supplied and could not be applied.
+  return { totalAmount: pricing.totalAmount, couponIssue };
 }
 exports.computeAuthoritativePricing = computeAuthoritativePricing;
 
@@ -1322,7 +1341,10 @@ exports.createBooking = async (req, res) => {
 exports.getMyBookings = async (req, res) => {
   try {
     const bookings = await TripBooking.find({ userId: req.user._id })
-      .populate("packageId", "title location image_url avgRating")
+      .populate(
+        "packageId",
+        "title location image_url avgRating itinerary addons outsideCityCharge",
+      )
       .populate(
         "batchId",
         "startDate endDate adultPrice totalSeats bookedSeats label",
@@ -1339,7 +1361,10 @@ exports.getMyBookings = async (req, res) => {
 exports.getBookingById = async (req, res) => {
   try {
     const booking = await TripBooking.findById(req.params.id)
-      .populate("packageId", "title location image_url")
+      .populate(
+        "packageId",
+        "title location image_url itinerary addons outsideCityCharge",
+      )
       .populate("batchId")
       .populate("userId", "name email phone")
       .populate("operatorId", "businessName contactName email");
@@ -2225,7 +2250,10 @@ exports.syncSnapjaStatus = async (req, res) => {
         .json({ success: false, message: "Not authorized" });
     }
 
-    if (!booking.addonDispatched || !booking.snapjaBookings) {
+    const hasSnapjaEntries = Object.values(booking.snapjaBookings || {}).some(
+      (entry) => entry?.bookingId,
+    );
+    if (!hasSnapjaEntries) {
       return res.json({
         success: true,
         updated: false,
@@ -2341,5 +2369,125 @@ exports.syncSnapjaStatus = async (req, res) => {
     res.json({ success: true, updated, snapjaBookings });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// ── Confirm one Snapja add-on delivery for the owning TripReel customer ──────
+// POST /api/trip-bookings/:id/snapja/:entryKey/confirm-delivery
+exports.confirmSnapjaDelivery = async (req, res) => {
+  try {
+    const booking = await TripBooking.findById(req.params.id);
+    if (!booking) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Booking not found" });
+    }
+    if (String(booking.userId) !== String(req.user._id)) {
+      return res
+        .status(403)
+        .json({ success: false, message: "Not authorized" });
+    }
+
+    const entryKey = req.params.entryKey;
+    const snapjaBookings = { ...(booking.snapjaBookings || {}) };
+    const snap = snapjaBookings[entryKey];
+    if (!snap?.bookingId) {
+      return res.status(404).json({
+        success: false,
+        message: "Snapja add-on booking was not found",
+      });
+    }
+    if (snap.customerConfirmed) {
+      return res.json({
+        success: true,
+        duplicate: true,
+        entryKey,
+        snapjaBooking: snap,
+        message: "Delivery was already confirmed",
+      });
+    }
+
+    const snapjaApi =
+      process.env.SNAPJA_API_URL ||
+      "https://api.snapja.com/api/tripreel/bookings";
+    const liveResponse = await fetch(
+      `${snapjaApi}/${encodeURIComponent(snap.bookingId)}`,
+      { headers: { "X-API-Key": process.env.SNAPJA_API_KEY } },
+    );
+    const liveData = await liveResponse.json().catch(() => ({}));
+    if (!liveResponse.ok || !liveData.booking) {
+      return res.status(502).json({
+        success: false,
+        message: "Could not verify the latest Snapja delivery status",
+      });
+    }
+
+    const liveBooking = liveData.booking;
+    const liveStatus = String(liveBooking.status || "").toLowerCase();
+    const liveDeliverables = Array.isArray(liveBooking.deliverables)
+      ? liveBooking.deliverables
+      : [];
+    const confirmableStatuses = ["completed", "delivered", "done", "finished"];
+    if (!confirmableStatuses.includes(liveStatus)) {
+      return res.status(409).json({
+        success: false,
+        message: "The creator has not completed this add-on yet",
+      });
+    }
+    if (liveDeliverables.length === 0) {
+      return res.status(409).json({
+        success: false,
+        message: "No deliverables are available to confirm yet",
+      });
+    }
+    const snapjaRes = await fetch(
+      `${snapjaApi}/${encodeURIComponent(snap.bookingId)}/confirm-delivery`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-API-Key": process.env.SNAPJA_API_KEY,
+        },
+        body: JSON.stringify({ source: "tripreel" }),
+      },
+    );
+    const snapjaData = await snapjaRes.json().catch(() => ({}));
+    if (!snapjaRes.ok || snapjaData.success === false) {
+      const unavailable = snapjaRes.status === 404;
+      return res.status(502).json({
+        success: false,
+        code: unavailable
+          ? "SNAPJA_CONFIRMATION_ENDPOINT_UNAVAILABLE"
+          : "SNAPJA_CONFIRMATION_FAILED",
+        message: unavailable
+          ? "Snapja delivery confirmation is not available on the connected API."
+          : snapjaData.message || "Snapja could not confirm delivery",
+      });
+    }
+
+    const now = new Date().toISOString();
+    snapjaBookings[entryKey] = {
+      ...snap,
+      deliverables: liveDeliverables,
+      status: snapjaData.booking?.status || "delivered",
+      customerConfirmed: true,
+      customerConfirmedAt: now,
+    };
+    booking.snapjaBookings = snapjaBookings;
+    booking.markModified("snapjaBookings");
+    await booking.save();
+
+    return res.json({
+      success: true,
+      entryKey,
+      snapjaBooking: snapjaBookings[entryKey],
+      message: "Delivery confirmed successfully",
+    });
+  } catch (err) {
+    console.error("[confirmSnapjaDelivery] Error:", err.message);
+    return res.status(500).json({
+      success: false,
+      message: err.message || "Could not confirm delivery",
+    });
   }
 };
