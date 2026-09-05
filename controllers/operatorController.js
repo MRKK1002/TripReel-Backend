@@ -8,7 +8,9 @@ const {
 const {
   collapseSpaces,
   validatePersonName,
-  validatePhoneIN,
+  normalizeOperatorPhone,
+  validatePhoneE164,
+  operatorPhoneVariants,
   validateAccountNumber,
   validateIfsc,
   validateUpi,
@@ -254,8 +256,38 @@ exports.transitionState = async (req, res) => {
       });
     }
 
-    // Don't approve while a document is still flagged as bad — otherwise the
-    // operator goes live with a rejected ID on file.
+    // Initial onboarding approval requires the two mandatory identity documents
+    // to exist and to have been explicitly approved. Legacy reinstatements from
+    // SUSPENDED are kept compatible because those operators may predate per-doc
+    // review metadata.
+    if (
+      newState === "APPROVED" &&
+      ["PENDING_APPROVAL", "CHANGES_REQUESTED", "REJECTED"].includes(
+        previousState,
+      )
+    ) {
+      const mandatoryDocuments = [
+        { key: "governmentId", path: "governmentId" },
+        { key: "panCard", path: "panCardPath" },
+      ];
+      const unapprovedMandatory = mandatoryDocuments
+        .filter(
+          ({ key, path }) =>
+            !operator[path] ||
+            operator.documentStatus?.[key]?.status !== "APPROVED",
+        )
+        .map(({ key }) => key);
+
+      if (unapprovedMandatory.length > 0) {
+        return res.status(400).json({
+          success: false,
+          message: `Cannot approve — mandatory documents must be uploaded and approved first: ${unapprovedMandatory.join(", ")}.`,
+        });
+      }
+    }
+
+    // Don't approve while any optional or mandatory document is still flagged
+    // as bad — otherwise the operator goes live with a rejected file on record.
     if (newState === "APPROVED") {
       const badDocs = Object.entries(
         operator.documentStatus?.toObject?.() || operator.documentStatus || {},
@@ -714,6 +746,7 @@ exports.submitOnboarding = async (req, res) => {
     };
 
     const destinations = parseList(mainOperatingDestinations);
+    const normalizedPhone = normalizeOperatorPhone(phone);
     const isCompany = ["TOUR_OPERATOR", "TRAVEL_AGENCY"].includes(businessType);
     const truthy = (v) => v === true || v === "true";
 
@@ -743,7 +776,7 @@ exports.submitOnboarding = async (req, res) => {
     // ── Full server-side validation of the 7-step form ─────────────────────
     const bad = firstError({
       contactName: validatePersonName(contactName, "Full name"),
-      phone: validatePhoneIN(phone),
+      phone: validatePhoneE164(normalizedPhone),
       businessName: isCompany
         ? validateBounded(
             businessName,
@@ -807,8 +840,25 @@ exports.submitOnboarding = async (req, res) => {
         .json({ success: false, field: bad.field, message: bad.message });
     }
 
+    const phoneChanged =
+      normalizeOperatorPhone(operator.phone) !== normalizedPhone;
+    if (phoneChanged) {
+      const duplicate = await Operator.findOne({
+        _id: { $ne: operator._id },
+        phone: { $in: operatorPhoneVariants(normalizedPhone) },
+      }).select("_id");
+      if (duplicate) {
+        return res.status(400).json({
+          success: false,
+          field: "phone",
+          message: "This phone number is already registered.",
+        });
+      }
+      operator.phoneVerified = false;
+    }
+
     operator.contactName = collapseSpaces(contactName);
-    operator.phone = String(phone).replace(/\D/g, "");
+    operator.phone = normalizedPhone;
     operator.businessName = collapseSpaces(businessName);
     operator.businessType = businessType;
     operator.country = collapseSpaces(country);

@@ -13,6 +13,22 @@ const walletTransactionSchema = new mongoose.Schema(
       ref: "TripBooking",
       default: null,
     },
+    // Stable business-event identity used by idempotent wallet credits.
+    eventKey: {
+      type: String,
+      trim: true,
+    },
+    purpose: {
+      type: String,
+      enum: [
+        "ESCROW_RELEASE",
+        "CANCELLATION_RETENTION",
+        "MANUAL_CREDIT",
+        "WITHDRAWAL_REVERSAL",
+        "",
+      ],
+      default: "",
+    },
     type: {
       type: String,
       enum: ["CREDIT", "DEBIT", "WITHDRAWAL"],
@@ -35,6 +51,14 @@ const walletTransactionSchema = new mongoose.Schema(
     },
   },
   { timestamps: true },
+);
+
+walletTransactionSchema.index(
+  { eventKey: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { eventKey: { $type: "string" } },
+  },
 );
 
 module.exports = mongoose.model("WalletTransaction", walletTransactionSchema);

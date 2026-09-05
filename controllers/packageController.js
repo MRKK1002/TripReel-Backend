@@ -258,6 +258,7 @@ exports.getAllPackages = async (req, res) => {
         { $sort: { nearbyScore: -1, popularityScore: -1, createdAt: -1 } },
         { $skip: skip },
         { $limit: Number(limit) },
+        { $project: { pendingRevision: 0 } },
       ]);
 
       const total = await Package.countDocuments(query);
@@ -279,7 +280,11 @@ exports.getAllPackages = async (req, res) => {
     const sort = sortMap[sortBy] || { createdAt: -1 };
 
     const [packages, total] = await Promise.all([
-      Package.find(query).skip(skip).limit(Number(limit)).sort(sort),
+      Package.find(query)
+        .select("-pendingRevision")
+        .skip(skip)
+        .limit(Number(limit))
+        .sort(sort),
       Package.countDocuments(query),
     ]);
 
@@ -388,7 +393,7 @@ exports.getPopularPackages = async (req, res) => {
       { $sort: { popularityScore: -1, createdAt: -1 } },
       { $limit: limit },
       // Clean up lookup fields
-      { $project: { _futureBatches: 0, _flexAvail: 0 } },
+      { $project: { _futureBatches: 0, _flexAvail: 0, pendingRevision: 0 } },
     ]);
 
     res.json({
@@ -401,10 +406,14 @@ exports.getPopularPackages = async (req, res) => {
   }
 };
 
-// GET /api/packages/:id  (public)
+// GET /api/packages/:id  (public — approved, active canonical content only)
 exports.getPackageById = async (req, res) => {
   try {
-    const pkg = await Package.findById(req.params.id);
+    const pkg = await Package.findOne({
+      _id: req.params.id,
+      status: "APPROVED",
+      isActive: true,
+    }).select("-pendingRevision");
     if (!pkg)
       return res
         .status(404)
@@ -417,24 +426,111 @@ exports.getPackageById = async (req, res) => {
 
 // ── Admin ─────────────────────────────────────────────────────────────────────
 
-// GET /api/packages/admin/all  (admin — all packages regardless of status)
+// Explicit allowlist used for pending revisions and approval. Unknown request
+// keys and platform-managed fields must never be persisted inside Mixed data.
+const OPERATOR_EDITABLE_PACKAGE_FIELDS = [
+  "title",
+  "location",
+  "country",
+  "state",
+  "city",
+  "tourType",
+  "destination",
+  "departureCity",
+  "bookingMode",
+  "durationDays",
+  "durationNights",
+  "duration",
+  "category",
+  "aboutThisTrip",
+  "about",
+  "price",
+  "priceLabel",
+  "badge",
+  "highlights",
+  "itinerary",
+  "inclusions",
+  "exclusions",
+  "addons",
+  "outsideCityCharge",
+  "videos",
+  "hotelDetails",
+  "transportDetails",
+  "pricing",
+  "availability",
+  "policies",
+  "offer",
+  "image_url",
+  "images",
+];
+
+function pickOperatorEditableFields(source) {
+  const picked = {};
+  OPERATOR_EDITABLE_PACKAGE_FIELDS.forEach((field) => {
+    if (source[field] !== undefined) picked[field] = source[field];
+  });
+  return picked;
+}
+
+function toAdminReviewView(pkg) {
+  const live = pkg?.toObject ? pkg.toObject() : { ...pkg };
+  const revision = live.pendingRevision;
+  if (!revision?.data) return live;
+
+  return {
+    ...live,
+    ...revision.data,
+    _id: live._id,
+    operatorId: live.operatorId,
+    isActive: live.isActive,
+    liveStatus: live.status,
+    status: revision.status,
+    revisionStatus: revision.status,
+    adminNotes: revision.adminNotes || "",
+    pendingRevision: revision,
+  };
+}
+
+// GET /api/packages/admin/all  (admin — all packages and pending revisions)
 exports.adminGetAllPackages = async (req, res) => {
   try {
     const { search, status, page = 1, limit = 20 } = req.query;
-    const query = {};
+    const clauses = [];
 
     if (search) {
       const escapeRegex = require("../utils/escapeRegex");
       const safe = escapeRegex(String(search));
-      query.$or = [
-        { title: { $regex: safe, $options: "i" } },
-        { location: { $regex: safe, $options: "i" } },
-      ];
+      clauses.push({
+        $or: [
+          { title: { $regex: safe, $options: "i" } },
+          { location: { $regex: safe, $options: "i" } },
+          { "pendingRevision.data.title": { $regex: safe, $options: "i" } },
+          {
+            "pendingRevision.data.location": {
+              $regex: safe,
+              $options: "i",
+            },
+          },
+        ],
+      });
     }
-    if (status && status !== "all") query.status = status;
+    if (status && status !== "all") {
+      clauses.push({
+        $or: [
+          { "pendingRevision.status": status },
+          {
+            $and: [
+              { "pendingRevision.status": { $exists: false } },
+              { status },
+            ],
+          },
+        ],
+      });
+    }
 
+    const query = clauses.length > 0 ? { $and: clauses } : {};
     const skip = (Number(page) - 1) * Number(limit);
-    const [packages, total] = await Promise.all([
+    const [packageDocs, total] = await Promise.all([
       Package.find(query)
         .populate("operatorId", "businessName contactName email")
         .skip(skip)
@@ -443,7 +539,30 @@ exports.adminGetAllPackages = async (req, res) => {
       Package.countDocuments(query),
     ]);
 
-    res.json({ success: true, total, page: Number(page), packages });
+    res.json({
+      success: true,
+      total,
+      page: Number(page),
+      packages: packageDocs.map(toAdminReviewView),
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// GET /api/packages/admin/:id (admin — canonical data plus review candidate)
+exports.adminGetPackageById = async (req, res) => {
+  try {
+    const pkg = await Package.findById(req.params.id).populate(
+      "operatorId",
+      "businessName contactName email",
+    );
+    if (!pkg) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Package not found" });
+    }
+    res.json({ success: true, package: toAdminReviewView(pkg) });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -453,8 +572,6 @@ exports.adminGetAllPackages = async (req, res) => {
 exports.reviewPackage = async (req, res) => {
   try {
     const { action, adminNotes } = req.body;
-    // action: 'approve' | 'reject' | 'needs_revision'
-
     const statusMap = {
       approve: "APPROVED",
       reject: "REJECTED",
@@ -467,8 +584,6 @@ exports.reviewPackage = async (req, res) => {
         message: "Invalid action. Use approve, reject, or needs_revision.",
       });
     }
-
-    // A rejection or revision request must tell the operator what to fix.
     if (
       (action === "reject" || action === "needs_revision") &&
       !(adminNotes || "").trim()
@@ -480,19 +595,49 @@ exports.reviewPackage = async (req, res) => {
       });
     }
 
-    const update = {
-      status: statusMap[action],
-      adminNotes: (adminNotes || "").trim(),
-      isActive: action === "approve",
-    };
-
-    const pkg = await Package.findByIdAndUpdate(req.params.id, update, {
-      new: true,
-    });
-    if (!pkg)
+    const pkg = await Package.findById(req.params.id);
+    if (!pkg) {
       return res
         .status(404)
         .json({ success: false, message: "Package not found" });
+    }
+
+    const revision = pkg.pendingRevision;
+    const isApprovedRevision =
+      pkg.status === "APPROVED" && Boolean(revision?.data);
+    if (isApprovedRevision && revision.status === "DRAFT") {
+      return res.status(400).json({
+        success: false,
+        message: "This revision is still a draft and has not been submitted.",
+      });
+    }
+
+    const notificationTitle =
+      (isApprovedRevision && revision.data?.title) || pkg.title;
+
+    if (isApprovedRevision) {
+      if (action === "approve") {
+        const approvedData = pickOperatorEditableFields(revision.data);
+        Object.entries(approvedData).forEach(([field, value]) => {
+          pkg.set(field, value);
+        });
+        pkg.pendingRevision = undefined;
+        pkg.adminNotes = "";
+        // Keep the existing live APPROVED/isActive state and stable package ID.
+        await pkg.save();
+      } else {
+        pkg.pendingRevision.status = statusMap[action];
+        pkg.pendingRevision.adminNotes = (adminNotes || "").trim();
+        pkg.pendingRevision.updatedAt = new Date();
+        pkg.markModified("pendingRevision");
+        await pkg.save({ validateModifiedOnly: true });
+      }
+    } else {
+      pkg.status = statusMap[action];
+      pkg.adminNotes = (adminNotes || "").trim();
+      pkg.isActive = action === "approve";
+      await pkg.save();
+    }
 
     // Notify operator about package review result
     if (pkg.operatorId) {
@@ -501,29 +646,30 @@ exports.reviewPackage = async (req, res) => {
         notifyOperator(
           pkg.operatorId,
           "Package Approved! ✅",
-          `Your package "${pkg.title}" has been approved and is now live.`,
+          `Your package "${notificationTitle}" has been approved and is now live.`,
           { type: "package_approved", packageId: pkg._id.toString() },
         );
       } else if (action === "reject") {
         notifyOperator(
           pkg.operatorId,
           "Package Rejected",
-          `Your package "${pkg.title}" was rejected. ${adminNotes || "Please review and resubmit."}`,
+          `Your package "${notificationTitle}" was rejected. ${adminNotes || "Please review and resubmit."}`,
           { type: "package_rejected", packageId: pkg._id.toString() },
         );
-      } else if (action === "needs_revision") {
+      } else {
         notifyOperator(
           pkg.operatorId,
           "Package Needs Revision",
-          `Your package "${pkg.title}" needs changes. ${adminNotes || "Check admin notes."}`,
+          `Your package "${notificationTitle}" needs changes. ${adminNotes || "Check admin notes."}`,
           { type: "package_revision", packageId: pkg._id.toString() },
         );
       }
     }
 
-    res.json({ success: true, package: pkg });
+    res.json({ success: true, package: toAdminReviewView(pkg) });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    const status = err.name === "ValidationError" ? 400 : 500;
+    res.status(status).json({ success: false, message: err.message });
   }
 };
 
@@ -643,6 +789,10 @@ const OPERATOR_FORBIDDEN_PACKAGE_FIELDS = [
   "reviewCount",
   "bookingCount",
   "adminNotes",
+  "pendingRevision",
+  "sampleMedia",
+  "approvedCategory",
+  "reviews",
   "createdAt",
   "updatedAt",
   "__v",
@@ -831,13 +981,6 @@ exports.operatorUpdatePackage = async (req, res) => {
         .status(404)
         .json({ success: false, message: "Package not found or not yours" });
 
-    if (pkg.status === "APPROVED") {
-      // Allow editing approved packages — content updates immediately,
-      // status resets to PENDING for admin re-review.
-      // Package stays isActive=true so it remains visible in the app during review.
-      // If admin rejects, they'll request revision and operator can fix.
-    }
-
     const body = stripPlatformFields({ ...req.body });
 
     // slot-0 → image_url (cover), slots 1-3 → images (gallery)
@@ -904,9 +1047,6 @@ exports.operatorUpdatePackage = async (req, res) => {
 
     const nextStatus = submissionMode === "DRAFT" ? "DRAFT" : "PENDING";
     const resetNotes = nextStatus === "PENDING";
-
-    // If package was previously APPROVED, keep its current isActive state
-    // (respect operator's disable choice). Otherwise hide it until approved.
     const wasApproved = pkg.status === "APPROVED";
 
     // Auto-sync the legacy `duration` text field from numeric days/nights
@@ -919,24 +1059,61 @@ exports.operatorUpdatePackage = async (req, res) => {
           : `${days} Days / ${nights} Night${nights !== 1 ? "s" : ""}`;
     }
 
-    const updated = await Package.findByIdAndUpdate(
-      req.params.id,
-      {
-        ...body,
-        // Re-pin ownership and all platform-controlled fields so they can never
-        // be moved by the request body.
+    let updated;
+    let reviewTitle;
+    if (wasApproved) {
+      // Build a fully cast candidate from the live package, any existing
+      // revision, and this request. Nothing is copied back to canonical fields
+      // until an administrator approves it.
+      const candidate = new Package({
+        ...pkg.toObject(),
+        ...(pkg.pendingRevision?.data || {}),
+        ...pickOperatorEditableFields(body),
+        _id: pkg._id,
         operatorId: pkg.operatorId,
+        status: "APPROVED",
+        isActive: pkg.isActive,
+        pendingRevision: undefined,
+      });
+      if (nextStatus === "PENDING") await candidate.validate();
+
+      const candidateData = pickOperatorEditableFields(candidate.toObject());
+      pkg.pendingRevision = {
         status: nextStatus,
-        adminNotes: resetNotes ? "" : pkg.adminNotes,
-        isActive: wasApproved ? pkg.isActive : false,
-      },
-      // Drafts can be partial, so only enforce full validation on submit.
-      // (Update validators don't evaluate the conditional-required reliably.)
-      { new: true, runValidators: nextStatus !== "DRAFT" },
-    );
+        data: candidateData,
+        adminNotes:
+          nextStatus === "PENDING" ? "" : pkg.pendingRevision?.adminNotes || "",
+        submittedAt:
+          nextStatus === "PENDING"
+            ? new Date()
+            : pkg.pendingRevision?.submittedAt,
+        updatedAt: new Date(),
+      };
+      pkg.markModified("pendingRevision");
+      await pkg.save({ validateModifiedOnly: true });
+      updated = pkg;
+      reviewTitle = candidateData.title || pkg.title;
+    } else {
+      updated = await Package.findByIdAndUpdate(
+        req.params.id,
+        {
+          ...pickOperatorEditableFields(body),
+          // Re-pin ownership and all platform-controlled fields so they can
+          // never be moved by the request body.
+          operatorId: pkg.operatorId,
+          status: nextStatus,
+          adminNotes: resetNotes ? "" : pkg.adminNotes,
+          isActive: false,
+        },
+        // Drafts can be partial, so only enforce full validation on submit.
+        { new: true, runValidators: nextStatus !== "DRAFT" },
+      );
+      reviewTitle = updated.title;
+    }
+
     res.json({ success: true, package: updated });
 
-    // Notify admin if package was re-submitted for review
+    // Notify admin if package was submitted or re-submitted for review.
     if (nextStatus === "PENDING") {
       const { notifyAdmin } = require("./notificationController");
       const label = wasApproved
@@ -944,7 +1121,7 @@ exports.operatorUpdatePackage = async (req, res) => {
         : "Package Submitted for Review";
       notifyAdmin(
         label,
-        `"${updated.title}" ${wasApproved ? "(was approved, edited)" : ""} needs admin review.`,
+        `"${reviewTitle}" ${wasApproved ? "(approved package edit)" : ""} needs admin review.`,
         { type: "general", packageId: updated._id.toString() },
       );
     }

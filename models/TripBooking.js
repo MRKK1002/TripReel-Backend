@@ -230,6 +230,14 @@ const tripBookingSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    walletReleaseState: {
+      type: String,
+      enum: ["PENDING", "PROCESSING", "RELEASED", "FAILED"],
+      default: "PENDING",
+    },
+    walletReleaseToken: { type: String, default: "" },
+    walletReleaseLeaseUntil: { type: Date, default: null },
+    walletReleaseError: { type: String, default: "" },
 
     // Guards against sending duplicate confirmation emails/push (webhook + app
     // verify can both fire for the same payment).

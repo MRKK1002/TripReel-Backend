@@ -93,8 +93,8 @@ const operatorSchema = new mongoose.Schema(
       type: String,
       trim: true,
       match: [
-        /^[6-9]\d{9}$/,
-        "Enter a valid 10-digit Indian mobile number starting with 6-9",
+        /^(?:\+[1-9]\d{7,14}|[6-9]\d{9})$/,
+        "Enter a valid international phone number",
       ],
     },
     phoneVerified: { type: Boolean, default: false },

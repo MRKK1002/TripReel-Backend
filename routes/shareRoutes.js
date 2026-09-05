@@ -22,7 +22,11 @@ router.get("/package/:id", async (req, res) => {
   const id = req.params.id;
   let pkg = null;
   try {
-    pkg = await Package.findById(id).select("title location image_url pricing");
+    pkg = await Package.findOne({
+      _id: id,
+      status: "APPROVED",
+      isActive: true,
+    }).select("title location image_url pricing");
   } catch {
     // fall through with nulls
   }

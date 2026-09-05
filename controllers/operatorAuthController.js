@@ -4,7 +4,9 @@ const {
   collapseSpaces,
   validatePersonName,
   validateEmail,
-  validatePhoneIN,
+  normalizeOperatorPhone,
+  validatePhoneE164,
+  operatorPhoneVariants,
   validatePassword,
   validateUpi,
   validateBounded,
@@ -27,13 +29,13 @@ exports.register = async (req, res) => {
     // Normalize
     contactName = collapseSpaces(contactName);
     email = (email || "").trim().toLowerCase();
-    phone = (phone || "").trim().replace(/\D/g, "");
+    phone = normalizeOperatorPhone(phone);
 
     // ── Validate every field server-side (client rules can be bypassed) ────
     const bad = firstError({
       contactName: validatePersonName(contactName, "Full name"),
       email: validateEmail(email),
-      phone: validatePhoneIN(phone),
+      phone: validatePhoneE164(phone),
       password: validatePassword(password),
     });
     if (bad) {
@@ -42,9 +44,11 @@ exports.register = async (req, res) => {
         .json({ success: false, field: bad.field, message: bad.message });
     }
 
-    // Reject if email OR phone already belongs to another operator
+    // Reject if email OR phone already belongs to another operator. Include the
+    // historical Indian format so canonical +91 values cannot create duplicates.
     const orConditions = [{ email }];
-    if (phone) orConditions.push({ phone });
+    if (phone)
+      orConditions.push({ phone: { $in: operatorPhoneVariants(phone) } });
     const existing = await Operator.findOne({ $or: orConditions });
     if (existing) {
       const reason = existing.email === email ? "email" : "phone number";
@@ -57,15 +61,9 @@ exports.register = async (req, res) => {
       });
     }
 
-    // ── Require BOTH phone and email to be verified via OTP ──────────────────
+    // Email ownership is the only OTP proof required during registration.
+    // Phone is collected for contact and remains explicitly unverified.
     const otpStore = require("../utils/otpStore");
-    if (!otpStore.isVerified("phone", phone)) {
-      return res.status(400).json({
-        success: false,
-        field: "phone",
-        message: "Please verify your phone number before creating an account.",
-      });
-    }
     if (!otpStore.isVerified("email", email)) {
       return res.status(400).json({
         success: false,
@@ -79,12 +77,11 @@ exports.register = async (req, res) => {
       email,
       phone,
       password,
-      phoneVerified: true,
+      phoneVerified: false,
       emailVerified: true,
     });
 
-    // Consume the verification markers
-    otpStore.clearVerified("phone", phone);
+    // Consume the email verification marker.
     otpStore.clearVerified("email", email);
     const token = signToken(operator._id);
 
@@ -217,8 +214,8 @@ exports.updateProfile = async (req, res) => {
       checks.contactName = validatePersonName(updates.contactName, "Full name");
     }
     if (updates.phone !== undefined) {
-      updates.phone = String(updates.phone).replace(/\D/g, "");
-      checks.phone = validatePhoneIN(updates.phone);
+      updates.phone = normalizeOperatorPhone(updates.phone);
+      checks.phone = validatePhoneE164(updates.phone);
     }
     if (updates.businessName !== undefined) {
       updates.businessName = collapseSpaces(updates.businessName);
@@ -264,15 +261,46 @@ exports.updateProfile = async (req, res) => {
         .json({ success: false, field: bad.field, message: bad.message });
     }
 
+    const needsCurrent =
+      updates.phone !== undefined || updates.upiId !== undefined;
+    const current = needsCurrent
+      ? await Operator.findById(req.operator._id).select(
+          "phone phoneVerified upiId",
+        )
+      : null;
+    if (needsCurrent && !current) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Operator not found" });
+    }
+
+    if (
+      updates.phone !== undefined &&
+      normalizeOperatorPhone(current.phone) !== updates.phone
+    ) {
+      const duplicate = await Operator.findOne({
+        _id: { $ne: req.operator._id },
+        phone: { $in: operatorPhoneVariants(updates.phone) },
+      }).select("_id");
+      if (duplicate) {
+        return res.status(400).json({
+          success: false,
+          field: "phone",
+          message: "This phone number is already registered.",
+        });
+      }
+      updates.phoneVerified = false;
+    }
+
     // Changing the UPI ID changes where money goes — stamp it so the wallet can
     // apply its cooling-off window, and drop the cached RazorpayX fund account.
-    if (updates.upiId !== undefined) {
-      const current = await Operator.findById(req.operator._id).select("upiId");
-      if ((current?.upiId || "") !== updates.upiId) {
-        updates.payoutDetailsChangedAt = new Date();
-        updates.razorpayFundAccountId = "";
-        updates.razorpayFundFingerprint = "";
-      }
+    if (
+      updates.upiId !== undefined &&
+      (current?.upiId || "") !== updates.upiId
+    ) {
+      updates.payoutDetailsChangedAt = new Date();
+      updates.razorpayFundAccountId = "";
+      updates.razorpayFundFingerprint = "";
     }
 
     const operator = await Operator.findByIdAndUpdate(
@@ -297,14 +325,19 @@ exports.updateProfile = async (req, res) => {
 const otpStore = require("../utils/otpStore");
 const { sendOtpSms } = require("../utils/sendSms");
 
-// Send an OTP to phone (SMS) or email
+// Send an OTP to phone (SMS) or email. Delivery helpers intentionally return
+// failure values instead of throwing, so normalize those failures here and let
+// the HTTP handlers report the truth to the operator.
 async function sendOtpToChannel(channel, value) {
   const otp = otpStore.setOtp(channel, value);
+  let delivered = false;
+
   if (channel === "phone") {
-    await sendOtpSms(value, otp);
+    const result = await sendOtpSms(value, otp);
+    delivered = result?.success === true;
   } else if (channel === "email") {
     const { sendMail } = require("../utils/sendMail");
-    await sendMail({
+    const result = await sendMail({
       to: value,
       subject: "Trip Reel - Verification Code",
       text: `Your Trip Reel verification code is: ${otp}\n\nValid for 10 minutes. Never share this code.`,
@@ -317,8 +350,23 @@ async function sendOtpToChannel(channel, value) {
         <p style="color:#6B7280;font-size:13px;">Valid for 10 minutes. Never share this code.</p>
       </div>`,
     });
+    delivered = Boolean(result);
   }
+
+  if (!delivered) {
+    const error = new Error("Unable to send OTP right now. Please try again.");
+    error.statusCode = 502;
+    error.isOtpDeliveryError = true;
+    throw error;
+  }
+
   return otp;
+}
+
+function validatePhoneRecoverySupport(phone) {
+  return /^\+91[6-9]\d{9}$/.test(phone)
+    ? ""
+    : "Phone recovery is currently available only for verified Indian numbers. Please use email recovery.";
 }
 
 // POST /api/operators/auth/send-otp
@@ -333,20 +381,21 @@ exports.sendOtp = async (req, res) => {
         .json({ success: false, message: "channel and value are required" });
     }
 
-    // Validate the value format
     if (channel === "phone") {
-      const err = validatePhoneIN(value);
-      if (err) return res.status(400).json({ success: false, message: err });
-    } else {
-      const err = validateEmail(value);
-      if (err) return res.status(400).json({ success: false, message: err });
+      return res.status(400).json({
+        success: false,
+        message:
+          "Phone OTP verification is not available. Please verify your email instead.",
+      });
     }
 
-    // Reject if this phone/email already belongs to an existing operator
-    const query =
-      channel === "phone"
-        ? { phone: String(value).replace(/\D/g, "") }
-        : { email: String(value).trim().toLowerCase() };
+    const normalizedValue = String(value).trim().toLowerCase();
+
+    const err = validateEmail(normalizedValue);
+    if (err) return res.status(400).json({ success: false, message: err });
+
+    // Reject if this email already belongs to an existing operator
+    const query = { email: normalizedValue };
     const existing = await Operator.findOne(query);
     if (existing) {
       return res.status(400).json({
@@ -356,18 +405,22 @@ exports.sendOtp = async (req, res) => {
     }
 
     // Enforce resend cooldown + per-target rate limit
-    const gate = otpStore.canSendOtp(channel, value);
+    const gate = otpStore.canSendOtp(channel, normalizedValue);
     if (!gate.ok) {
       return res.status(429).json({ success: false, message: gate.reason });
     }
 
-    await sendOtpToChannel(channel, value);
+    await sendOtpToChannel(channel, normalizedValue);
     res.json({
       success: true,
       message: `OTP sent to your ${channel === "phone" ? "phone" : "email"}.`,
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    const status = err.isOtpDeliveryError ? 502 : err.statusCode || 500;
+    const message = err.isOtpDeliveryError
+      ? "Unable to send OTP right now. Please try again."
+      : err.message;
+    res.status(status).json({ success: false, message });
   }
 };
 
@@ -382,7 +435,21 @@ exports.verifyOtp = async (req, res) => {
         message: "channel, value, and otp are required",
       });
     }
-    const result = otpStore.verifyOtp(channel, value, otp);
+    if (channel === "phone") {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Phone OTP verification is not available. Please verify your email instead.",
+      });
+    }
+
+    const normalizedValue = String(value).trim().toLowerCase();
+    const valueError = validateEmail(normalizedValue);
+    if (valueError) {
+      return res.status(400).json({ success: false, message: valueError });
+    }
+
+    const result = otpStore.verifyOtp(channel, normalizedValue, otp);
     if (!result.ok) {
       return res.status(400).json({ success: false, message: result.reason });
     }
@@ -406,10 +473,31 @@ exports.forgotPassword = async (req, res) => {
       });
     }
 
+    const normalizedValue =
+      method === "phone"
+        ? normalizeOperatorPhone(value)
+        : String(value).trim().toLowerCase();
+    const valueError =
+      method === "phone"
+        ? validatePhoneE164(normalizedValue)
+        : validateEmail(normalizedValue);
+    if (valueError) {
+      return res.status(400).json({ success: false, message: valueError });
+    }
+    if (method === "phone") {
+      const recoveryError = validatePhoneRecoverySupport(normalizedValue);
+      if (recoveryError) {
+        return res.status(400).json({ success: false, message: recoveryError });
+      }
+    }
+
     const query =
       method === "phone"
-        ? { phone: String(value).replace(/\D/g, "") }
-        : { email: String(value).trim().toLowerCase() };
+        ? {
+            phone: { $in: operatorPhoneVariants(normalizedValue) },
+            phoneVerified: true,
+          }
+        : { email: normalizedValue };
     const operator = await Operator.findOne(query);
 
     // Don't reveal whether the account exists — always respond success
@@ -420,7 +508,10 @@ exports.forgotPassword = async (req, res) => {
       });
     }
 
-    const target = method === "phone" ? operator.phone : operator.email;
+    const target =
+      method === "phone"
+        ? normalizeOperatorPhone(operator.phone)
+        : operator.email;
 
     // Enforce resend cooldown + per-target rate limit
     const gate = otpStore.canSendOtp(method, target);
@@ -435,7 +526,11 @@ exports.forgotPassword = async (req, res) => {
       message: `An OTP has been sent to your ${method}.`,
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    const status = err.isOtpDeliveryError ? 502 : err.statusCode || 500;
+    const message = err.isOtpDeliveryError
+      ? "Unable to send OTP right now. Please try again."
+      : err.message;
+    res.status(status).json({ success: false, message });
   }
 };
 
@@ -456,8 +551,26 @@ exports.resetPassword = async (req, res) => {
       });
     }
 
+    const normalizedValue =
+      method === "phone"
+        ? normalizeOperatorPhone(value)
+        : String(value).trim().toLowerCase();
+    const valueError =
+      method === "phone"
+        ? validatePhoneE164(normalizedValue)
+        : validateEmail(normalizedValue);
+    if (valueError) {
+      return res.status(400).json({ success: false, message: valueError });
+    }
+    if (method === "phone") {
+      const recoveryError = validatePhoneRecoverySupport(normalizedValue);
+      if (recoveryError) {
+        return res.status(400).json({ success: false, message: recoveryError });
+      }
+    }
+
     // Verify the OTP for the chosen channel
-    const result = otpStore.verifyOtp(method, value, otp);
+    const result = otpStore.verifyOtp(method, normalizedValue, otp);
     if (!result.ok) {
       return res.status(400).json({ success: false, message: result.reason });
     }
@@ -470,8 +583,11 @@ exports.resetPassword = async (req, res) => {
 
     const query =
       method === "phone"
-        ? { phone: String(value).replace(/\D/g, "") }
-        : { email: String(value).trim().toLowerCase() };
+        ? {
+            phone: { $in: operatorPhoneVariants(normalizedValue) },
+            phoneVerified: true,
+          }
+        : { email: normalizedValue };
     const operator = await Operator.findOne(query).select("+password");
     if (!operator) {
       return res
@@ -481,7 +597,7 @@ exports.resetPassword = async (req, res) => {
 
     operator.password = newPassword; // pre-save hook hashes it
     await operator.save();
-    otpStore.clearVerified(method, value);
+    otpStore.clearVerified(method, normalizedValue);
 
     res.json({ success: true, message: "Password reset successfully." });
   } catch (err) {

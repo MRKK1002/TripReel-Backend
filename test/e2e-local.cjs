@@ -346,9 +346,9 @@ async function main() {
   const operatorEmail = `e2e.operator.${suffix}@example.test`;
   const customerEmail = `e2e.customer.${suffix}@example.test`;
   const secondOperatorEmail = `e2e.operator2.${suffix}@example.test`;
-  const operatorPhone = `9${String(Date.now()).slice(-9)}`;
+  const operatorPhone = "+971553406800";
   const customerPhone = `8${String(Date.now() + 1).slice(-9)}`;
-  const secondOperatorPhone = `7${String(Date.now() + 2).slice(-9)}`;
+  const secondOperatorPhone = `+917${String(Date.now() + 2).slice(-9)}`;
   const adminPassword = "LocalOnly-Admin-123!";
   const operatorPassword = "LocalOnly-Operator-123!";
 
@@ -373,24 +373,16 @@ async function main() {
   );
   const adminToken = requireValue(adminLogin.body.token, "admin token");
 
-  // Operator OTP registration. Phone delivery is intentionally unavailable.
-  const phoneOtpSend = await api("/api/operators/auth/send-otp", {
+  // Operator registration verifies email only. Phone is contact information and
+  // must not trigger SMS delivery or become verified implicitly.
+  const phoneOtpDisabled = await api("/api/operators/auth/send-otp", {
     method: "POST",
     json: { channel: "phone", value: operatorPhone },
   });
   record(
-    "Operator phone OTP delivery failure is reported truthfully",
-    phoneOtpSend.status >= 400,
-    `mocked SMS delivery failed; API status=${phoneOtpSend.status}`,
-  );
-  const phoneOtpVerify = await api("/api/operators/auth/verify-otp", {
-    method: "POST",
-    json: { channel: "phone", value: operatorPhone, otp: E2E_OTP },
-  });
-  record(
-    "Operator phone OTP can be verified in deterministic test harness",
-    phoneOtpVerify.status === 200,
-    `status=${phoneOtpVerify.status}`,
+    "Operator registration phone OTP is disabled",
+    phoneOtpDisabled.status === 400,
+    `status=${phoneOtpDisabled.status}`,
   );
 
   const emailOtpSend = await api("/api/operators/auth/send-otp", {
@@ -412,6 +404,22 @@ async function main() {
     `status=${emailOtpVerify.status}`,
   );
 
+  const malformedPhoneRegister = await api("/api/operators/auth/register", {
+    method: "POST",
+    json: {
+      contactName: "Synthetic Operator",
+      email: operatorEmail,
+      phone: "+971123",
+      password: operatorPassword,
+    },
+  });
+  record(
+    "Operator registration rejects malformed international phone",
+    malformedPhoneRegister.status === 400 &&
+      malformedPhoneRegister.body.field === "phone",
+    `status=${malformedPhoneRegister.status}, field=${malformedPhoneRegister.body.field || ""}`,
+  );
+
   const operatorRegister = await api("/api/operators/auth/register", {
     method: "POST",
     json: {
@@ -422,7 +430,7 @@ async function main() {
     },
   });
   record(
-    "Operator registration requires completed phone and email OTP",
+    "Operator registration requires email OTP only",
     operatorRegister.status === 201 && Boolean(operatorRegister.body.token),
     `status=${operatorRegister.status}`,
   );
@@ -433,6 +441,57 @@ async function main() {
   const operatorId = requireValue(
     operatorRegister.body.operator?._id,
     "operator id",
+  );
+  const registeredOperator = await Operator.findById(operatorId).lean();
+  record(
+    "Operator stores UAE E.164 phone without marking it verified",
+    registeredOperator?.phone === operatorPhone &&
+      registeredOperator?.phoneVerified === false &&
+      registeredOperator?.emailVerified === true,
+    `phone=${registeredOperator?.phone || "missing"}, phoneVerified=${registeredOperator?.phoneVerified}, emailVerified=${registeredOperator?.emailVerified}`,
+  );
+
+  const internationalPhoneRecovery = await api(
+    "/api/operators/auth/forgot-password",
+    {
+      method: "POST",
+      json: { method: "phone", value: operatorPhone },
+    },
+  );
+  record(
+    "Unverified international phone is not offered as a recovery channel",
+    internationalPhoneRecovery.status === 400,
+    `status=${internationalPhoneRecovery.status}`,
+  );
+
+  await Operator.updateOne(
+    { _id: operatorId },
+    { $set: { phoneVerified: true } },
+  );
+  const changedPhone = "+971501234567";
+  const changedPhoneProfile = await api("/api/operators/auth/profile", {
+    method: "PATCH",
+    token: operatorToken,
+    json: { phone: changedPhone },
+  });
+  record(
+    "Changing a verified operator phone clears verification",
+    changedPhoneProfile.status === 200 &&
+      changedPhoneProfile.body.operator?.phone === changedPhone &&
+      changedPhoneProfile.body.operator?.phoneVerified === false,
+    `status=${changedPhoneProfile.status}, phone=${changedPhoneProfile.body.operator?.phone || "missing"}, phoneVerified=${changedPhoneProfile.body.operator?.phoneVerified}`,
+  );
+  const restoredPhoneProfile = await api("/api/operators/auth/profile", {
+    method: "PATCH",
+    token: operatorToken,
+    json: { phone: operatorPhone },
+  });
+  record(
+    "Profile preserves canonical UAE phone after editing",
+    restoredPhoneProfile.status === 200 &&
+      restoredPhoneProfile.body.operator?.phone === operatorPhone &&
+      restoredPhoneProfile.body.operator?.phoneVerified === false,
+    `status=${restoredPhoneProfile.status}, phone=${restoredPhoneProfile.body.operator?.phone || "missing"}`,
   );
 
   const blockedDraft = new FormData();
@@ -484,7 +543,9 @@ async function main() {
   record(
     "Synthetic KYC onboarding submission",
     onboardingSubmit.status === 200 &&
-      onboardingSubmit.body.operator?.onboardingState === "PENDING_APPROVAL",
+      onboardingSubmit.body.operator?.onboardingState === "PENDING_APPROVAL" &&
+      onboardingSubmit.body.operator?.phone === operatorPhone &&
+      onboardingSubmit.body.operator?.phoneVerified === false,
     `status=${onboardingSubmit.status}, state=${onboardingSubmit.body.operator?.onboardingState || ""}`,
   );
 
@@ -546,6 +607,18 @@ async function main() {
     "Operator final onboarding state is APPROVED",
     operatorState?.onboardingState === "APPROVED",
     `state=${operatorState?.onboardingState}`,
+  );
+  const approvedOperatorLogin = await api("/api/operators/auth/login", {
+    method: "POST",
+    json: { email: operatorEmail, password: operatorPassword },
+  });
+  record(
+    "Approved operator can log in with approved identity",
+    approvedOperatorLogin.status === 200 &&
+      Boolean(approvedOperatorLogin.body.token) &&
+      String(approvedOperatorLogin.body.operator?._id) === String(operatorId) &&
+      approvedOperatorLogin.body.operator?.onboardingState === "APPROVED",
+    `status=${approvedOperatorLogin.status}, token=${Boolean(approvedOperatorLogin.body.token)}, operatorId=${approvedOperatorLogin.body.operator?._id || "missing"}, state=${approvedOperatorLogin.body.operator?.onboardingState || "missing"}`,
   );
 
   async function createAndApprovePackage({ title, bookingMode }) {
@@ -1030,6 +1103,15 @@ async function main() {
     batchId,
     platformCouponCode,
   });
+  let platformCoupon = await PlatformCoupon.findOne({
+    code: platformCouponCode,
+  }).lean();
+  record(
+    "Confirmed booking consumes platform coupon once",
+    platformCoupon?.usedCount === 1 &&
+      concurrentBooking.pricing?.platformCouponCode === platformCouponCode,
+    `usedCount=${platformCoupon?.usedCount}, bookingCoupon=${concurrentBooking.pricing?.platformCouponCode || "missing"}`,
+  );
   const concurrentResults = await Promise.all([
     api(`/api/trip-bookings/${concurrentBooking._id}/cancel`, {
       method: "POST",
@@ -1046,6 +1128,14 @@ async function main() {
     (item) => item.status === 200,
   ).length;
   batchState = await Batch.findById(batchId).lean();
+  platformCoupon = await PlatformCoupon.findOne({
+    code: platformCouponCode,
+  }).lean();
+  record(
+    "Concurrent cancellation restores platform coupon usage",
+    platformCoupon?.usedCount === 0,
+    `usedCount=${platformCoupon?.usedCount}`,
+  );
   record(
     "Concurrent duplicate cancellation allows exactly one winner",
     concurrentSuccesses === 1,
@@ -1325,7 +1415,7 @@ async function main() {
   );
 
   // Tenant isolation with a second approved operator fixture and real login route.
-  await Operator.create({
+  const secondOperator = await Operator.create({
     contactName: "Synthetic Second Operator",
     email: secondOperatorEmail,
     phone: secondOperatorPhone,
@@ -1350,9 +1440,41 @@ async function main() {
     method: "POST",
     json: { email: secondOperatorEmail, password: operatorPassword },
   });
+  record(
+    "Second operator login returns its own authenticated identity",
+    secondLogin.status === 200 &&
+      Boolean(secondLogin.body.token) &&
+      String(secondLogin.body.operator?._id) === String(secondOperator._id),
+    `status=${secondLogin.status}, token=${Boolean(secondLogin.body.token)}, operatorId=${secondLogin.body.operator?._id || "missing"}`,
+  );
   const secondOperatorToken = requireValue(
     secondLogin.body.token,
     "second operator token",
+  );
+  const secondOperatorBookings = await api("/api/operator-bookings", {
+    token: secondOperatorToken,
+  });
+  record(
+    "Second operator booking list excludes first operator data",
+    secondOperatorBookings.status === 200 &&
+      Number(secondOperatorBookings.body.total) === 0 &&
+      Array.isArray(secondOperatorBookings.body.bookings) &&
+      !listContainsId(secondOperatorBookings.body.bookings, batchBooking._id) &&
+      !listContainsId(secondOperatorBookings.body.bookings, escrowBooking._id),
+    `status=${secondOperatorBookings.status}, total=${secondOperatorBookings.body.total}, hasBatchBooking=${listContainsId(secondOperatorBookings.body.bookings || [], batchBooking._id)}, hasEscrowBooking=${listContainsId(secondOperatorBookings.body.bookings || [], escrowBooking._id)}`,
+  );
+  const secondOperatorWallet = await api("/api/wallet", {
+    token: secondOperatorToken,
+  });
+  record(
+    "Second operator wallet is isolated and starts empty",
+    secondOperatorWallet.status === 200 &&
+      String(secondOperatorWallet.body.wallet?.operatorId) ===
+        String(secondOperator._id) &&
+      Number(secondOperatorWallet.body.wallet?.balance) === 0 &&
+      Number(secondOperatorWallet.body.wallet?.totalEarned) === 0 &&
+      Number(secondOperatorWallet.body.wallet?.totalWithdrawn) === 0,
+    `status=${secondOperatorWallet.status}, operatorId=${secondOperatorWallet.body.wallet?.operatorId || "missing"}, balance=${secondOperatorWallet.body.wallet?.balance}, totalEarned=${secondOperatorWallet.body.wallet?.totalEarned}, totalWithdrawn=${secondOperatorWallet.body.wallet?.totalWithdrawn}`,
   );
   const secondMine = await api("/api/packages/operator/mine", {
     token: secondOperatorToken,
@@ -1451,16 +1573,18 @@ async function main() {
     json: { status: "Active" },
   });
 
-  // Approved-package edit lifecycle: reviewed content is overwritten and exposed by ID.
+  // Approved-package edit lifecycle: the live approved version remains public
+  // until an administrator explicitly promotes the validated revision.
   const editedForm = new FormData();
-  const editedTitle = `UNREVIEWED EDIT ${suffix}`;
+  const editedTitle = `REVIEWED EDIT ${suffix}`;
   const existingBatchPackage = await Package.findById(batchPackageId).lean();
+  const originalApprovedTitle = existingBatchPackage?.title;
   const editedFields = {
     submissionMode: "SUBMIT",
     title: editedTitle,
     bookingMode: "batch",
-    location: "Unreviewed Location",
-    destination: "Unreviewed Destination",
+    location: "Reviewed Location",
+    destination: "Reviewed Destination",
     country: "India",
     state: "Goa",
     city: "Panaji",
@@ -1468,8 +1592,8 @@ async function main() {
     durationDays: "2",
     durationNights: "1",
     itinerary: JSON.stringify([
-      { day: 1, title: "Unreviewed day one", points: [] },
-      { day: 2, title: "Unreviewed day two", points: [] },
+      { day: 1, title: "Reviewed day one", points: [] },
+      { day: 2, title: "Reviewed day two", points: [] },
     ]),
     pricing: JSON.stringify({ adultPrice: 1000, childPrice: 600 }),
     existing_image_url: existingBatchPackage?.image_url || "",
@@ -1483,22 +1607,65 @@ async function main() {
   });
   const listAfterApprovedEdit = await api("/api/packages?limit=100");
   const detailAfterApprovedEdit = await api(`/api/packages/${batchPackageId}`);
-  record(
-    "Approved package edit returns package to PENDING",
-    approvedEdit.status === 200 &&
-      approvedEdit.body.package?.status === "PENDING",
-    `status=${approvedEdit.status}, packageStatus=${approvedEdit.body.package?.status || ""}`,
+  const adminPendingAfterEdit = await api(
+    "/api/packages/admin/all?status=PENDING&limit=100",
+    { token: adminToken },
+  );
+  const pendingReviewPackage = adminPendingAfterEdit.body.packages?.find(
+    (pkg) => String(pkg._id) === String(batchPackageId),
   );
   record(
-    "Edited PENDING package disappears from discovery",
-    !listContainsId(listAfterApprovedEdit.body, batchPackageId),
+    "Approved package edit keeps canonical package APPROVED",
+    approvedEdit.status === 200 &&
+      approvedEdit.body.package?.status === "APPROVED" &&
+      approvedEdit.body.package?.pendingRevision?.status === "PENDING",
+    `status=${approvedEdit.status}, liveStatus=${approvedEdit.body.package?.status || ""}, revisionStatus=${approvedEdit.body.package?.pendingRevision?.status || ""}`,
+  );
+  record(
+    "Approved package stays in discovery during edit review",
+    listAfterApprovedEdit.status === 200 &&
+      listContainsId(listAfterApprovedEdit.body, batchPackageId),
     `listStatus=${listAfterApprovedEdit.status}`,
   );
   record(
-    "Unreviewed approved-package edit is blocked from public detail",
-    detailAfterApprovedEdit.status === 404 ||
-      detailAfterApprovedEdit.status === 403,
-    `detailStatus=${detailAfterApprovedEdit.status}, title=${detailAfterApprovedEdit.body.package?.title || detailAfterApprovedEdit.body.title || ""}`,
+    "Public detail keeps previously approved content during edit review",
+    detailAfterApprovedEdit.status === 200 &&
+      detailAfterApprovedEdit.body.package?.title === originalApprovedTitle &&
+      !detailAfterApprovedEdit.body.package?.pendingRevision,
+    `detailStatus=${detailAfterApprovedEdit.status}, title=${detailAfterApprovedEdit.body.package?.title || ""}`,
+  );
+  record(
+    "Admin pending queue shows proposed package revision",
+    adminPendingAfterEdit.status === 200 &&
+      pendingReviewPackage?.title === editedTitle &&
+      pendingReviewPackage?.status === "PENDING" &&
+      pendingReviewPackage?.liveStatus === "APPROVED",
+    `status=${adminPendingAfterEdit.status}, title=${pendingReviewPackage?.title || ""}, reviewStatus=${pendingReviewPackage?.status || ""}`,
+  );
+
+  const approveEditedRevision = await api(
+    `/api/packages/${batchPackageId}/review`,
+    {
+      method: "PATCH",
+      token: adminToken,
+      json: { action: "approve", adminNotes: "Synthetic revision approved" },
+    },
+  );
+  const detailAfterRevisionApproval = await api(
+    `/api/packages/${batchPackageId}`,
+  );
+  const packageAfterRevisionApproval =
+    await Package.findById(batchPackageId).lean();
+  record(
+    "Admin approval publishes revision on the same package ID",
+    approveEditedRevision.status === 200 &&
+      detailAfterRevisionApproval.status === 200 &&
+      String(detailAfterRevisionApproval.body.package?._id) ===
+        String(batchPackageId) &&
+      detailAfterRevisionApproval.body.package?.title === editedTitle &&
+      packageAfterRevisionApproval?.title === editedTitle &&
+      !packageAfterRevisionApproval?.pendingRevision,
+    `reviewStatus=${approveEditedRevision.status}, detailStatus=${detailAfterRevisionApproval.status}, title=${detailAfterRevisionApproval.body.package?.title || ""}`,
   );
 
   // Final isolated-database invariants and summary.
@@ -1523,6 +1690,7 @@ async function main() {
 
 async function cleanup() {
   const cleanupEvidence = [];
+  let success = true;
   try {
     const mongoose = require("mongoose");
     if (mongoose.connection.readyState === 1) {
@@ -1536,6 +1704,7 @@ async function cleanup() {
       await mongoose.disconnect();
     }
   } catch (error) {
+    success = false;
     cleanupEvidence.push(`databaseCleanupError=${error.message}`);
   }
 
@@ -1550,9 +1719,12 @@ async function cleanup() {
     }
     cleanupEvidence.push(`syntheticUploadsDeleted=${deleted}`);
   } catch (error) {
+    success = false;
     cleanupEvidence.push(`uploadCleanupError=${error.message}`);
   }
-  console.log(`CLEANUP | ${cleanupEvidence.join(" | ")}`);
+  const evidence = cleanupEvidence.join(" | ");
+  console.log(`CLEANUP | ${evidence}`);
+  return { success, evidence };
 }
 
 (async () => {
@@ -1569,7 +1741,12 @@ async function cleanup() {
   } finally {
     // Let fire-and-forget local DB notifications settle before dropping the DB.
     await new Promise((resolve) => setTimeout(resolve, 250));
-    await cleanup();
+    const cleanupResult = await cleanup();
+    record(
+      "E2E cleanup completes successfully",
+      cleanupResult.success,
+      cleanupResult.evidence,
+    );
     const passed = results.filter((item) => item.passed).length;
     const failed = results.length - passed;
     console.log(

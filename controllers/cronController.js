@@ -4,6 +4,9 @@ const { randomUUID } = require("crypto");
 const Batch = require("../models/Batch");
 const { getSetting } = require("./platformSettingsController");
 const { getItineraryDateKey } = require("../utils/addonBookingTiming");
+const {
+  creditOperatorWalletIdempotent,
+} = require("../utils/idempotentWalletCredit");
 
 // Helper: stagger notifications to avoid sending all at once
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -750,38 +753,28 @@ async function runCronJobs() {
           results.completed++;
 
           // Release funds to operator wallet (2 days after trip end)
-          const OperatorWallet = require("../models/OperatorWallet");
-          const WalletTransaction = require("../models/WalletTransaction");
-
           // operatorAmount already includes the outside-city addon surcharge
-          const totalCredit = booking.pricing.operatorAmount;
-
-          const wallet = await OperatorWallet.findOneAndUpdate(
-            { operatorId: booking.operatorId },
-            {
-              $inc: {
-                balance: totalCredit,
-                totalEarned: totalCredit,
-              },
-            },
-            { upsert: true, new: true },
-          );
-
+          const totalCredit = Number(booking.pricing?.operatorAmount) || 0;
           const surchargeNote =
             booking.addonSurcharge > 0
               ? ` (incl. ₹${booking.addonSurcharge} outside-city addon surcharge)`
               : "";
-
-          await WalletTransaction.create({
-            operatorId: booking.operatorId,
-            bookingId: booking._id,
-            type: "CREDIT",
-            amount: totalCredit,
-            description: `Booking ${booking.bookingId} — funds released after trip completion${surchargeNote}`,
-            balanceAfter: wallet.balance,
-          });
-
-          results.walletReleased++;
+          let creditApplied = false;
+          if (totalCredit > 0) {
+            const credit = await creditOperatorWalletIdempotent({
+              operatorId: booking.operatorId,
+              amount: totalCredit,
+              bookingId: booking._id,
+              eventKey: `escrow:${booking._id}`,
+              purpose: "ESCROW_RELEASE",
+              description: `Booking ${booking.bookingId} — funds released after trip completion${surchargeNote}`,
+            });
+            creditApplied = credit.applied;
+          }
+          booking.walletReleased = true;
+          booking.walletReleaseState = "RELEASED";
+          await booking.save();
+          if (creditApplied) results.walletReleased++;
 
           // Notify user: trip completed, rate it
           const { notifyUser } = require("./notificationController");
@@ -794,14 +787,16 @@ async function runCronJobs() {
             `Your trip to ${snap.packageTitle || "destination"} is complete. Rate your experience!`,
             { type: "trip_completed", bookingId: booking._id.toString() },
           );
-          // Notify operator: wallet credited
-          await delay(NOTIFICATION_STAGGER_MS);
-          notifyOperator(
-            booking.operatorId,
-            "Wallet Credited 💰",
-            `₹${totalCredit.toLocaleString("en-IN")} credited for booking ${booking.bookingId}.`,
-            { type: "wallet_credited", bookingId: booking._id.toString() },
-          );
+          // Notify operator only when this invocation applied the credit.
+          if (creditApplied) {
+            await delay(NOTIFICATION_STAGGER_MS);
+            notifyOperator(
+              booking.operatorId,
+              "Wallet Credited 💰",
+              `₹${totalCredit.toLocaleString("en-IN")} credited for booking ${booking.bookingId}.`,
+              { type: "wallet_credited", bookingId: booking._id.toString() },
+            );
+          }
         }
       } catch (e) {
         results.errors.push(`Auto-complete ${booking.bookingId}: ${e.message}`);
@@ -1212,12 +1207,13 @@ exports.runCron = async (req, res) => {
 exports.runAutoCompleteAndCancel = async function () {
   const now = new Date();
   const twoDaysAgo = new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000);
+  const leaseUntil = () => new Date(Date.now() + 10 * 60 * 1000);
   const results = { completed: 0, cancelled: 0, walletReleased: 0, errors: [] };
 
   try {
-    const { notifyUser } = require("./notificationController");
+    const { notifyUser, notifyOperator } = require("./notificationController");
 
-    // ── Step 1: Mark CONFIRMED → COMPLETED as soon as the trip endDate passes ──
+    // ── Step 1: atomically mark ended trips COMPLETED ───────────────────────
     const confirmedBookings = await TripBooking.find({
       status: "CONFIRMED",
     }).populate("batchId", "endDate");
@@ -1225,105 +1221,179 @@ exports.runAutoCompleteAndCancel = async function () {
     for (const booking of confirmedBookings) {
       try {
         const endD = effectiveEndDate(booking);
-        if (endD && new Date(endD) < now) {
-          booking.status = "COMPLETED";
-          booking.hasReviewed = false;
-          await booking.save();
-          results.completed++;
+        if (!endD || new Date(endD) >= now) continue;
 
-          // Notify user right away — trip done, rate it
-          const snap = booking.snapshot || {};
-          await delay(NOTIFICATION_STAGGER_MS);
-          notifyUser(
-            booking.userId,
-            "Trip Completed! ⭐",
-            `Your trip to ${snap.packageTitle || "destination"} is complete. Rate your experience!`,
-            {
-              type: "trip_completed",
-              bookingId: booking._id.toString(),
-              screen: "ReviewScreen",
-            },
-          );
-        }
-      } catch (e) {
-        results.errors.push(`Auto-complete ${booking.bookingId}: ${e.message}`);
+        const completedBooking = await TripBooking.findOneAndUpdate(
+          { _id: booking._id, status: "CONFIRMED" },
+          { $set: { status: "COMPLETED", hasReviewed: false } },
+          { new: true },
+        );
+        if (!completedBooking) continue;
+
+        results.completed++;
+        const snap = completedBooking.snapshot || {};
+        await delay(NOTIFICATION_STAGGER_MS);
+        notifyUser(
+          completedBooking.userId,
+          "Trip Completed! ⭐",
+          `Your trip to ${snap.packageTitle || "destination"} is complete. Rate your experience!`,
+          {
+            type: "trip_completed",
+            bookingId: completedBooking._id.toString(),
+            screen: "ReviewScreen",
+          },
+        );
+      } catch (error) {
+        results.errors.push(
+          `Auto-complete ${booking.bookingId}: ${error.message}`,
+        );
       }
     }
 
-    // ── Step 2: Release operator wallet 2 days after trip end (escrow) ──────────
+    // ── Step 2: lease and idempotently release escrow after two days ────────
     const completedUnpaid = await TripBooking.find({
       status: "COMPLETED",
       walletReleased: { $ne: true },
     }).populate("batchId", "endDate");
 
     for (const booking of completedUnpaid) {
+      const endD = effectiveEndDate(booking);
+      if (!endD || new Date(endD) >= twoDaysAgo) continue;
+
+      const releaseToken = randomUUID();
+      let claimed = null;
       try {
-        const endD = effectiveEndDate(booking);
-        if (endD && new Date(endD) < twoDaysAgo) {
-          const OperatorWallet = require("../models/OperatorWallet");
-          const WalletTransaction = require("../models/WalletTransaction");
-          const { notifyOperator } = require("./notificationController");
-          // operatorAmount already includes the outside-city addon surcharge
-          const totalCredit = booking.pricing.operatorAmount;
+        claimed = await TripBooking.findOneAndUpdate(
+          {
+            _id: booking._id,
+            status: "COMPLETED",
+            walletReleased: { $ne: true },
+            $or: [
+              { walletReleaseState: { $exists: false } },
+              { walletReleaseState: { $in: ["PENDING", "FAILED"] } },
+              {
+                walletReleaseState: "PROCESSING",
+                walletReleaseLeaseUntil: { $ne: null, $lte: now },
+              },
+            ],
+          },
+          {
+            $set: {
+              walletReleaseState: "PROCESSING",
+              walletReleaseToken: releaseToken,
+              walletReleaseLeaseUntil: leaseUntil(),
+              walletReleaseError: "",
+            },
+          },
+          { new: true },
+        );
+        if (!claimed) continue;
 
-          const wallet = await OperatorWallet.findOneAndUpdate(
-            { operatorId: booking.operatorId },
-            { $inc: { balance: totalCredit, totalEarned: totalCredit } },
-            { upsert: true, new: true },
-          );
+        const totalCredit = Number(claimed.pricing?.operatorAmount) || 0;
+        const surchargeNote =
+          claimed.addonSurcharge > 0
+            ? ` (incl. ₹${claimed.addonSurcharge} outside-city addon surcharge)`
+            : "";
+        let creditApplied = false;
 
-          const surchargeNote =
-            booking.addonSurcharge > 0
-              ? ` (incl. ₹${booking.addonSurcharge} outside-city addon surcharge)`
-              : "";
-
-          await WalletTransaction.create({
-            operatorId: booking.operatorId,
-            bookingId: booking._id,
-            type: "CREDIT",
+        if (totalCredit > 0) {
+          const credit = await creditOperatorWalletIdempotent({
+            operatorId: claimed.operatorId,
             amount: totalCredit,
-            description: `Booking ${booking.bookingId} — funds released after trip completion${surchargeNote}`,
-            balanceAfter: wallet.balance,
+            bookingId: claimed._id,
+            eventKey: `escrow:${claimed._id}`,
+            purpose: "ESCROW_RELEASE",
+            description: `Booking ${claimed.bookingId} — funds released after trip completion${surchargeNote}`,
           });
-
-          booking.walletReleased = true;
-          await booking.save();
-          results.walletReleased++;
-
-          await delay(NOTIFICATION_STAGGER_MS);
-          notifyOperator(
-            booking.operatorId,
-            "Wallet Credited 💰",
-            `₹${totalCredit.toLocaleString("en-IN")} credited for booking ${booking.bookingId}.`,
-            { type: "wallet_credited", bookingId: booking._id.toString() },
-          );
+          creditApplied = credit.applied;
         }
-      } catch (e) {
+
+        const finalized = await TripBooking.updateOne(
+          {
+            _id: claimed._id,
+            walletReleased: { $ne: true },
+            walletReleaseState: "PROCESSING",
+            walletReleaseToken: releaseToken,
+          },
+          {
+            $set: {
+              walletReleased: true,
+              walletReleaseState: "RELEASED",
+              walletReleaseToken: "",
+              walletReleaseLeaseUntil: null,
+              walletReleaseError: "",
+            },
+          },
+        );
+
+        if (finalized.modifiedCount === 1) {
+          results.walletReleased++;
+          if (creditApplied) {
+            await delay(NOTIFICATION_STAGGER_MS);
+            notifyOperator(
+              claimed.operatorId,
+              "Wallet Credited 💰",
+              `₹${totalCredit.toLocaleString("en-IN")} credited for booking ${claimed.bookingId}.`,
+              { type: "wallet_credited", bookingId: claimed._id.toString() },
+            );
+          }
+        }
+      } catch (error) {
+        if (claimed) {
+          await TripBooking.updateOne(
+            {
+              _id: claimed._id,
+              walletReleaseState: "PROCESSING",
+              walletReleaseToken: releaseToken,
+            },
+            {
+              $set: {
+                walletReleaseState: "FAILED",
+                walletReleaseToken: "",
+                walletReleaseLeaseUntil: null,
+                walletReleaseError: String(error.message || error).slice(
+                  0,
+                  500,
+                ),
+              },
+            },
+          ).catch(() => {});
+        }
         results.errors.push(
-          `Wallet release ${booking.bookingId}: ${e.message}`,
+          `Wallet release ${booking.bookingId}: ${error.message}`,
         );
       }
     }
 
-    // ── Step 3: Auto-cancel expired pending bookings ────────────────────────────
+    // ── Step 3: atomically auto-cancel expired pending bookings ─────────────
     const pendingBookings = await TripBooking.find({
       status: "PENDING",
     }).populate("batchId", "bookingDeadline");
     for (const booking of pendingBookings) {
       try {
-        if (booking.batchId && booking.batchId.bookingDeadline < now) {
-          booking.status = "CANCELLED";
-          booking.cancelReason = "Booking deadline passed — auto-cancelled";
-          booking.cancelledBy = "system";
-          await booking.save();
-          results.cancelled++;
-        }
-      } catch (e) {
-        results.errors.push(`Auto-cancel ${booking.bookingId}: ${e.message}`);
+        if (!booking.batchId || booking.batchId.bookingDeadline >= now)
+          continue;
+        const cancelled = await TripBooking.findOneAndUpdate(
+          { _id: booking._id, status: "PENDING" },
+          {
+            $set: {
+              status: "CANCELLED",
+              cancelReason: "Booking deadline passed — auto-cancelled",
+              cancelledBy: "system",
+              cancelledAt: new Date(),
+            },
+          },
+          { new: true },
+        );
+        if (cancelled) results.cancelled++;
+      } catch (error) {
+        results.errors.push(
+          `Auto-cancel ${booking.bookingId}: ${error.message}`,
+        );
       }
     }
-  } catch (err) {
-    results.errors.push(`Auto-complete/cancel error: ${err.message}`);
+  } catch (error) {
+    results.errors.push(`Auto-complete/cancel error: ${error.message}`);
   }
   return results;
 };

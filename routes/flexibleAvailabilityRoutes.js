@@ -35,8 +35,19 @@ router.get("/", operatorProtect, async (req, res) => {
 // ── GET /api/flexible-availability/package/:packageId — public (app uses this)
 router.get("/package/:packageId", async (req, res) => {
   try {
+    const pkg = await Package.findOne({
+      _id: req.params.packageId,
+      status: "APPROVED",
+      isActive: true,
+    }).select("_id");
+    if (!pkg) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Package not found" });
+    }
+
     const items = await FlexibleAvailability.find({
-      packageId: req.params.packageId,
+      packageId: pkg._id,
       isActive: true,
       endDate: { $gte: new Date() },
     }).sort({ startDate: 1 });
@@ -49,7 +60,14 @@ router.get("/package/:packageId", async (req, res) => {
 // ── POST /api/flexible-availability — create (approved operator)
 router.post("/", operatorProtect, requireApprovedOperator, async (req, res) => {
   try {
-    const { packageId, startDate, endDate, adultPrice, childPrice } = req.body;
+    const {
+      packageId,
+      startDate,
+      endDate,
+      adultPrice,
+      childPrice,
+      maxBookings = 0,
+    } = req.body;
 
     if (!packageId || !startDate || !endDate || adultPrice == null) {
       return res.status(400).json({
@@ -58,17 +76,37 @@ router.post("/", operatorProtect, requireApprovedOperator, async (req, res) => {
       });
     }
 
-    if (Number(adultPrice) <= 0) {
+    const parsedAdultPrice = Number(adultPrice);
+    const parsedChildPrice = childPrice == null ? 0 : Number(childPrice);
+    const parsedMaxBookings = Number(maxBookings);
+    if (!Number.isFinite(parsedAdultPrice) || parsedAdultPrice <= 0) {
       return res.status(400).json({
         success: false,
         message: "Adult price must be greater than ₹0",
       });
     }
+    if (!Number.isFinite(parsedChildPrice) || parsedChildPrice < 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Child price cannot be negative",
+      });
+    }
     // Consistency with the PUT path: child price can't exceed adult price
-    if (childPrice != null && Number(childPrice) > Number(adultPrice)) {
+    if (parsedChildPrice > parsedAdultPrice) {
       return res.status(400).json({
         success: false,
         message: "Child price cannot be higher than the adult price",
+      });
+    }
+    if (
+      !Number.isInteger(parsedMaxBookings) ||
+      parsedMaxBookings < 0 ||
+      parsedMaxBookings > 1000
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Maximum bookings must be a whole number between 0 and 1000 (0 means unlimited)",
       });
     }
 
@@ -123,8 +161,9 @@ router.post("/", operatorProtect, requireApprovedOperator, async (req, res) => {
       operatorId: req.operator._id,
       startDate: new Date(startDate),
       endDate: new Date(endDate),
-      adultPrice: Number(adultPrice),
-      childPrice: Number(childPrice) || 0,
+      adultPrice: parsedAdultPrice,
+      childPrice: parsedChildPrice,
+      maxBookings: parsedMaxBookings,
     });
 
     res.status(201).json({ success: true, item });
@@ -150,7 +189,14 @@ router.put(
           .json({ success: false, message: "Not your record" });
       }
 
-      const { startDate, endDate, adultPrice, childPrice, isActive } = req.body;
+      const {
+        startDate,
+        endDate,
+        adultPrice,
+        childPrice,
+        maxBookings,
+        isActive,
+      } = req.body;
 
       // Block edits while travellers hold bookings in this range
       const TripBookingModel = require("../models/TripBooking");
@@ -175,6 +221,21 @@ router.put(
       if (endDate) item.endDate = new Date(endDate);
       if (adultPrice != null) item.adultPrice = Number(adultPrice);
       if (childPrice != null) item.childPrice = Number(childPrice);
+      let parsedMaxBookings = null;
+      if (maxBookings != null) {
+        parsedMaxBookings = Number(maxBookings);
+        if (
+          !Number.isInteger(parsedMaxBookings) ||
+          parsedMaxBookings < 0 ||
+          parsedMaxBookings > 1000
+        ) {
+          return res.status(400).json({
+            success: false,
+            message:
+              "Maximum bookings must be a whole number between 0 and 1000 (0 means unlimited)",
+          });
+        }
+      }
       if (isActive != null) item.isActive = Boolean(isActive);
 
       if (
@@ -237,8 +298,45 @@ router.put(
         });
       }
 
-      await item.save();
-      res.json({ success: true, item });
+      // Apply the edit as one conditional write. The capacity predicate is on
+      // the same document used by checkout's atomic reservation, so either a
+      // booking observes the new limit or the limit reduction loses with 409;
+      // the two operations cannot leave bookedSeats above maxBookings.
+      const updateFields = {};
+      if (startDate) updateFields.startDate = item.startDate;
+      if (endDate) updateFields.endDate = item.endDate;
+      if (adultPrice != null) updateFields.adultPrice = item.adultPrice;
+      if (childPrice != null) updateFields.childPrice = item.childPrice;
+      if (parsedMaxBookings != null)
+        updateFields.maxBookings = parsedMaxBookings;
+      if (isActive != null) updateFields.isActive = item.isActive;
+
+      const updateQuery = {
+        _id: item._id,
+        operatorId: req.operator._id,
+      };
+      if (parsedMaxBookings > 0) {
+        updateQuery.$expr = {
+          $lte: [{ $ifNull: ["$bookedSeats", 0] }, parsedMaxBookings],
+        };
+      }
+
+      const updated = await FlexibleAvailability.findOneAndUpdate(
+        updateQuery,
+        { $set: updateFields },
+        { new: true, runValidators: true },
+      );
+      if (!updated) {
+        const current = await FlexibleAvailability.findById(item._id).select(
+          "bookedSeats",
+        );
+        return res.status(409).json({
+          success: false,
+          message: `Maximum bookings cannot be lower than the ${current?.bookedSeats || 0} seats already booked`,
+        });
+      }
+
+      res.json({ success: true, item: updated });
     } catch (err) {
       res.status(500).json({ success: false, message: err.message });
     }

@@ -3,6 +3,9 @@ const Batch = require("../models/Batch");
 const Package = require("../models/Package");
 const OperatorWallet = require("../models/OperatorWallet");
 const WalletTransaction = require("../models/WalletTransaction");
+const {
+  creditOperatorWalletIdempotent,
+} = require("../utils/idempotentWalletCredit");
 const { notifyUser } = require("./notificationController");
 const { getSetting } = require("./platformSettingsController");
 const escapeRegex = require("../utils/escapeRegex");
@@ -372,26 +375,18 @@ async function creditOperatorWallet(
   amount,
   bookingId,
   description,
+  eventKey,
+  purpose,
 ) {
-  // Upsert wallet
-  const wallet = await OperatorWallet.findOneAndUpdate(
-    { operatorId },
-    {
-      $inc: { balance: amount, totalEarned: amount },
-    },
-    { upsert: true, new: true },
-  );
-
-  await WalletTransaction.create({
+  const result = await creditOperatorWalletIdempotent({
     operatorId,
-    bookingId,
-    type: "CREDIT",
     amount,
+    bookingId,
     description,
-    balanceAfter: wallet.balance,
+    eventKey,
+    purpose,
   });
-
-  return wallet;
+  return result.wallet;
 }
 
 async function debitOperatorWallet(operatorId, amount, bookingId, description) {
@@ -462,6 +457,38 @@ async function processCancellationRefund(
   booking,
   { cancelledBy, reason, fullRefund },
 ) {
+  // Compare-and-set is the cancellation lock. Exactly one concurrent caller can
+  // move a live booking to CANCELLED; only that winner may refund, restore
+  // inventory/counters, release coupon usage, or send downstream side effects.
+  const cancelledAt = new Date();
+  const claimedBooking = await TripBooking.findOneAndUpdate(
+    {
+      _id: booking._id,
+      status: { $in: ["CONFIRMED", "PENDING"] },
+    },
+    {
+      $set: {
+        status: "CANCELLED",
+        cancelReason: reason || `Cancelled by ${cancelledBy}`,
+        cancelledBy,
+        cancelledAt,
+      },
+    },
+    { new: true },
+  );
+
+  if (!claimedBooking) {
+    const current = await TripBooking.findById(booking._id).select("status");
+    const currentStatus = current?.status || "unknown";
+    const error = new Error(
+      `Cannot cancel a ${currentStatus.toLowerCase()} booking`,
+    );
+    error.statusCode = 400;
+    error.code = "CANCELLATION_ALREADY_CLAIMED";
+    throw error;
+  }
+  booking = claimedBooking;
+
   const p = booking.pricing || {};
   const fareSubtotal = Number(p.fareSubtotal) || 0;
   const discountAmount = Number(p.discountAmount) || 0;
@@ -521,11 +548,8 @@ async function processCancellationRefund(
     platformRetained,
   };
 
-  // ── Update booking record ───────────────────────────────────────────────
-  booking.status = "CANCELLED";
-  booking.cancelReason = reason || `Cancelled by ${cancelledBy}`;
-  booking.cancelledBy = cancelledBy;
-  booking.cancelledAt = new Date();
+  // The status/cancellation metadata was atomically claimed above. Persist the
+  // calculated refund fields on that winner's document only.
   booking.refundPercent = refundPercent;
   booking.refundAmount = userRefund;
   booking.refundBreakdown = breakdown;
@@ -582,13 +606,47 @@ async function processCancellationRefund(
     });
   } catch {}
 
-  // ── Release seats + bookingCount ──────────────────────────────────────────
-  await Batch.findByIdAndUpdate(booking.batchId, {
-    $inc: { bookedSeats: -booking.seats },
-  });
-  await Package.findByIdAndUpdate(booking.packageId, {
-    $inc: { bookingCount: -booking.seats },
-  });
+  // ── Release seats + bookingCount (winner only, clamped at zero) ───────────
+  const seatsToRelease = Math.max(0, Number(booking.seats) || 0);
+  const clampedSeatRelease = [
+    {
+      $set: {
+        bookedSeats: {
+          $max: [
+            0,
+            {
+              $subtract: [{ $ifNull: ["$bookedSeats", 0] }, seatsToRelease],
+            },
+          ],
+        },
+      },
+    },
+  ];
+
+  if (booking.bookingMode === "flexible" && booking.flexAvailabilityId) {
+    const FlexibleAvailability = require("../models/FlexibleAvailability");
+    await FlexibleAvailability.updateOne(
+      { _id: booking.flexAvailabilityId },
+      clampedSeatRelease,
+    );
+  } else if (booking.batchId) {
+    await Batch.updateOne({ _id: booking.batchId }, clampedSeatRelease);
+  }
+
+  await Package.updateOne({ _id: booking.packageId }, [
+    {
+      $set: {
+        bookingCount: {
+          $max: [
+            0,
+            {
+              $subtract: [{ $ifNull: ["$bookingCount", 0] }, seatsToRelease],
+            },
+          ],
+        },
+      },
+    },
+  ]);
 
   // ── Return the coupon usage slot (createBooking incremented usedCount) ─────
   const usedCoupon = booking.pricing?.couponCode;
@@ -624,6 +682,8 @@ async function processCancellationRefund(
       operatorRetained,
       booking._id,
       `Cancellation retention — Booking ${booking.bookingId}`,
+      `cancellation-retention:${booking._id}`,
+      "CANCELLATION_RETENTION",
     );
   }
 
@@ -644,6 +704,7 @@ async function processCancellationRefund(
     refundPercent,
     breakdown,
     refundStatus: booking.refundStatus,
+    booking,
   };
 }
 
@@ -1238,7 +1299,7 @@ exports.createBooking = async (req, res) => {
           // Send via the existing chat conversation (already created above)
           const Message = require("../models/Message");
           await Message.create({
-            conversationId: conv._id,
+            conversationId: conversation._id,
             senderId: pkg.operatorId,
             senderType: "operator",
             senderName: "Trip Reel",
@@ -1540,7 +1601,9 @@ exports.updateBookingStatus = async (req, res) => {
 
     res.json({ success: true, booking: updated });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    res
+      .status(err.statusCode || 500)
+      .json({ success: false, message: err.message });
   }
 };
 
@@ -1785,10 +1848,12 @@ exports.cancelBooking = async (req, res) => {
       refundAmount: summary.refundAmount,
       refundStatus: summary.refundStatus,
       breakdown: summary.breakdown,
-      booking,
+      booking: summary.booking,
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    res
+      .status(err.statusCode || 500)
+      .json({ success: false, message: err.message });
   }
 };
 
@@ -1934,7 +1999,9 @@ exports.operatorCancelBooking = async (req, res) => {
 
     res.json({ success: true, refund: summary });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    res
+      .status(err.statusCode || 500)
+      .json({ success: false, message: err.message });
   }
 };
 

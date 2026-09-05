@@ -123,6 +123,23 @@ const packageOfferSchema = new mongoose.Schema(
   { _id: false },
 );
 
+const pendingPackageRevisionSchema = new mongoose.Schema(
+  {
+    status: {
+      type: String,
+      enum: ["DRAFT", "PENDING", "NEEDS_REVISION", "REJECTED"],
+      required: true,
+    },
+    // A validated snapshot of operator-editable fields. The live canonical
+    // fields remain unchanged until an administrator approves this revision.
+    data: { type: mongoose.Schema.Types.Mixed, required: true },
+    adminNotes: { type: String, default: "" },
+    submittedAt: { type: Date },
+    updatedAt: { type: Date, default: Date.now },
+  },
+  { _id: false },
+);
+
 const packageSchema = new mongoose.Schema(
   {
     title: {
@@ -325,6 +342,12 @@ const packageSchema = new mongoose.Schema(
     adminNotes: {
       type: String,
       default: "",
+    },
+    // Approved-package edits are moderated separately so the currently
+    // approved content stays public until the replacement is reviewed.
+    pendingRevision: {
+      type: pendingPackageRevisionSchema,
+      default: undefined,
     },
     approvedCategory: {
       type: String,

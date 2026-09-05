@@ -5,6 +5,7 @@ const {
   getPopularPackages,
   getPackageById,
   adminGetAllPackages,
+  adminGetPackageById,
   reviewPackage,
   deletePackage,
   operatorGetMyPackages,
@@ -62,6 +63,7 @@ router.patch(
 
 // ── Admin routes ──────────────────────────────────────────────────────────────
 router.get("/admin/all", protect, restrictTo("admin"), adminGetAllPackages);
+router.get("/admin/:id", protect, restrictTo("admin"), adminGetPackageById);
 router.patch("/:id/review", protect, restrictTo("admin"), reviewPackage);
 router.patch(
   "/:id/sample-media",

@@ -27,6 +27,7 @@ const PERSON_NAME_RE = /^[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ.'\- ]*$/;
 const PLACE_NAME_RE = /^[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ.'\-() ]*$/;
 const EMAIL_RE = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
 const PHONE_IN_RE = /^[6-9]\d{9}$/;
+const PHONE_E164_RE = /^\+[1-9]\d{7,14}$/;
 const IFSC_RE = /^[A-Z]{4}0[A-Z0-9]{6}$/;
 const UPI_RE = /^[a-zA-Z0-9][a-zA-Z0-9.\-_]{1,63}@[a-zA-Z][a-zA-Z0-9.]{1,63}$/;
 const GSTIN_RE = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/;
@@ -57,11 +58,6 @@ function validateEmail(value) {
   if (!v) return "Email is required.";
   if (v.length > LIMITS.EMAIL_MAX) return "Email address is too long.";
   if (!EMAIL_RE.test(v)) return "Please enter a valid email address.";
-  const domain = v.split("@")[1] || "";
-  const tld = domain.split(".").pop() || "";
-  // Catches typos like "gmail.commmm"
-  if (/(.)\1\1/.test(domain) || tld.length > 6)
-    return "This email looks like it has a typo. Please check it.";
   return "";
 }
 
@@ -72,6 +68,36 @@ function validatePhoneIN(value, { required = true } = {}) {
   if (!PHONE_IN_RE.test(digits))
     return "Enter a valid Indian mobile number starting with 6, 7, 8 or 9.";
   return "";
+}
+
+// Operator phones are stored canonically as E.164. Keep accepting historical
+// 10-digit Indian values at API boundaries while existing records are migrated.
+function normalizeOperatorPhone(value) {
+  const raw = str(value);
+  if (!raw) return "";
+  if (PHONE_IN_RE.test(raw)) return `+91${raw}`;
+  if (!/^[+\d\s().-]+$/.test(raw)) return raw;
+
+  const compact = raw.replace(/[\s().-]/g, "");
+  if (/^00\d+$/.test(compact)) return `+${compact.slice(2)}`;
+  if (/^\+\d+$/.test(compact)) return compact;
+  return compact;
+}
+
+function validatePhoneE164(value, { required = true } = {}) {
+  const phone = normalizeOperatorPhone(value);
+  if (!phone) return required ? "Phone number is required." : "";
+  if (!PHONE_E164_RE.test(phone))
+    return "Select a country and enter a valid international phone number.";
+  return "";
+}
+
+function operatorPhoneVariants(value) {
+  const phone = normalizeOperatorPhone(value);
+  if (!phone) return [];
+  const variants = [phone];
+  if (/^\+91[6-9]\d{9}$/.test(phone)) variants.push(phone.slice(3));
+  return [...new Set(variants)];
 }
 
 function validatePassword(value) {
@@ -169,6 +195,7 @@ module.exports = {
   PERSON_NAME_RE,
   EMAIL_RE,
   PHONE_IN_RE,
+  PHONE_E164_RE,
   IFSC_RE,
   UPI_RE,
   GSTIN_RE,
@@ -177,6 +204,9 @@ module.exports = {
   validatePersonName,
   validateEmail,
   validatePhoneIN,
+  normalizeOperatorPhone,
+  validatePhoneE164,
+  operatorPhoneVariants,
   validatePassword,
   validateAccountNumber,
   validateIfsc,

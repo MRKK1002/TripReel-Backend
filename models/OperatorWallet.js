@@ -24,6 +24,13 @@ const operatorWalletSchema = new mongoose.Schema(
       type: Number,
       default: 0,
     },
+    // Durable idempotency keys for balance credits. A credit event may update
+    // this wallet at most once even if multiple workers race or retry.
+    appliedCreditKeys: {
+      type: [String],
+      default: [],
+      select: false,
+    },
   },
   { timestamps: true },
 );
