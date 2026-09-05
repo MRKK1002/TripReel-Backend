@@ -214,12 +214,15 @@ const startChange = async (req, res, kind) => {
         .status(401)
         .json({ success: false, message: "Not authorized." });
 
-    if (kind === "phone" && !(user.phone && user.phoneVerifiedAt)) {
+    // Legacy accounts may have a valid stored phone without phoneVerifiedAt.
+    // Sending the current-contact OTP to that exact number proves possession,
+    // so only accounts with no current phone need to use the add-phone flow.
+    if (kind === "phone" && !user.phone) {
       return res.status(409).json({
         success: false,
         code: "NO_VERIFIED_PHONE",
         message:
-          "No verified phone number is linked yet. Add and verify a phone number first.",
+          "No phone number is linked yet. Add and verify a phone number first.",
       });
     }
     if (kind === "email" && !user.email) {
