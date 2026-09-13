@@ -60,6 +60,26 @@ const DEFAULTS = [
     label: "Reel Maker / Videographer Base Price (₹/day)",
   },
   {
+    key: "photographer_duration_min",
+    value: 30,
+    label: "Photographer Session Duration (minutes)",
+  },
+  {
+    key: "photographer_deliverables",
+    value: "Edited photos",
+    label: "Photographer Deliverables Label",
+  },
+  {
+    key: "reelmaker_duration_min",
+    value: 30,
+    label: "Reel Maker Session Duration (minutes)",
+  },
+  {
+    key: "reelmaker_deliverable_count",
+    value: 2,
+    label: "Reel Maker Deliverable Count (number of reels)",
+  },
+  {
     key: "default_cancellation_policy",
     value:
       "Free cancellation up to 7 days before departure. 50% refund for cancellations 3-7 days prior. No refund within 3 days of departure.",
@@ -116,6 +136,10 @@ exports.getPublicSettings = async (req, res) => {
       "gst_percent",
       "photographer_base_price",
       "videographer_base_price",
+      "photographer_duration_min",
+      "photographer_deliverables",
+      "reelmaker_duration_min",
+      "reelmaker_deliverable_count",
       "default_cancellation_policy",
       "default_refund_policy",
       "default_terms",
@@ -209,7 +233,11 @@ exports.updateSetting = async (req, res) => {
       "gst_percent",
       "photographer_base_price",
       "videographer_base_price",
+      "photographer_duration_min",
+      "reelmaker_duration_min",
+      "reelmaker_deliverable_count",
     ];
+    const percentKeys = ["platform_fee_percent", "gst_percent"];
     const arrayKeys = [
       "cancellation_refund_slabs",
       "sample_demo_media",
@@ -225,7 +253,7 @@ exports.updateSetting = async (req, res) => {
           message: "value must be a non-negative number",
         });
       }
-      if (numVal > 100) {
+      if (percentKeys.includes(req.params.key) && numVal > 100) {
         return res.status(400).json({
           success: false,
           message: "Percentage value cannot exceed 100%",

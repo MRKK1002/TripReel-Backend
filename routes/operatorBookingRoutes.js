@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const {
   operatorGetMyBookings,
+  operatorGetBookingById,
   operatorBookingSummary,
   operatorCancelBooking,
   operatorCancelBatch,
@@ -11,8 +12,10 @@ const {
   requireApprovedOperator,
 } = require("../middleware/operatorAuthMiddleware");
 
-router.get("/", operatorProtect, operatorGetMyBookings);
 router.get("/summary", operatorProtect, operatorBookingSummary);
+router.get("/", operatorProtect, operatorGetMyBookings);
+// Keep named/static GET routes above this owned detail route.
+router.get("/:id", operatorProtect, operatorGetBookingById);
 router.post(
   "/:id/cancel",
   operatorProtect,

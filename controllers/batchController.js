@@ -1,5 +1,17 @@
 const Batch = require("../models/Batch");
 const Package = require("../models/Package");
+const { getPagination, paginationMeta } = require("../utils/pagination");
+const { getISTDateKey, getISTDayRange } = require("../utils/businessDate");
+const {
+  normalizeView,
+  batchLifecycle,
+  applyLifecycleView,
+  isHistory,
+} = require("../utils/lifecycle");
+const {
+  pendingReferenceQuery,
+  IN_FLIGHT_STATES,
+} = require("../utils/resourceIntegrity");
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -49,8 +61,8 @@ async function findOverlappingBatch({ packageId, start, end, excludeId }) {
   const query = {
     packageId,
     isActive: { $ne: false },
-    startDate: { $lt: end },
-    endDate: { $gt: start },
+    startDate: { $lte: end },
+    endDate: { $gte: start },
   };
   if (excludeId) query._id = { $ne: excludeId };
   return Batch.findOne(query);
@@ -77,13 +89,28 @@ exports.getBatchesForPackage = async (req, res) => {
         .json({ success: false, message: "packageId is required" });
     }
 
-    const now = new Date();
-    const batches = await Batch.find({
+    const dayStart = getISTDayRange(getISTDateKey()).start;
+    const pkg = await Package.findOne({
+      _id: packageId,
+      status: "APPROVED",
+      isActive: true,
+    }).select("_id");
+    if (!pkg) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Package not found" });
+    }
+    const docs = await Batch.find({
       packageId,
       isActive: true,
-      bookingDeadline: { $gte: now }, // only show batches still open for booking
-      endDate: { $gte: now }, // exclude fully completed ones
+      isArchived: { $ne: true },
+      bookingDeadline: { $gte: dayStart },
+      endDate: { $gte: dayStart },
     }).sort({ startDate: 1 });
+    const batches = docs.map((batch) => ({
+      ...batch.toObject(),
+      lifecycle: batchLifecycle(batch),
+    }));
 
     res.json({ success: true, count: batches.length, batches });
   } catch (err) {
@@ -94,16 +121,24 @@ exports.getBatchesForPackage = async (req, res) => {
 // GET /api/batches/:id
 exports.getBatchById = async (req, res) => {
   try {
-    const batch = await Batch.findById(req.params.id).populate(
-      "packageId",
-      "title location image_url",
-    );
-    if (!batch) {
+    const batch = await Batch.findOne({
+      _id: req.params.id,
+      isActive: true,
+      isArchived: { $ne: true },
+    }).populate({
+      path: "packageId",
+      select: "title location image_url status isActive",
+      match: { status: "APPROVED", isActive: true },
+    });
+    if (!batch || !batch.packageId) {
       return res
         .status(404)
         .json({ success: false, message: "Batch not found" });
     }
-    res.json({ success: true, batch });
+    res.json({
+      success: true,
+      batch: { ...batch.toObject(), lifecycle: batchLifecycle(batch) },
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -171,10 +206,11 @@ exports.createBatch = async (req, res) => {
         .status(400)
         .json({ success: false, message: "startDate must be in the future" });
     }
-    if (end <= start) {
-      return res
-        .status(400)
-        .json({ success: false, message: "endDate must be after startDate" });
+    if (end < start) {
+      return res.status(400).json({
+        success: false,
+        message: "endDate must be on or after startDate",
+      });
     }
     if (!deadline || deadline > start) {
       // Default: booking deadline = start date
@@ -252,6 +288,12 @@ exports.cloneBatch = async (req, res) => {
         .status(404)
         .json({ success: false, message: "Batch not found or not yours" });
     }
+    if (source.isArchived) {
+      return res.status(409).json({
+        success: false,
+        message: "Archived batches are read-only and cannot be cloned.",
+      });
+    }
 
     const { startDate, endDate, bookingDeadline, label } = req.body;
 
@@ -272,10 +314,11 @@ exports.cloneBatch = async (req, res) => {
         .status(400)
         .json({ success: false, message: "startDate must be in the future" });
     }
-    if (end <= start) {
-      return res
-        .status(400)
-        .json({ success: false, message: "endDate must be after startDate" });
+    if (end < start) {
+      return res.status(400).json({
+        success: false,
+        message: "endDate must be on or after startDate",
+      });
     }
     if (!deadline || deadline > start) deadline = start;
 
@@ -336,19 +379,11 @@ exports.updateBatch = async (req, res) => {
         .status(404)
         .json({ success: false, message: "Batch not found or not yours" });
     }
-
-    // Block edit if any live booking exists. This used to check CONFIRMED only,
-    // while delete checked CONFIRMED *and* PENDING — so a batch with a pending
-    // booking could have its price and dates rewritten under the traveller.
-    const liveCount = await TripBooking.countDocuments({
-      batchId: batch._id,
-      status: { $in: ["CONFIRMED", "PENDING"] },
-    });
-    if (liveCount > 0) {
-      return res.status(400).json({
+    const lifecycle = batchLifecycle(batch);
+    if (isHistory("batch", lifecycle)) {
+      return res.status(409).json({
         success: false,
-        message:
-          "Cannot edit a batch that already has bookings. Contact admin.",
+        message: `This batch is in History (${lifecycle}) and is read-only. It cannot be changed.`,
       });
     }
 
@@ -362,16 +397,61 @@ exports.updateBatch = async (req, res) => {
       label,
     } = req.body;
 
+    const changingTerms = [
+      startDate,
+      endDate,
+      bookingDeadline,
+      adultPrice,
+      childPrice,
+      totalSeats,
+    ].some((value) => value !== undefined);
+    if (changingTerms) {
+      const Review = require("../models/Review");
+      const Coupon = require("../models/Coupon");
+      const PendingOrder = require("../models/PendingOrder");
+      const [bookingHistory, reviewHistory, usedCoupon, inFlight] =
+        await Promise.all([
+          TripBooking.exists({ batchId: batch._id }),
+          Review.exists({ batchId: batch._id }),
+          Coupon.exists({
+            batchId: batch._id,
+            $or: [
+              { everUsedCount: { $gt: 0 } },
+              { usedCount: { $gt: 0 } },
+              { usageClaimKeys: { $exists: true, $ne: [] } },
+            ],
+          }),
+          PendingOrder.exists({
+            $or: [
+              pendingReferenceQuery("batchId", batch._id),
+              {
+                batchId: batch._id,
+                status: "pending",
+                finalizationState: { $in: IN_FLIGHT_STATES },
+              },
+            ],
+          }),
+        ]);
+      if (bookingHistory || reviewHistory || usedCoupon || inFlight) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "Batch dates, pricing and capacity are immutable after booking/review/coupon history or an in-flight payment exists. Label-only changes remain allowed.",
+        });
+      }
+    }
+
     const oldPrice = batch.adultPrice;
     const datesChanged = Boolean(startDate || endDate);
 
     if (startDate) batch.startDate = toDate(startDate) || batch.startDate;
     if (endDate) batch.endDate = toDate(endDate) || batch.endDate;
 
-    if (batch.endDate <= batch.startDate) {
-      return res
-        .status(400)
-        .json({ success: false, message: "endDate must be after startDate" });
+    if (batch.endDate < batch.startDate) {
+      return res.status(400).json({
+        success: false,
+        message: "endDate must be on or after startDate",
+      });
     }
 
     // Moved dates must still be in the future — create enforced this, update
@@ -447,11 +527,14 @@ exports.updateBatch = async (req, res) => {
   }
 };
 
-// DELETE /api/batches/:id  — operator deletes own batch (only if no confirmed bookings)
+// DELETE /api/batches/:id  — archive historically referenced batches
 exports.deleteBatch = async (req, res) => {
   try {
     const TripBooking = require("../models/TripBooking");
-
+    const PendingOrder = require("../models/PendingOrder");
+    const Review = require("../models/Review");
+    const Coupon = require("../models/Coupon");
+    const BookingIntent = require("../models/BookingIntent");
     const batch = await Batch.findOne({
       _id: req.params.id,
       operatorId: req.operator._id,
@@ -461,37 +544,122 @@ exports.deleteBatch = async (req, res) => {
         .status(404)
         .json({ success: false, message: "Batch not found or not yours" });
     }
-
-    const confirmedCount = await TripBooking.countDocuments({
-      batchId: batch._id,
-      status: { $in: ["CONFIRMED", "PENDING"] },
-    });
-    if (confirmedCount > 0) {
-      return res.status(400).json({
+    const lifecycle = batchLifecycle(batch);
+    if (isHistory("batch", lifecycle)) {
+      return res.status(409).json({
         success: false,
-        message: "Cannot delete a batch that has active bookings.",
+        message: `This batch is in History (${lifecycle}) and is read-only. It cannot be deleted.`,
       });
     }
-
+    const inFlight = await PendingOrder.exists({
+      $or: [
+        pendingReferenceQuery("batchId", batch._id),
+        {
+          batchId: batch._id,
+          status: "pending",
+          finalizationState: { $in: IN_FLIGHT_STATES },
+        },
+      ],
+    });
+    if (inFlight) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "Cannot delete while a payment order for this batch is in flight.",
+      });
+    }
+    const [bookingRef, reviewRef, usedCoupon] = await Promise.all([
+      TripBooking.exists({ batchId: batch._id }),
+      Review.exists({ batchId: batch._id }),
+      Coupon.exists({
+        batchId: batch._id,
+        $or: [
+          { everUsedCount: { $gt: 0 } },
+          { usedCount: { $gt: 0 } },
+          { usageClaimKeys: { $exists: true, $ne: [] } },
+        ],
+      }),
+    ]);
+    if (bookingRef || reviewRef || usedCoupon) {
+      batch.isActive = false;
+      batch.isArchived = true;
+      batch.archivedAt = new Date();
+      batch.archivedBy = String(req.operator._id);
+      batch.archivedByType = "operator";
+      batch.archivedReason = String(
+        req.body?.reason || "Historical references preserved",
+      ).slice(0, 500);
+      await Promise.all([
+        batch.save(),
+        Coupon.updateMany(
+          { batchId: batch._id },
+          {
+            $set: {
+              isActive: false,
+              isArchived: true,
+              archivedAt: batch.archivedAt,
+              archivedBy: batch.archivedBy,
+              archivedByType: "operator",
+              archivedReason: batch.archivedReason,
+            },
+          },
+        ),
+      ]);
+      return res.json({
+        success: true,
+        archived: true,
+        message: "Batch has durable history and was archived.",
+      });
+    }
+    await Promise.all([
+      Coupon.deleteMany({ batchId: batch._id }),
+      BookingIntent.deleteMany({ batchId: batch._id }),
+      PendingOrder.deleteMany({
+        status: "expired",
+        $or: [
+          { batchId: batch._id },
+          { "payload.batchId": { $in: [batch._id, String(batch._id)] } },
+        ],
+      }),
+    ]);
     await batch.deleteOne();
-    res.json({ success: true, message: "Batch deleted" });
+    res.json({ success: true, archived: false, message: "Batch deleted" });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 };
 
-// GET /api/batches/operator/mine  — all batches for operator's packages
+// GET /api/batches/operator/mine  — lifecycle-aware operator list
 exports.operatorGetMyBatches = async (req, res) => {
   try {
-    const { packageId } = req.query;
+    const { page, limit, skip } = getPagination(req.query, 20);
+    const view = normalizeView(req.query);
     const query = { operatorId: req.operator._id };
-    if (packageId) query.packageId = packageId;
-
-    const batches = await Batch.find(query)
+    if (req.query.packageId) query.packageId = req.query.packageId;
+    let docs = await Batch.find(query)
       .populate("packageId", "title location")
-      .sort({ startDate: 1 });
-
-    res.json({ success: true, count: batches.length, batches });
+      .sort({ startDate: -1, createdAt: -1, _id: -1 });
+    if (req.query.search) {
+      const term = String(req.query.search).trim().toLowerCase();
+      docs = docs.filter((item) =>
+        [item.label, item.packageId?.title, item.packageId?.location].some(
+          (value) =>
+            String(value || "")
+              .toLowerCase()
+              .includes(term),
+        ),
+      );
+    }
+    const classified = applyLifecycleView(docs, "batch", batchLifecycle, view);
+    const batches = classified.items.slice(skip, skip + limit);
+    res.json({
+      success: true,
+      count: batches.length,
+      batches,
+      ...paginationMeta(classified.items.length, page, limit),
+      currentTotal: classified.currentTotal,
+      historyTotal: classified.historyTotal,
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -507,6 +675,12 @@ exports.adminToggleActive = async (req, res) => {
       return res
         .status(404)
         .json({ success: false, message: "Batch not found" });
+    }
+    if (batch.isArchived) {
+      return res.status(409).json({
+        success: false,
+        message: "Archived batches are read-only and cannot be reactivated.",
+      });
     }
     batch.isActive = !batch.isActive;
     await batch.save();

@@ -56,11 +56,22 @@ const notificationSchema = new mongoose.Schema(
       ],
     },
     intentId: { type: mongoose.Schema.Types.ObjectId, ref: "BookingIntent" },
+    // Stable identity for replayable system notifications. User-triggered and
+    // legacy notifications omit it and are unaffected by the sparse index.
+    effectKey: { type: String, default: undefined },
 
     // Read status
     read: { type: Boolean, default: false },
   },
   { timestamps: true },
+);
+
+notificationSchema.index(
+  { effectKey: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { effectKey: { $type: "string" } },
+  },
 );
 
 module.exports = mongoose.model("Notification", notificationSchema);

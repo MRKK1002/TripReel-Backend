@@ -1,3 +1,4 @@
+const { randomUUID } = require("crypto");
 const TripBooking = require("../models/TripBooking");
 const Batch = require("../models/Batch");
 const Package = require("../models/Package");
@@ -9,22 +10,56 @@ const {
 const { notifyUser } = require("./notificationController");
 const { getSetting } = require("./platformSettingsController");
 const escapeRegex = require("../utils/escapeRegex");
+const { getPagination, paginationMeta } = require("../utils/pagination");
+const {
+  parseDateKey,
+  dateKeyToISTStart,
+  getISTDateKey,
+  storedDateKey,
+  addDaysToDateKey,
+  isDateKeyPastInclusiveEnd,
+  isDateKeyStarted,
+  getISTDayRange,
+} = require("../utils/businessDate");
+const { batchLifecycle, isHistory } = require("../utils/lifecycle");
+const FlexibleDateInventory = require("../models/FlexibleDateInventory");
+const {
+  acquireFlexCapacityLease,
+  releaseFlexCapacityLease,
+  materializeDateInventory,
+} = require("../utils/flexibleInventory");
+const {
+  buildReservationClaimFilter,
+  buildReservationClaimPipeline,
+  buildReservationReleaseFilter,
+  buildReservationReleasePipeline,
+} = require("../utils/inventoryClaims");
+const {
+  buildPlatformCouponClaim,
+  buildPlatformCouponRelease,
+} = require("../utils/platformCouponClaims");
+const {
+  buildCanonicalAddonEntries,
+  summarizeAddonEntries,
+} = require("../utils/canonicalAddonServices");
 
-// Parse a YYYY-MM-DD date string as local (IST) midnight rather than UTC midnight.
-// new Date('2026-08-01') in Node treats it as UTC, which is 2026-07-31T18:30Z in IST —
-// the booking would be stored one day early. Since the server's TZ is Asia/Kolkata
-// (set in server.js), new Date(y, m, d) creates local midnight correctly.
-function parseLocalDateStr(str) {
-  if (!str) return null;
-  // Accept YYYY-MM-DD or ISO string — strip the time component first
-  const datePart = String(str).split("T")[0];
-  const parts = datePart.split("-").map(Number);
-  if (parts.length === 3 && parts.every((n) => !isNaN(n))) {
-    const [y, m, d] = parts;
-    return new Date(y, m - 1, d); // local midnight in TZ = Asia/Kolkata
-  }
-  return new Date(str); // fallback
+// Parse a canonical business date at IST midnight independent of server TZ.
+function parseLocalDateStr(value) {
+  if (!value) return null;
+  const raw = String(value).trim();
+  const key = raw.split("T")[0];
+  if (!parseDateKey(key)) return null;
+  if (raw.includes("T") && Number.isNaN(Date.parse(raw))) return null;
+  return dateKeyToISTStart(key);
 }
+
+function isBookingFinalizationPending(booking) {
+  return (
+    Number(booking?.requiredEffectsVersion) === 1 &&
+    booking?.requiredEffectsState !== "COMPLETED"
+  );
+}
+exports.isBookingFinalizationPending = isBookingFinalizationPending;
 
 // Most bookings an operator may cancel in one batch-cancel request. Each one
 // issues a synchronous Razorpay refund, so a bigger batch cannot finish inside a
@@ -141,49 +176,112 @@ async function computeAuthoritativePricing({
   platformCouponCode,
   userId,
   addonDays,
+  addonSchedule,
 }) {
+  if (!["batch", "flexible"].includes(bookingMode)) {
+    throw new Error("bookingMode must be exactly 'batch' or 'flexible'");
+  }
+
   const numSeats = Math.max(1, Number(seats) || 1);
   const pkg = await Package.findById(packageId);
-  if (!pkg) throw new Error("Package not found");
+  if (!pkg || !pkg.isActive || pkg.status !== "APPROVED") {
+    throw new Error("Package not found or not available");
+  }
+  if (pkg.bookingMode !== bookingMode) {
+    throw new Error(`This package only supports ${pkg.bookingMode} bookings.`);
+  }
 
-  let adultPrice, childPrice;
+  let adultPrice, childPrice, operatorId;
+  let flexInventoryId = null;
+  let addonTimingBooking = null;
 
   if (bookingMode === "flexible") {
+    if (!flexAvailabilityId) {
+      throw new Error("flexAvailabilityId is required for flexible bookings");
+    }
+    if (!flexStartDate) {
+      throw new Error("Please select a valid start date.");
+    }
+
     // Flexible booking — get pricing from FlexibleAvailability record
     const FlexibleAvailability = require("../models/FlexibleAvailability");
     const flex = await FlexibleAvailability.findById(flexAvailabilityId);
-    if (!flex || !flex.isActive)
+    if (!flex || !flex.isActive || flex.isArchived)
       throw new Error("Flexible availability not found or inactive");
     if (String(flex.packageId) !== String(packageId))
       throw new Error("Flexible availability does not belong to this package");
 
     // Validate chosen start date up-front (before charging) — future + in-window
-    if (flexStartDate) {
-      const chosen = parseLocalDateStr(flexStartDate);
-      const todayMid = new Date();
-      todayMid.setHours(0, 0, 0, 0);
-      const winStart = new Date(flex.startDate);
-      winStart.setHours(0, 0, 0, 0);
-      const winEnd = new Date(flex.endDate);
-      winEnd.setHours(0, 0, 0, 0);
-      if (!chosen) throw new Error("Please select a valid start date.");
-      if (chosen < todayMid)
-        throw new Error("The selected start date is in the past.");
-      if (chosen < winStart || chosen > winEnd)
-        throw new Error("The selected date is outside the available range.");
+    const chosenKey = String(flexStartDate).trim().split("T")[0];
+    const chosen = parseLocalDateStr(chosenKey);
+    const winStartKey = storedDateKey(flex.startDate);
+    const winEndKey = storedDateKey(flex.endDate);
+    if (!chosen || !parseDateKey(chosenKey))
+      throw new Error("Please select a valid start date.");
+    if (chosenKey < getISTDateKey())
+      throw new Error("The selected start date is in the past.");
+    if (chosenKey < winStartKey || chosenKey > winEndKey)
+      throw new Error("The selected date is outside the available range.");
+
+    const lease = await acquireFlexCapacityLease(flex._id);
+    let inventory;
+    try {
+      inventory = await materializeDateInventory(lease.item, chosenKey, {
+        syncCapacity: true,
+      });
+    } finally {
+      await releaseFlexCapacityLease(flex._id, lease.token);
+    }
+    flexInventoryId = inventory._id;
+    if (
+      inventory.capacity > 0 &&
+      numSeats > inventory.capacity - (inventory.bookedSeats || 0)
+    ) {
+      const remaining = Math.max(
+        0,
+        inventory.capacity - (inventory.bookedSeats || 0),
+      );
+      throw new Error(
+        remaining > 0
+          ? `Only ${remaining} seat${remaining > 1 ? "s" : ""} left for this start date.`
+          : "This start date is fully booked.",
+      );
     }
 
     adultPrice = flex.adultPrice;
     childPrice = flex.childPrice || 0;
+    operatorId = flex.operatorId;
+    addonTimingBooking = { flexStartDate: chosen };
   } else {
+    if (!batchId) throw new Error("batchId is required for batch bookings");
+
     // Batch booking — existing flow
     const batch = await Batch.findById(batchId);
-    if (!batch || !batch.isActive)
+    if (!batch || !batch.isActive || batch.isArchived)
       throw new Error("Batch not found or inactive");
     if (String(batch.packageId) !== String(packageId))
       throw new Error("Batch does not belong to this package");
+
+    const now = new Date();
+    if (isDateKeyPastInclusiveEnd(batch.bookingDeadline, now))
+      throw new Error("Booking deadline has passed for this batch");
+    if (batch.startDate <= now)
+      throw new Error("This trip has already started");
+
+    const available = Math.max(
+      0,
+      (batch.totalSeats || 0) - (batch.bookedSeats || 0),
+    );
+    if (numSeats > available) {
+      throw new Error(
+        `Only ${available} seat${available !== 1 ? "s" : ""} available`,
+      );
+    }
+
     adultPrice = batch.adultPrice;
     childPrice = batch.childPrice || 0;
+    operatorId = batch.operatorId;
+    addonTimingBooking = { batchId: { startDate: batch.startDate } };
   }
 
   // Resolve adult / child split (backward compatible — default all to adults)
@@ -193,46 +291,38 @@ async function computeAuthoritativePricing({
   const platformFeePercent = (await getSetting("platform_fee_percent")) ?? 10;
   const gstPercent = (await getSetting("gst_percent")) ?? 5;
 
-  // Addons — one creator per booking. Each selected addon-day adds:
-  //   base price (per service type from settings) + per-day outside-city surcharge + per-day extra charges
+  // Freeze one canonical immutable entry per service/day. This is the only
+  // add-on representation trusted after checkout creation.
   const photographerPrice =
     (await getSetting("photographer_base_price")) ?? 2000;
   const videographerPrice =
     (await getSetting("videographer_base_price")) ?? 2000;
-  let addonSurcharge = 0; // operator earnings portion (outside-city + extras)
-  let addonTotalPrice = 0;
-  if (addonDays) {
-    for (const name of Object.keys(addonDays)) {
-      const basePrice = pickAddonBasePrice(
-        name,
-        photographerPrice,
-        videographerPrice,
-      );
-      for (const dayIdx of addonDays[name] || []) {
-        const dayInfo = pkg.itinerary[dayIdx];
-        let sc = 0;
-        if (dayInfo?.isOutsideCity) {
-          // Per-day surcharge, fall back to package-level default
-          sc =
-            Number(dayInfo.outsideCityCharge) ||
-            Number(pkg.outsideCityCharge) ||
-            0;
-          // Add extra charges (entry fee, parking, etc.)
-          if (Array.isArray(dayInfo.extraCharges)) {
-            for (const ec of dayInfo.extraCharges) {
-              sc += Number(ec.amount) || 0;
-            }
-          }
-        }
-        addonSurcharge += sc;
-        addonTotalPrice += basePrice + sc;
-      }
-    }
+  let addonPlan = {
+    entries: [],
+    addonDays: {},
+    schedule: {},
+    bookingTypes: {},
+  };
+  if (addonDays && Object.keys(addonDays).length > 0) {
+    addonPlan = buildCanonicalAddonEntries({
+      booking: addonTimingBooking,
+      pkg,
+      addonDays,
+      addonSchedule,
+      photographerPrice,
+      reelmakerPrice: videographerPrice,
+      gstPercent,
+      paymentSource: { kind: "initial" },
+    });
   }
+  const addonSummary = summarizeAddonEntries(addonPlan.entries);
+  const addonSurcharge = addonSummary.addonSurcharge;
+  const addonTotalPrice = addonSummary.addonTotalPrice;
 
   // Coupon (read-only — no usage increment here)
   const code = (couponCode || "").trim().toUpperCase();
   let discountAmount = 0;
+  let operatorCouponId = null;
   // When a code was supplied but cannot be honoured, the caller must be told
   // instead of silently charging full price.
   let couponIssue = null;
@@ -242,15 +332,17 @@ async function computeAuthoritativePricing({
   if (code) {
     const Coupon = require("../models/Coupon");
     const now = new Date();
+    const dayStart = getISTDayRange(getISTDateKey(now)).start;
     // Flexible coupons are keyed by packageId, batch coupons by batchId
     const couponMatch =
-      bookingMode === "flexible" ? { packageId } : { batchId };
+      bookingMode === "flexible" ? { packageId, batchId: null } : { batchId };
     const coupon = await Coupon.findOne({
       ...couponMatch,
       code,
       isActive: true,
+      isArchived: { $ne: true },
       validFrom: { $lte: now },
-      validUntil: { $gte: now },
+      validUntil: { $gte: dayStart },
     });
     if (!coupon) {
       couponIssue = "This coupon is no longer valid.";
@@ -262,6 +354,7 @@ async function computeAuthoritativePricing({
       const meetsOrder =
         coupon.minOrderAmount === 0 || fareSubtotalRaw >= coupon.minOrderAmount;
       if (withinUsage && meetsGuests && meetsOrder) {
+        operatorCouponId = coupon._id;
         if (coupon.type === "percentage") {
           discountAmount = Math.round((fareSubtotalRaw * coupon.value) / 100);
           if (coupon.maxDiscount > 0 && discountAmount > coupon.maxDiscount)
@@ -285,6 +378,7 @@ async function computeAuthoritativePricing({
   // A booking may carry ONE coupon. Operator coupon takes precedence if both a
   // valid operator coupon and a platform code were somehow sent.
   let platformDiscountAmount = 0;
+  let platformCouponId = null;
   const platformCode = (platformCouponCode || "").trim().toUpperCase();
   if (platformCode && discountAmount === 0) {
     const { resolvePlatformCoupon } = require("../utils/platformCoupon");
@@ -297,6 +391,7 @@ async function computeAuthoritativePricing({
     });
     if (res.ok) {
       platformDiscountAmount = res.discount;
+      platformCouponId = res.coupon?._id || null;
       couponIssue = null;
     } else {
       couponIssue = res.reason || "This coupon is no longer valid.";
@@ -316,8 +411,43 @@ async function computeAuthoritativePricing({
     discountAmount,
     platformDiscountAmount,
   });
+  if (discountAmount > 0) pricing.couponCode = code;
+  if (platformDiscountAmount > 0) pricing.platformCouponCode = platformCode;
   // `couponIssue` is set only when a code was supplied and could not be applied.
-  return { totalAmount: pricing.totalAmount, couponIssue };
+  return {
+    totalAmount: pricing.totalAmount,
+    couponIssue,
+    pricing,
+    addonSurcharge,
+    addonTotalPrice,
+    addonServiceEntries: addonPlan.entries,
+    addonDays: addonPlan.addonDays,
+    addonSchedule: addonPlan.schedule,
+    addonBookingTypes: addonPlan.bookingTypes,
+    addonNames: [
+      ...new Set(addonPlan.entries.map((entry) => entry.displayName)),
+    ],
+    operatorCouponId,
+    platformCouponId,
+    source: {
+      adultPrice,
+      childPrice: childPrice || 0,
+      operatorId,
+      bookingMode,
+      packageId,
+      batchId: bookingMode === "batch" ? batchId : null,
+      flexAvailabilityId:
+        bookingMode === "flexible" ? flexAvailabilityId : null,
+      flexStartDateKey:
+        bookingMode === "flexible"
+          ? String(flexStartDate).trim().split("T")[0]
+          : null,
+      flexInventoryId: bookingMode === "flexible" ? flexInventoryId : null,
+      seats: numSeats,
+      adults: numAdults,
+      children: numChildren,
+    },
+  };
 }
 exports.computeAuthoritativePricing = computeAuthoritativePricing;
 
@@ -455,33 +585,148 @@ async function resolveRefundPercent(startDate) {
  */
 async function processCancellationRefund(
   booking,
-  { cancelledBy, reason, fullRefund },
+  { cancelledBy, reason, fullRefund } = {},
 ) {
-  // Compare-and-set is the cancellation lock. Exactly one concurrent caller can
-  // move a live booking to CANCELLED; only that winner may refund, restore
-  // inventory/counters, release coupon usage, or send downstream side effects.
-  const cancelledAt = new Date();
+  const CANCELLATION_LEASE_MS = 5 * 60 * 1000;
+  const token = randomUUID();
+  const now = new Date();
+  const leaseUntil = new Date(now.getTime() + CANCELLATION_LEASE_MS);
+
+  const persistedSummary = (current, newlyCompleted = false) => ({
+    refundAmount:
+      (Number(current.refundAmount) || 0) +
+      (Number(current.addonPurchaseRefundAmount) || 0),
+    initialRefundAmount: Number(current.refundAmount) || 0,
+    addonPurchaseRefundAmount: Number(current.addonPurchaseRefundAmount) || 0,
+    refundPercent: Number(current.refundPercent) || 0,
+    breakdown: current.refundBreakdown || {},
+    refundStatus: current.refundStatus,
+    financialSettlementState: current.financialSettlementState,
+    localEffectsCompleted: current.cancellationState === "COMPLETED",
+    refundMessage:
+      (Number(current.refundAmount) || 0) +
+        (Number(current.addonPurchaseRefundAmount) || 0) <=
+      0
+        ? "Cancellation completed; no refund is applicable."
+        : current.financialSettlementState === "RECONCILIATION_REQUIRED"
+          ? "Cancellation completed, but the refund requires manual attention."
+          : current.refundStatus === "REFUNDED"
+            ? "Refund processed by the payment provider."
+            : current.refundStatus === "PROCESSING"
+              ? "Refund was accepted and is still pending with the payment provider."
+              : ["FAILED", "MANUAL"].includes(current.refundStatus)
+                ? "Cancellation completed, but the refund requires manual attention."
+                : "Refund status is pending review.",
+    booking: current,
+    newlyCompleted,
+  });
+
+  let current = await TripBooking.findById(booking._id);
+  if (!current) {
+    const error = new Error("Booking not found");
+    error.statusCode = 404;
+    throw error;
+  }
+  if (
+    current.status === "CANCELLED" &&
+    (!current.cancellationState || current.cancellationState === "NONE")
+  ) {
+    const legacyError =
+      "Legacy cancellation has no durable effect markers; manual reconciliation is required before replay";
+    current = await TripBooking.findByIdAndUpdate(
+      current._id,
+      {
+        $set: {
+          cancellationState: "RECONCILIATION_REQUIRED",
+          cancellationError: legacyError,
+          financialSettlementState: "RECONCILIATION_REQUIRED",
+          cancellationLeaseToken: "",
+          cancellationLeaseUntil: null,
+        },
+      },
+      { new: true },
+    );
+    const error = new Error(legacyError);
+    error.statusCode = 409;
+    error.code = "CANCELLATION_RECONCILIATION_REQUIRED";
+    throw error;
+  }
+  if (isBookingFinalizationPending(current)) {
+    const error = new Error(
+      "Booking finalization is still processing and cannot be cancelled yet",
+    );
+    error.statusCode = 409;
+    error.code = "BOOKING_FINALIZATION_PENDING";
+    throw error;
+  }
+
+  if (
+    current.status === "CANCELLED" &&
+    current.cancellationState === "COMPLETED"
+  ) {
+    return persistedSummary(current, false);
+  }
+
+  const resuming = current.status === "CANCELLED";
+  const actor = resuming
+    ? current.cancelledBy || cancelledBy || "system"
+    : cancelledBy || current.cancelledBy || "system";
+  const cancellationReason = resuming
+    ? current.cancelReason || reason || `Cancelled by ${actor}`
+    : reason || current.cancelReason || `Cancelled by ${actor}`;
+  const isFullRefund = resuming
+    ? actor !== "user"
+    : fullRefund == null
+      ? actor !== "user"
+      : Boolean(fullRefund);
+
   const claimedBooking = await TripBooking.findOneAndUpdate(
     {
       _id: booking._id,
-      status: { $in: ["CONFIRMED", "PENDING"] },
+      $or: [
+        { status: { $in: ["CONFIRMED", "PENDING"] } },
+        {
+          status: "CANCELLED",
+          cancellationState: {
+            $nin: ["COMPLETED", "RECONCILIATION_REQUIRED"],
+          },
+          $or: [
+            { cancellationLeaseUntil: null },
+            { cancellationLeaseUntil: { $exists: false } },
+            { cancellationLeaseUntil: { $lte: now } },
+          ],
+        },
+      ],
     },
     {
       $set: {
         status: "CANCELLED",
-        cancelReason: reason || `Cancelled by ${cancelledBy}`,
-        cancelledBy,
-        cancelledAt,
+        cancelReason: cancellationReason,
+        cancelledBy: actor,
+        cancelledAt: current.cancelledAt || now,
+        cancellationState: "PROCESSING",
+        cancellationLeaseToken: token,
+        cancellationLeaseUntil: leaseUntil,
+        cancellationError: "",
       },
     },
     { new: true },
   );
 
   if (!claimedBooking) {
-    const current = await TripBooking.findById(booking._id).select("status");
+    current = await TripBooking.findById(booking._id);
+    if (
+      current?.status === "CANCELLED" &&
+      current.cancellationState === "COMPLETED"
+    ) {
+      return persistedSummary(current, false);
+    }
     const currentStatus = current?.status || "unknown";
     const error = new Error(
-      `Cannot cancel a ${currentStatus.toLowerCase()} booking`,
+      current?.cancellationState === "RECONCILIATION_REQUIRED"
+        ? current.cancellationError ||
+            "Cancellation requires manual reconciliation"
+        : `Cannot cancel a ${currentStatus.toLowerCase()} booking`,
     );
     error.statusCode = 400;
     error.code = "CANCELLATION_ALREADY_CLAIMED";
@@ -489,224 +734,992 @@ async function processCancellationRefund(
   }
   booking = claimedBooking;
 
-  const p = booking.pricing || {};
-  const fareSubtotal = Number(p.fareSubtotal) || 0;
-  const discountAmount = Number(p.discountAmount) || 0;
-  // Platform (admin) coupon was funded by the platform — the user did NOT pay
-  // this portion, so it can never be refunded back to the user.
-  const platformDiscountAmount = Number(p.platformDiscountAmount) || 0;
-  const netFare = Math.max(0, fareSubtotal - discountAmount);
-  // What the user actually paid toward the fare (after the platform's gift).
-  const userNetFare = Math.max(0, netFare - platformDiscountAmount);
-  const gst = Number(p.gstAmount) || 0;
-  const addon = Number(p.addonAmount) || 0;
-  const platformFeePercent = Number(p.platformFeePercent) || 0;
-
-  // ── Determine refund percentage ──────────────────────────────────────────
-  const refundPercent = fullRefund
-    ? 100
-    : await resolveRefundPercent(booking.snapshot?.startDate);
-
-  // ── Compute the split ──────────────────────────────────────────────────────
-  // User's fare refund is on what THEY paid (userNetFare), so the platform's
-  // gifted discount is never refunded as cash to the user.
-  const fareRefund = Math.round((userNetFare * refundPercent) / 100);
-  // Operator's retention is computed on the full netFare (operator was paid on
-  // the full fare — the platform absorbed the coupon, not the operator).
-  const operatorFareRefund = Math.round((netFare * refundPercent) / 100);
-  // Split GST: portion on fare vs portion on addons (GST was paid in full by user)
-  const gstOnFare =
-    netFare > 0 ? Math.round((gst * netFare) / (netFare + addon)) : 0;
-  const gstOnAddon = gst - gstOnFare;
-  const gstFareRefund = Math.round((gstOnFare * refundPercent) / 100);
-  // Addon: always fully refundable (with its GST)
-  const addonRefundable = true; // addons always get full refund on cancellation
-  const addonRefund = fullRefund
-    ? addon // operator/admin cancel → always refund addon
-    : addon; // user cancel → also full refund on addons
-  const gstAddonRefund = addonRefund > 0 ? gstOnAddon : 0;
-  const gstRefund = gstFareRefund + gstAddonRefund;
-
-  const retainedFare = netFare - operatorFareRefund;
-  const platformFeeOnRetained = fullRefund
-    ? 0
-    : Math.round((retainedFare * platformFeePercent) / 100);
-  const operatorRetained = fullRefund
-    ? 0
-    : retainedFare - platformFeeOnRetained;
-  const platformRetained = fullRefund
-    ? 0
-    : platformFeeOnRetained + (gst - gstRefund);
-
-  const userRefund = fareRefund + gstRefund + addonRefund;
-
-  const breakdown = {
-    fareRefund,
-    gstRefund,
-    addonRefund,
-    operatorRetained,
-    platformRetained,
-  };
-
-  // The status/cancellation metadata was atomically claimed above. Persist the
-  // calculated refund fields on that winner's document only.
-  booking.refundPercent = refundPercent;
-  booking.refundAmount = userRefund;
-  booking.refundBreakdown = breakdown;
-
-  // ── Issue Razorpay refund (or flag manual if no payment id) ───────────────
-  if (userRefund > 0) {
-    if (booking.razorpayPaymentId) {
-      const { refundPayment } = require("../utils/razorpayRefund");
-      const result = await refundPayment(
-        booking.razorpayPaymentId,
-        userRefund,
-        { bookingId: booking.bookingId, reason: reason || cancelledBy },
-      );
-      if (result.success) {
-        booking.refundId = result.refundId || "";
-        booking.refundStatus =
-          result.status === "processed" ? "REFUNDED" : "PROCESSING";
-        if (booking.refundStatus === "REFUNDED")
-          booking.refundedAt = new Date();
-      } else {
-        booking.refundStatus = "FAILED";
-        booking.refundError = result.error || "Refund failed";
-      }
-    } else {
-      // Legacy booking without payment id — admin must refund manually
-      booking.refundStatus = "MANUAL";
-      booking.refundError = "No Razorpay payment id — manual refund required";
+  const persist = async (fields) => {
+    const updated = await TripBooking.findOneAndUpdate(
+      {
+        _id: booking._id,
+        cancellationState: "PROCESSING",
+        cancellationLeaseToken: token,
+      },
+      { $set: fields },
+      { new: true },
+    );
+    if (!updated) {
+      const error = new Error("Cancellation lease was lost");
+      error.code = "CANCELLATION_ALREADY_CLAIMED";
+      error.statusCode = 400;
+      throw error;
     }
-  } else {
-    booking.refundStatus = "REFUNDED"; // nothing to refund (0% slab)
-    booking.refundedAt = new Date();
-  }
-
-  await booking.save();
-
-  // ── Refund audit log ────────────────────────────────────────────────────────
-  try {
-    const audit = require("../utils/audit");
-    audit.log({
-      action:
-        booking.refundStatus === "FAILED" ? "refund_failed" : "refund_issued",
-      actor: { type: "system" },
-      target: { type: "booking", id: booking._id, ref: booking.bookingId },
-      details: {
-        cancelledBy,
-        reason,
-        refundAmount: userRefund,
-        refundPercent,
-        refundStatus: booking.refundStatus,
-        refundId: booking.refundId || "",
-        paymentId: booking.razorpayPaymentId || "",
-        breakdown,
-      },
-    });
-  } catch {}
-
-  // ── Release seats + bookingCount (winner only, clamped at zero) ───────────
-  const seatsToRelease = Math.max(0, Number(booking.seats) || 0);
-  const clampedSeatRelease = [
-    {
-      $set: {
-        bookedSeats: {
-          $max: [
-            0,
-            {
-              $subtract: [{ $ifNull: ["$bookedSeats", 0] }, seatsToRelease],
-            },
-          ],
-        },
-      },
-    },
-  ];
-
-  if (booking.bookingMode === "flexible" && booking.flexAvailabilityId) {
-    const FlexibleAvailability = require("../models/FlexibleAvailability");
-    await FlexibleAvailability.updateOne(
-      { _id: booking.flexAvailabilityId },
-      clampedSeatRelease,
-    );
-  } else if (booking.batchId) {
-    await Batch.updateOne({ _id: booking.batchId }, clampedSeatRelease);
-  }
-
-  await Package.updateOne({ _id: booking.packageId }, [
-    {
-      $set: {
-        bookingCount: {
-          $max: [
-            0,
-            {
-              $subtract: [{ $ifNull: ["$bookingCount", 0] }, seatsToRelease],
-            },
-          ],
-        },
-      },
-    },
-  ]);
-
-  // ── Return the coupon usage slot (createBooking incremented usedCount) ─────
-  const usedCoupon = booking.pricing?.couponCode;
-  if (usedCoupon) {
-    try {
-      const Coupon = require("../models/Coupon");
-      const match = booking.batchId
-        ? { batchId: booking.batchId }
-        : { packageId: booking.packageId };
-      await Coupon.updateOne(
-        { ...match, code: usedCoupon, usedCount: { $gt: 0 } },
-        { $inc: { usedCount: -1 } },
-      );
-    } catch {}
-  }
-
-  // ── Return the platform (admin) coupon usage slot too ──────────────────────
-  const usedPlatformCoupon = booking.pricing?.platformCouponCode;
-  if (usedPlatformCoupon) {
-    try {
-      const PlatformCoupon = require("../models/PlatformCoupon");
-      await PlatformCoupon.updateOne(
-        { code: usedPlatformCoupon, usedCount: { $gt: 0 } },
-        { $inc: { usedCount: -1 } },
-      );
-    } catch {}
-  }
-
-  // ── Credit operator the cancellation retention (immediately) ─────────────
-  if (operatorRetained > 0) {
-    await creditOperatorWallet(
-      booking.operatorId,
-      operatorRetained,
-      booking._id,
-      `Cancellation retention — Booking ${booking.bookingId}`,
-      `cancellation-retention:${booking._id}`,
-      "CANCELLATION_RETENTION",
-    );
-  }
-
-  // ── Flag admin if addon was already dispatched to Snapja ──────────────────
-  if (booking.addonDispatched && addonRefund > 0) {
-    try {
-      const { notifyAdmin } = require("./notificationController");
-      notifyAdmin(
-        "Manual Snapja Reconciliation Needed",
-        `Booking ${booking.bookingId} cancelled after addon was dispatched to Snapja. ₹${addonRefund} refunded to user — reconcile with Snapja manually.`,
-        { type: "general", bookingId: booking._id.toString() },
-      );
-    } catch {}
-  }
-
-  return {
-    refundAmount: userRefund,
-    refundPercent,
-    breakdown,
-    refundStatus: booking.refundStatus,
-    booking,
+    booking = updated;
+    return updated;
   };
+
+  let refundSubmissionStarted = false;
+  let refundResultPersisted = false;
+  try {
+    const hasUnledgeredLegacyTopups =
+      !booking.initialPricing &&
+      (booking.addonTopupPaymentIds || []).length > 0;
+    const p =
+      booking.initialPricing ||
+      (hasUnledgeredLegacyTopups ? {} : booking.pricing || {});
+    const fareSubtotal = Number(p.fareSubtotal) || 0;
+    const discountAmount = Number(p.discountAmount) || 0;
+    const platformDiscountAmount = Number(p.platformDiscountAmount) || 0;
+    const netFare = Math.max(0, fareSubtotal - discountAmount);
+    const userNetFare = Math.max(0, netFare - platformDiscountAmount);
+    const gst = Number(p.gstAmount) || 0;
+    const addon = Number(p.addonAmount) || 0;
+    const platformFeePercent = Number(p.platformFeePercent) || 0;
+    const refundPercent = isFullRefund
+      ? 100
+      : await resolveRefundPercent(booking.snapshot?.startDate);
+    const fareRefund = Math.round((userNetFare * refundPercent) / 100);
+    const operatorFareRefund = Math.round((netFare * refundPercent) / 100);
+    const gstOnFare =
+      netFare > 0 ? Math.round((gst * netFare) / (netFare + addon)) : 0;
+    const gstOnAddon = gst - gstOnFare;
+    const gstFareRefund = Math.round((gstOnFare * refundPercent) / 100);
+    const addonRefund = addon;
+    const gstAddonRefund = addonRefund > 0 ? gstOnAddon : 0;
+    const gstRefund = gstFareRefund + gstAddonRefund;
+    const retainedFare = netFare - operatorFareRefund;
+    const platformFeeOnRetained = isFullRefund
+      ? 0
+      : Math.round((retainedFare * platformFeePercent) / 100);
+    const operatorRetained = isFullRefund
+      ? 0
+      : retainedFare - platformFeeOnRetained;
+    const platformRetained = isFullRefund
+      ? 0
+      : platformFeeOnRetained + (gst - gstRefund);
+    let userRefund = fareRefund + gstRefund + addonRefund;
+    const AddonEntryRefund = require("../models/AddonEntryRefund");
+    const ambiguousInitialEntryRefund = await AddonEntryRefund.findOne({
+      bookingId: booking._id,
+      paymentSource: "INITIAL",
+      $or: [
+        { status: "RECONCILIATION_REQUIRED" },
+        { status: "PROCESSING", refundId: "" },
+      ],
+    }).select("_id");
+    const priorInitialEntryRefunds = await AddonEntryRefund.aggregate([
+      {
+        $match: {
+          bookingId: booking._id,
+          paymentSource: "INITIAL",
+          status: { $in: ["REFUNDED", "PROCESSING"] },
+          refundId: { $ne: "" },
+        },
+      },
+      { $group: { _id: null, total: { $sum: "$amount" } } },
+    ]);
+    userRefund = Math.max(
+      0,
+      userRefund - Number(priorInitialEntryRefunds[0]?.total || 0),
+    );
+    userRefund = Math.min(
+      userRefund,
+      Number(booking.initialPaymentAmount) || Number(p.totalAmount) || 0,
+    );
+    if (hasUnledgeredLegacyTopups) userRefund = 0;
+    const breakdown = {
+      fareRefund,
+      gstRefund,
+      addonRefund,
+      operatorRetained,
+      platformRetained,
+    };
+
+    await persist({
+      refundPercent,
+      refundAmount: userRefund,
+      refundBreakdown: breakdown,
+    });
+
+    // Persist PROCESSING before submitting money movement. A later run never
+    // resubmits an acknowledged or ambiguous refund.
+    if (hasUnledgeredLegacyTopups || ambiguousInitialEntryRefund) {
+      await persist({
+        refundStatus: "MANUAL",
+        refundError: hasUnledgeredLegacyTopups
+          ? "Legacy booking mixes original and top-up pricing without durable per-payment amounts; financial reconciliation is required"
+          : "An ambiguous per-entry refund exists on the original payment; whole-payment refund is blocked pending reconciliation",
+        financialSettlementState: "RECONCILIATION_REQUIRED",
+      });
+    } else if (userRefund <= 0) {
+      if (booking.refundStatus !== "REFUNDED") {
+        await persist({
+          refundStatus: "REFUNDED",
+          refundedAt: new Date(),
+          refundError: "",
+        });
+      }
+    } else if (!booking.razorpayPaymentId) {
+      if (!booking.refundId && booking.refundStatus === "NONE") {
+        await persist({
+          refundStatus: "MANUAL",
+          refundError: "No Razorpay payment id — manual refund required",
+        });
+      }
+    } else if (
+      booking.refundId ||
+      booking.refundStatus === "REFUNDED" ||
+      (booking.refundStatus === "PROCESSING" && booking.refundId)
+    ) {
+      // Provider already acknowledged this refund; resume local effects only.
+    } else if (booking.refundStatus === "PROCESSING") {
+      const ambiguity =
+        "A prior refund submission may have reached the provider; reconcile before retrying";
+      // Financial ambiguity must not block durable local cleanup. Keep the
+      // refund in attention state, then continue inventory/coupon/chat effects.
+      await persist({
+        refundError: ambiguity,
+        financialSettlementState: "RECONCILIATION_REQUIRED",
+      });
+    } else if (!["FAILED", "MANUAL"].includes(booking.refundStatus)) {
+      const refundClaim = await TripBooking.findOneAndUpdate(
+        {
+          _id: booking._id,
+          cancellationState: "PROCESSING",
+          cancellationLeaseToken: token,
+          refundStatus: { $nin: ["PROCESSING", "REFUNDED"] },
+          initialAddonRefundInFlight: { $ne: true },
+        },
+        {
+          $set: {
+            refundStatus: "PROCESSING",
+            refundError: "Refund submission in progress",
+          },
+        },
+        { new: true },
+      );
+      if (!refundClaim) {
+        await persist({
+          refundStatus: "MANUAL",
+          refundError:
+            "A per-entry refund claimed the original payment concurrently; whole-payment refund is blocked",
+          financialSettlementState: "RECONCILIATION_REQUIRED",
+        });
+      } else {
+        booking = refundClaim;
+        refundSubmissionStarted = true;
+        const { refundPayment } = require("../utils/razorpayRefund");
+        const result = await refundPayment(
+          booking.razorpayPaymentId,
+          userRefund,
+          { bookingId: booking.bookingId, reason: cancellationReason },
+        );
+        if (result.success) {
+          await persist({
+            refundId: result.refundId || "",
+            refundStatus:
+              result.status === "processed" ? "REFUNDED" : "PROCESSING",
+            refundedAt: result.status === "processed" ? new Date() : null,
+            refundError: "",
+          });
+        } else {
+          await persist({
+            refundStatus: "FAILED",
+            refundError: result.error || "Refund failed",
+          });
+        }
+        refundResultPersisted = true;
+      }
+    }
+
+    const addonPurchaseRefund =
+      await require("../utils/addonPurchaseCancellation").refundAppliedAddonPurchases(
+        booking,
+        cancellationReason,
+      );
+    await persist({
+      addonPurchaseRefundAmount: addonPurchaseRefund.requestedAmount,
+      addonPurchaseRefundStatus: addonPurchaseRefund.status,
+      ...(addonPurchaseRefund.reconciliation
+        ? { financialSettlementState: "RECONCILIATION_REQUIRED" }
+        : {}),
+    });
+
+    if (!booking.inventoryReleasedAt) {
+      const seatsToRelease = Math.max(0, Number(booking.seats) || 0);
+      const releaseKey = String(booking._id);
+      const releasePipeline = [
+        {
+          $set: {
+            bookedSeats: {
+              $max: [
+                0,
+                {
+                  $subtract: [{ $ifNull: ["$bookedSeats", 0] }, seatsToRelease],
+                },
+              ],
+            },
+            inventoryReleaseClaimKeys: {
+              $setUnion: [
+                { $ifNull: ["$inventoryReleaseClaimKeys", []] },
+                [releaseKey],
+              ],
+            },
+          },
+        },
+      ];
+      if (booking.bookingMode === "flexible" && booking.flexInventoryId) {
+        await FlexibleDateInventory.updateOne(
+          {
+            _id: booking.flexInventoryId,
+            inventoryReleaseClaimKeys: { $ne: releaseKey },
+          },
+          releasePipeline,
+        );
+        // Keep the legacy parent counter as aggregate analytics only. It never
+        // gates new reservations, but remains useful to existing dashboards.
+        if (booking.flexAvailabilityId) {
+          const FlexibleAvailability = require("../models/FlexibleAvailability");
+          await FlexibleAvailability.updateOne(
+            {
+              _id: booking.flexAvailabilityId,
+              inventoryReleaseClaimKeys: { $ne: releaseKey },
+            },
+            releasePipeline,
+          );
+        }
+      } else if (
+        booking.bookingMode === "flexible" &&
+        booking.flexAvailabilityId
+      ) {
+        // Legacy flexible bookings predate per-date inventory.
+        const FlexibleAvailability = require("../models/FlexibleAvailability");
+        await FlexibleAvailability.updateOne(
+          {
+            _id: booking.flexAvailabilityId,
+            inventoryReleaseClaimKeys: { $ne: releaseKey },
+          },
+          releasePipeline,
+        );
+      } else if (booking.batchId) {
+        await Batch.updateOne(
+          {
+            _id: booking.batchId,
+            inventoryReleaseClaimKeys: { $ne: releaseKey },
+          },
+          releasePipeline,
+        );
+      }
+      await Package.updateOne(
+        {
+          _id: booking.packageId,
+          bookingCountReleaseKeys: { $ne: releaseKey },
+        },
+        [
+          {
+            $set: {
+              bookingCount: {
+                $max: [
+                  0,
+                  {
+                    $subtract: [
+                      { $ifNull: ["$bookingCount", 0] },
+                      seatsToRelease,
+                    ],
+                  },
+                ],
+              },
+              bookingCountReleaseKeys: {
+                $setUnion: [
+                  { $ifNull: ["$bookingCountReleaseKeys", []] },
+                  [releaseKey],
+                ],
+              },
+            },
+          },
+        ],
+      );
+      await persist({ inventoryReleasedAt: new Date() });
+    }
+
+    if (!booking.couponReleasedAt) {
+      const usedCoupon = booking.pricing?.couponCode;
+      if (usedCoupon) {
+        const Coupon = require("../models/Coupon");
+        const releaseKey = String(booking._id);
+        const match = booking.operatorCouponId
+          ? { _id: booking.operatorCouponId }
+          : booking.batchId
+            ? { batchId: booking.batchId, code: usedCoupon }
+            : { packageId: booking.packageId, batchId: null, code: usedCoupon };
+        await Coupon.updateOne(
+          { ...match, releaseClaimKeys: { $ne: releaseKey } },
+          [
+            {
+              $set: {
+                usedCount: {
+                  $max: [0, { $subtract: [{ $ifNull: ["$usedCount", 0] }, 1] }],
+                },
+                releaseClaimKeys: {
+                  $setUnion: [
+                    { $ifNull: ["$releaseClaimKeys", []] },
+                    [releaseKey],
+                  ],
+                },
+              },
+            },
+          ],
+        );
+      }
+      await persist({ couponReleasedAt: new Date() });
+    }
+
+    if (!booking.platformCouponReleasedAt) {
+      const usedPlatformCoupon = booking.pricing?.platformCouponCode;
+      if (usedPlatformCoupon) {
+        const PlatformCoupon = require("../models/PlatformCoupon");
+        const releaseKey = String(booking._id);
+        const release = buildPlatformCouponRelease({
+          couponId: booking.platformCouponId,
+          code: usedPlatformCoupon,
+          effectKey: releaseKey,
+          userId: booking.userId,
+        });
+        await PlatformCoupon.updateOne(release.filter, release.pipeline);
+      }
+      await persist({ platformCouponReleasedAt: new Date() });
+    }
+
+    if (!booking.retentionCreditedAt) {
+      if (operatorRetained > 0) {
+        await creditOperatorWallet(
+          booking.operatorId,
+          operatorRetained,
+          booking._id,
+          `Cancellation retention — Booking ${booking.bookingId}`,
+          `cancellation-retention:${booking._id}`,
+          "CANCELLATION_RETENTION",
+        );
+      }
+      await persist({ retentionCreditedAt: new Date() });
+    }
+
+    if (!booking.conversationClosedAt) {
+      const Conversation = require("../models/Conversation");
+      await Conversation.updateMany(
+        { bookingId: booking._id },
+        { isActive: false },
+      );
+      await persist({ conversationClosedAt: new Date() });
+    }
+
+    const financialSettlementState =
+      booking.financialSettlementState === "RECONCILIATION_REQUIRED" ||
+      booking.addonPurchaseRefundStatus === "RECONCILIATION_REQUIRED"
+        ? "RECONCILIATION_REQUIRED"
+        : booking.refundStatus === "REFUNDED" &&
+            ["NONE", "REFUNDED"].includes(
+              booking.addonPurchaseRefundStatus || "NONE",
+            )
+          ? "SETTLED"
+          : booking.refundStatus === "PROCESSING" ||
+              booking.addonPurchaseRefundStatus === "PROCESSING"
+            ? "PENDING"
+            : ["FAILED", "MANUAL"].includes(booking.refundStatus)
+              ? "RECONCILIATION_REQUIRED"
+              : userRefund <= 0 &&
+                  ["NONE", "REFUNDED"].includes(
+                    booking.addonPurchaseRefundStatus || "NONE",
+                  )
+                ? "SETTLED"
+                : "PENDING";
+
+    const completed = await TripBooking.findOneAndUpdate(
+      {
+        _id: booking._id,
+        cancellationState: "PROCESSING",
+        cancellationLeaseToken: token,
+      },
+      {
+        $set: {
+          cancellationState: "COMPLETED",
+          cancellationLeaseToken: "",
+          cancellationLeaseUntil: null,
+          cancellationError: "",
+          financialSettlementState,
+        },
+      },
+      { new: true },
+    );
+    if (!completed) throw new Error("Cancellation lease was lost");
+    booking = completed;
+
+    try {
+      const audit = require("../utils/audit");
+      audit.log({
+        action:
+          booking.refundStatus === "REFUNDED"
+            ? "refund_issued"
+            : booking.refundStatus === "PROCESSING"
+              ? "refund_pending"
+              : "refund_attention_required",
+        actor: { type: "system" },
+        target: { type: "booking", id: booking._id, ref: booking.bookingId },
+        details: {
+          cancelledBy: actor,
+          reason: cancellationReason,
+          refundAmount: userRefund,
+          refundPercent,
+          refundStatus: booking.refundStatus,
+          refundId: booking.refundId || "",
+          paymentId: booking.razorpayPaymentId || "",
+          breakdown,
+        },
+      });
+    } catch {}
+
+    if (booking.addonDispatched && addonRefund > 0) {
+      try {
+        const { notifyAdmin } = require("./notificationController");
+        notifyAdmin(
+          "Manual Snapja Reconciliation Needed",
+          `Booking ${booking.bookingId} cancelled after addon was dispatched to Snapja. ₹${addonRefund} is included in the cancellation refund calculation; provider status is ${booking.refundStatus}. Reconcile with Snapja manually.`,
+          { type: "general", bookingId: booking._id.toString() },
+        );
+      } catch {}
+    }
+
+    return persistedSummary(booking, true);
+  } catch (error) {
+    if (error.code === "CANCELLATION_RECONCILIATION_REQUIRED") throw error;
+    const message = String(error.message || error).slice(0, 500);
+    const requiresReconciliation =
+      refundSubmissionStarted && !refundResultPersisted;
+    await TripBooking.updateOne(
+      { _id: booking._id, cancellationLeaseToken: token },
+      {
+        $set: {
+          cancellationState: "PROCESSING",
+          cancellationLeaseToken: "",
+          cancellationLeaseUntil: null,
+          cancellationError: message,
+          ...(requiresReconciliation
+            ? { financialSettlementState: "RECONCILIATION_REQUIRED" }
+            : {}),
+        },
+      },
+    ).catch(() => {});
+    if (requiresReconciliation) {
+      error.code = "CANCELLATION_FINANCIAL_RECONCILIATION_REQUIRED";
+      error.statusCode = 409;
+    }
+    throw error;
+  }
 }
+exports.processCancellationRefund = processCancellationRefund;
+
+async function ensureRequiredBookingEffects(bookingOrId) {
+  let booking =
+    bookingOrId && bookingOrId._id
+      ? bookingOrId
+      : await TripBooking.findById(bookingOrId);
+  if (!booking) throw new Error("Booking not found while applying effects");
+
+  const Conversation = require("../models/Conversation");
+  if (booking.requiredEffectsState === "COMPLETED") {
+    if (
+      Number(booking.requiredEffectsVersion) === 1 &&
+      booking.status === "PENDING"
+    ) {
+      booking = await TripBooking.findOneAndUpdate(
+        {
+          _id: booking._id,
+          requiredEffectsVersion: 1,
+          requiredEffectsState: "COMPLETED",
+          status: "PENDING",
+        },
+        { $set: { status: "CONFIRMED" } },
+        { new: true },
+      );
+      if (!booking)
+        booking = await TripBooking.findById(bookingOrId._id || bookingOrId);
+    }
+    return {
+      booking,
+      conversation: await Conversation.findOne({ bookingId: booking._id }),
+    };
+  }
+
+  // Rows created before effect-versioning have ambiguous package/chat history.
+  // Replaying them could double-count, so keep those conservative.
+  if (Number(booking.requiredEffectsVersion) !== 1) {
+    const message =
+      "Legacy booking has no trustworthy post-insert effect claims; manual reconciliation is required";
+    await TripBooking.updateOne(
+      { _id: booking._id },
+      { $set: { requiredEffectsState: "RECONCILIATION_REQUIRED" } },
+    );
+    const error = new Error(message);
+    error.code = "BOOKING_EFFECTS_RECONCILIATION_REQUIRED";
+    throw error;
+  }
+
+  const effectKey = String(booking._id);
+  // Claim the race-sensitive platform coupon before any other aggregate effect.
+  // If eligibility was lost after quote time, finalization remains PENDING
+  // without partially incrementing package/operator-coupon aggregates.
+  if (booking.platformCouponId) {
+    const PlatformCoupon = require("../models/PlatformCoupon");
+    const now = new Date();
+    const [pkg, priorPublishedBooking] = await Promise.all([
+      Package.findById(booking.packageId).select(
+        "category categories state city operatorId",
+      ),
+      TripBooking.exists({
+        _id: { $ne: booking._id },
+        userId: booking.userId,
+        status: { $in: ["CONFIRMED", "COMPLETED"] },
+      }),
+    ]);
+    if (!pkg) throw new Error("Booking package no longer exists");
+    const claim = buildPlatformCouponClaim({
+      couponId: booking.platformCouponId,
+      effectKey,
+      userId: booking.userId,
+      packageId: booking.packageId,
+      operatorId: booking.operatorId,
+      pkg,
+      seats: Math.max(0, Number(booking.seats) || 0),
+      fareSubtotal: Math.max(0, Number(booking.pricing?.fareSubtotal) || 0),
+      now,
+      hasPriorPublishedBooking: Boolean(priorPublishedBooking),
+    });
+    const couponEffect = await PlatformCoupon.updateOne(
+      claim.filter,
+      claim.pipeline,
+    );
+    if (couponEffect.matchedCount === 0) {
+      throw new Error(
+        "Platform coupon is no longer eligible or has reached its usage limit",
+      );
+    }
+  }
+
+  const packageEffect = await Package.updateOne(
+    { _id: booking.packageId, bookingCountClaimKeys: { $ne: effectKey } },
+    {
+      $inc: { bookingCount: Math.max(0, Number(booking.seats) || 0) },
+      $addToSet: { bookingCountClaimKeys: effectKey },
+    },
+  );
+  if (packageEffect.matchedCount === 0) {
+    const packageExists = await Package.exists({ _id: booking.packageId });
+    if (!packageExists) throw new Error("Booking package no longer exists");
+  }
+  await TripBooking.updateOne(
+    { _id: booking._id },
+    { $set: { packageCountAppliedAt: new Date() } },
+  );
+
+  if (booking.operatorCouponId) {
+    const Coupon = require("../models/Coupon");
+    const now = new Date();
+    const dayStart = getISTDayRange(getISTDateKey(now)).start;
+    const scopeMatch =
+      booking.bookingMode === "flexible"
+        ? { packageId: booking.packageId, batchId: null }
+        : { batchId: booking.batchId };
+    const couponEffect = await Coupon.updateOne(
+      {
+        _id: booking.operatorCouponId,
+        ...scopeMatch,
+        $or: [
+          { usageClaimKeys: effectKey },
+          {
+            $and: [
+              { isActive: true },
+              { isArchived: { $ne: true } },
+              { validFrom: { $lte: now } },
+              { validUntil: { $gte: dayStart } },
+              { minGuests: { $lte: Number(booking.seats) || 0 } },
+              {
+                minOrderAmount: {
+                  $lte: Number(booking.pricing?.fareSubtotal) || 0,
+                },
+              },
+              {
+                $or: [
+                  { usageLimit: 0 },
+                  {
+                    $expr: {
+                      $lt: [{ $ifNull: ["$usedCount", 0] }, "$usageLimit"],
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+      [
+        {
+          $set: {
+            usedCount: {
+              $cond: [
+                { $in: [effectKey, { $ifNull: ["$usageClaimKeys", []] }] },
+                { $ifNull: ["$usedCount", 0] },
+                { $add: [{ $ifNull: ["$usedCount", 0] }, 1] },
+              ],
+            },
+            everUsedCount: {
+              $cond: [
+                { $in: [effectKey, { $ifNull: ["$usageClaimKeys", []] }] },
+                { $ifNull: ["$everUsedCount", 0] },
+                { $add: [{ $ifNull: ["$everUsedCount", 0] }, 1] },
+              ],
+            },
+            firstUsedAt: {
+              $cond: [
+                { $in: [effectKey, { $ifNull: ["$usageClaimKeys", []] }] },
+                "$firstUsedAt",
+                { $ifNull: ["$firstUsedAt", now] },
+              ],
+            },
+            lastUsedAt: {
+              $cond: [
+                { $in: [effectKey, { $ifNull: ["$usageClaimKeys", []] }] },
+                "$lastUsedAt",
+                now,
+              ],
+            },
+            usageClaimKeys: {
+              $setUnion: [{ $ifNull: ["$usageClaimKeys", []] }, [effectKey]],
+            },
+          },
+        },
+      ],
+    );
+    if (couponEffect.matchedCount === 0) {
+      throw new Error(
+        "Operator coupon is no longer eligible or has reached capacity",
+      );
+    }
+  }
+
+  const tripStart = new Date(
+    booking.snapshot?.startDate || booking.flexStartDate || booking.createdAt,
+  );
+  const tripEnd = new Date(
+    booking.snapshot?.endDate || booking.flexEndDate || tripStart,
+  );
+  const expiresAt = new Date(tripEnd.getTime() + 2 * 24 * 60 * 60 * 1000);
+  const conversation = await Conversation.findOneAndUpdate(
+    { bookingId: booking._id },
+    {
+      $setOnInsert: {
+        bookingId: booking._id,
+        userId: booking.userId,
+        operatorId: booking.operatorId,
+        packageTitle: booking.snapshot?.packageTitle || "",
+        packageImage: booking.snapshot?.packageImageUrl || "",
+        startsAt: new Date(),
+        expiresAt,
+        lastMessage: "New booking received",
+        lastMessageAt: new Date(),
+        lastSenderType: "system",
+      },
+    },
+    { upsert: true, new: true },
+  );
+  await TripBooking.updateOne(
+    { _id: booking._id },
+    { $set: { conversationPreparedAt: new Date() } },
+  );
+
+  const User = require("../models/User");
+  const user = await User.findById(booking.userId).select("name phone");
+  const formatDate = (date) =>
+    new Date(date).toLocaleDateString("en-IN", {
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+    });
+  const summaryText = `📋 New Booking!\n\n🎯 Package: ${booking.snapshot?.packageTitle || "Trip"}\n📅 Dates: ${formatDate(tripStart)} — ${formatDate(tripEnd)}\n👥 Travelers: ${booking.seats}\n🆔 Booking ID: ${booking.bookingId}\n👤 Name: ${user?.name || "User"}\n📱 Phone: ${user?.phone || "—"}\n\nChat is active until ${formatDate(expiresAt)}`;
+  const Message = require("../models/Message");
+  await Message.findOneAndUpdate(
+    { effectKey: `booking-summary:${effectKey}` },
+    {
+      $setOnInsert: {
+        conversationId: conversation._id,
+        senderId: booking.userId,
+        senderType: "user",
+        senderName: "System",
+        text: summaryText,
+        effectKey: `booking-summary:${effectKey}`,
+      },
+    },
+    { upsert: true, new: true },
+  );
+
+  booking = await TripBooking.findOneAndUpdate(
+    { _id: booking._id, requiredEffectsVersion: 1 },
+    {
+      $set: {
+        systemMessagePreparedAt: new Date(),
+        requiredEffectsState: "COMPLETED",
+        status: "CONFIRMED",
+      },
+    },
+    { new: true },
+  );
+  if (!booking) throw new Error("Could not persist booking effect completion");
+  return { booking, conversation };
+}
+exports.ensureRequiredBookingEffects = ensureRequiredBookingEffects;
+
+function requireDeliverySuccess(result, channel) {
+  if (!result) throw new Error(`${channel} confirmation delivery failed`);
+  return result;
+}
+exports.requireDeliverySuccess = requireDeliverySuccess;
+
+async function deliverBookingConfirmation(bookingOrId) {
+  const bookingId = bookingOrId?._id || bookingOrId;
+  const token = randomUUID();
+  const now = new Date();
+  const claimed = await TripBooking.findOneAndUpdate(
+    {
+      _id: bookingId,
+      status: "CONFIRMED",
+      requiredEffectsState: "COMPLETED",
+      $or: [
+        { confirmationDeliveryState: { $exists: false } },
+        { confirmationDeliveryState: { $in: ["PENDING", "FAILED"] } },
+        {
+          confirmationDeliveryState: "PROCESSING",
+          confirmationDeliveryLeaseUntil: { $lte: now },
+        },
+      ],
+    },
+    {
+      $set: {
+        confirmationDeliveryState: "PROCESSING",
+        confirmationDeliveryToken: token,
+        confirmationDeliveryLeaseUntil: new Date(now.getTime() + 5 * 60 * 1000),
+        confirmationDeliveryError: "",
+      },
+      $inc: { confirmationDeliveryAttempts: 1 },
+    },
+    { new: true },
+  );
+  if (!claimed) {
+    const current = await TripBooking.findById(bookingId).select(
+      "confirmationDeliveryState confirmationSentAt",
+    );
+    return current?.confirmationDeliveryState === "COMPLETED";
+  }
+
+  const markChannel = async (field) => {
+    const marked = await TripBooking.updateOne(
+      {
+        _id: claimed._id,
+        confirmationDeliveryState: "PROCESSING",
+        confirmationDeliveryToken: token,
+      },
+      { $set: { [field]: new Date() } },
+    );
+    if (marked.matchedCount !== 1)
+      throw new Error("Confirmation delivery lease was lost");
+    claimed[field] = new Date();
+  };
+
+  try {
+    const User = require("../models/User");
+    const Conversation = require("../models/Conversation");
+    const [{ Operator }, user, pkg, conversation] = await Promise.all([
+      Promise.resolve(require("../models/Operator")),
+      User.findById(claimed.userId).select("name email phone"),
+      Package.findById(claimed.packageId),
+      Conversation.findOne({ bookingId: claimed._id }),
+    ]);
+    if (!pkg || !user || !conversation) {
+      throw new Error("Confirmation delivery dependencies are incomplete");
+    }
+    const {
+      notifyUserStrict,
+      notifyOperatorStrict,
+      notifyAdminStrict,
+    } = require("./notificationController");
+
+    if (!claimed.userConfirmationSentAt) {
+      requireDeliverySuccess(
+        await notifyUserStrict(
+          claimed.userId,
+          "Booking Confirmed! 🎉",
+          `Your trip to ${pkg.title} is confirmed. ${claimed.seats} seat${claimed.seats > 1 ? "s" : ""} booked.`,
+          {
+            type: "booking_confirmed",
+            bookingId: String(claimed._id),
+            effectKey: `booking-confirmation:user:${claimed._id}:${claimed.userId}`,
+          },
+        ),
+        "User notification",
+      );
+      await markChannel("userConfirmationSentAt");
+    }
+    if (!claimed.operatorConfirmationSentAt) {
+      requireDeliverySuccess(
+        await notifyOperatorStrict(
+          claimed.operatorId,
+          "New Booking! 🎊",
+          `${user.name || "A user"} booked ${pkg.title} — ${claimed.seats} seat${claimed.seats > 1 ? "s" : ""}. ₹${Number(claimed.pricing?.operatorAmount || 0).toLocaleString("en-IN")} earning.`,
+          {
+            type: "new_booking",
+            bookingId: String(claimed._id),
+            effectKey: `booking-confirmation:operator:${claimed._id}:${claimed.operatorId}`,
+          },
+        ),
+        "Operator notification",
+      );
+      await markChannel("operatorConfirmationSentAt");
+    }
+    if (!claimed.adminConfirmationSentAt) {
+      requireDeliverySuccess(
+        await notifyAdminStrict(
+          "New Booking",
+          `${user.name || "User"} booked ${pkg.title} — ₹${Number(claimed.pricing?.totalAmount || 0).toLocaleString("en-IN")}`,
+          {
+            type: "new_booking",
+            bookingId: String(claimed._id),
+            effectKey: `booking-confirmation:admin:${claimed._id}`,
+          },
+        ),
+        "Admin notification",
+      );
+      await markChannel("adminConfirmationSentAt");
+    }
+
+    const fmtDate = (value) =>
+      value
+        ? new Date(value).toLocaleDateString("en-IN", {
+            day: "2-digit",
+            month: "short",
+            year: "numeric",
+          })
+        : "-";
+    if (!claimed.itineraryConfirmationSentAt) {
+      const itineraryLines = (pkg.itinerary || [])
+        .filter((day) => day.title)
+        .map((day) => {
+          const points = (day.points || [])
+            .filter(Boolean)
+            .map((point) => `  • ${point}`)
+            .join("\n");
+          return `Day ${day.day}: ${day.title}${points ? `\n${points}` : ""}`;
+        })
+        .join("\n\n");
+      const itineraryText = [
+        `📋 Your Itinerary — ${pkg.title}`,
+        `📍 ${pkg.location || ""}`,
+        `📅 ${fmtDate(claimed.snapshot?.startDate)} → ${fmtDate(claimed.snapshot?.endDate)}`,
+        itineraryLines,
+        pkg.inclusions?.length
+          ? `✅ Inclusions: ${pkg.inclusions.filter(Boolean).join(", ")}`
+          : "",
+        pkg.exclusions?.length
+          ? `❌ Exclusions: ${pkg.exclusions.filter(Boolean).join(", ")}`
+          : "",
+        "Your operator will share pickup details and transport info closer to the trip date.",
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+      const Message = require("../models/Message");
+      await Message.findOneAndUpdate(
+        { effectKey: `booking-itinerary:${claimed._id}` },
+        {
+          $setOnInsert: {
+            conversationId: conversation._id,
+            senderId: claimed.operatorId,
+            senderType: "operator",
+            senderName: "Trip Reel",
+            text: itineraryText,
+            effectKey: `booking-itinerary:${claimed._id}`,
+          },
+        },
+        { upsert: true, new: true },
+      );
+      await markChannel("itineraryConfirmationSentAt");
+    }
+
+    if (!claimed.emailConfirmationSentAt) {
+      if (user.email) {
+        const operator = await Operator.findById(claimed.operatorId).select(
+          "businessName contactName phone",
+        );
+        const { sendBookingConfirmation } = require("../utils/sendMail");
+        requireDeliverySuccess(
+          await sendBookingConfirmation({
+            to: user.email,
+            userName: user.name || "Traveler",
+            bookingDetails: {
+              bookingId: claimed.bookingId,
+              userName: user.name || "Traveler",
+              packageName: pkg.title,
+              packageLocation: pkg.location,
+              batchDate: `${fmtDate(claimed.snapshot?.startDate)} - ${fmtDate(claimed.snapshot?.endDate)}`,
+              seats: claimed.seats,
+              totalAmount: claimed.pricing?.totalAmount,
+              travelers: claimed.travelers || [],
+              itinerary: pkg.itinerary || [],
+              inclusions: pkg.inclusions || [],
+              operatorName: operator?.businessName || operator?.contactName,
+              operatorPhone: operator?.phone,
+              paymentId: claimed.razorpayPaymentId || "",
+              addonNames: claimed.addonNames || [],
+              addonTotalPrice: claimed.addonTotalPrice || 0,
+              addonDays: claimed.addonDays,
+              itineraryDays: pkg.itinerary || [],
+            },
+          }),
+          "Booking email",
+        );
+      }
+      await markChannel("emailConfirmationSentAt");
+    }
+
+    const completedAt = new Date();
+    const completed = await TripBooking.updateOne(
+      {
+        _id: claimed._id,
+        confirmationDeliveryState: "PROCESSING",
+        confirmationDeliveryToken: token,
+      },
+      {
+        $set: {
+          confirmationDeliveryState: "COMPLETED",
+          confirmationDeliveryToken: "",
+          confirmationDeliveryLeaseUntil: null,
+          confirmationDeliveryError: "",
+          confirmationSentAt: completedAt,
+        },
+      },
+    );
+    return completed.matchedCount === 1;
+  } catch (error) {
+    await TripBooking.updateOne(
+      { _id: claimed._id, confirmationDeliveryToken: token },
+      {
+        $set: {
+          confirmationDeliveryState: "FAILED",
+          confirmationDeliveryToken: "",
+          confirmationDeliveryLeaseUntil: null,
+          confirmationDeliveryError: String(error.message || error).slice(
+            0,
+            500,
+          ),
+        },
+      },
+    ).catch(() => {});
+    return false;
+  }
+}
+exports.deliverBookingConfirmation = deliverBookingConfirmation;
 
 // ── User ──────────────────────────────────────────────────────────────────────
 
@@ -726,16 +1739,61 @@ exports.createBooking = async (req, res) => {
       });
     }
 
-    const { packageId, batchId, seats = 1 } = req.body;
+    const { packageId, batchId, seats = 1, bookingMode } = req.body;
 
-    if (!packageId || (!batchId && req.body.bookingMode !== "flexible")) {
+    if (!["batch", "flexible"].includes(bookingMode)) {
       return res.status(400).json({
         success: false,
-        message: "packageId and batchId (or bookingMode=flexible) are required",
+        message: "bookingMode must be exactly 'batch' or 'flexible'",
       });
     }
 
-    const isFlexible = req.body.bookingMode === "flexible";
+    const isFlexible = bookingMode === "flexible";
+    const chargedQuote = req._chargedPricingSnapshot || null;
+    if (!chargedQuote) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "Authoritative charged pricing snapshot is required for booking finalization.",
+      });
+    }
+    if (
+      chargedQuote &&
+      (String(chargedQuote.source?.packageId) !== String(packageId) ||
+        chargedQuote.source?.bookingMode !== bookingMode ||
+        Number(chargedQuote.source?.seats) !== Math.max(1, Number(seats) || 1))
+    ) {
+      return res.status(409).json({
+        success: false,
+        message: "Charged pricing snapshot does not match this booking",
+      });
+    }
+    if (
+      !packageId ||
+      (!isFlexible && !batchId) ||
+      (isFlexible && !req.body.flexAvailabilityId)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "packageId and the matching batch or flexible availability are required",
+      });
+    }
+
+    // Validate package state and booking mode before any capacity mutation.
+    const pkg = await Package.findById(packageId);
+    if (!pkg || !pkg.isActive || pkg.status !== "APPROVED") {
+      return res.status(404).json({
+        success: false,
+        message: "Package not found or not available",
+      });
+    }
+    if (pkg.bookingMode !== bookingMode) {
+      return res.status(400).json({
+        success: false,
+        message: `This package only supports ${pkg.bookingMode} bookings.`,
+      });
+    }
 
     const numSeats = Math.max(1, Number(seats) || 1);
     const hasSplit = req.body.adults != null;
@@ -748,6 +1806,16 @@ exports.createBooking = async (req, res) => {
 
     let batch = null;
     let flexRecord = null;
+    let flexInventory = null;
+    let flexStartDateKey = null;
+    const reservationOrderKey = String(
+      req.body.razorpayOrderId ||
+        req._paymentFinalization?.orderId ||
+        req.body.paymentId ||
+        "",
+    );
+    const flexReservationClaimKey = isFlexible ? reservationOrderKey : "";
+    const batchReservationClaimKey = isFlexible ? "" : reservationOrderKey;
     let adultPrice, childPrice, operatorId;
 
     if (isFlexible) {
@@ -756,7 +1824,7 @@ exports.createBooking = async (req, res) => {
       flexRecord = await FlexibleAvailability.findById(
         req.body.flexAvailabilityId,
       );
-      if (!flexRecord || !flexRecord.isActive) {
+      if (!flexRecord || !flexRecord.isActive || flexRecord.isArchived) {
         return res.status(404).json({
           success: false,
           message: "Flexible availability not found or inactive",
@@ -772,26 +1840,32 @@ exports.createBooking = async (req, res) => {
       // ── Validate the chosen start date is in the future AND inside the
       // operator's available window. Without this a user could book a past date
       // or a date outside the range — breaking scheduling & refund slabs.
-      const chosenStart = parseLocalDateStr(req.body.flexStartDate);
-      if (!chosenStart) {
+      flexStartDateKey = String(req.body.flexStartDate || "")
+        .trim()
+        .split("T")[0];
+      const chosenStart = parseLocalDateStr(flexStartDateKey);
+      if (!chosenStart || !parseDateKey(flexStartDateKey)) {
         return res.status(400).json({
           success: false,
           message: "Please select a valid start date.",
         });
       }
-      const todayMid = new Date();
-      todayMid.setHours(0, 0, 0, 0);
-      const winStart = new Date(flexRecord.startDate);
-      winStart.setHours(0, 0, 0, 0);
-      const winEnd = new Date(flexRecord.endDate);
-      winEnd.setHours(0, 0, 0, 0);
-      if (chosenStart < todayMid) {
+      if (!flexReservationClaimKey) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "A stable payment order is required to reserve flexible inventory.",
+        });
+      }
+      const winStartKey = storedDateKey(flexRecord.startDate);
+      const winEndKey = storedDateKey(flexRecord.endDate);
+      if (flexStartDateKey < getISTDateKey()) {
         return res.status(400).json({
           success: false,
           message: "The selected start date is in the past.",
         });
       }
-      if (chosenStart < winStart || chosenStart > winEnd) {
+      if (flexStartDateKey < winStartKey || flexStartDateKey > winEndKey) {
         return res.status(400).json({
           success: false,
           message: "The selected date is outside the available range.",
@@ -802,52 +1876,159 @@ exports.createBooking = async (req, res) => {
       childPrice = flexRecord.childPrice || 0;
       operatorId = flexRecord.operatorId;
 
-      // ── Capacity check (atomic, like the batch path) ────────────────────────
-      // maxBookings of 0 means unlimited. Otherwise, atomically reserve seats.
-      if (flexRecord.maxBookings > 0) {
-        const FlexibleAvailability = require("../models/FlexibleAvailability");
-        const reserved = await FlexibleAvailability.findOneAndUpdate(
+      const capacityLease = await acquireFlexCapacityLease(flexRecord._id);
+      try {
+        flexRecord = capacityLease.item;
+        flexInventory = await materializeDateInventory(
+          flexRecord,
+          flexStartDateKey,
+          { syncCapacity: true },
+        );
+
+        const reserved = await FlexibleDateInventory.findOneAndUpdate(
           {
-            _id: flexRecord._id,
-            $expr: {
-              $lte: [{ $add: ["$bookedSeats", numSeats] }, "$maxBookings"],
-            },
+            _id: flexInventory._id,
+            $or: [
+              {
+                reservationClaimKeys: flexReservationClaimKey,
+                inventoryReleaseClaimKeys: { $ne: flexReservationClaimKey },
+              },
+              { capacity: 0 },
+              {
+                $expr: {
+                  $lte: [
+                    { $add: [{ $ifNull: ["$bookedSeats", 0] }, numSeats] },
+                    "$capacity",
+                  ],
+                },
+              },
+            ],
           },
-          { $inc: { bookedSeats: numSeats } },
+          [
+            {
+              $set: {
+                bookedSeats: {
+                  $cond: [
+                    {
+                      $and: [
+                        {
+                          $in: [
+                            flexReservationClaimKey,
+                            { $ifNull: ["$reservationClaimKeys", []] },
+                          ],
+                        },
+                        {
+                          $not: [
+                            {
+                              $in: [
+                                flexReservationClaimKey,
+                                { $ifNull: ["$inventoryReleaseClaimKeys", []] },
+                              ],
+                            },
+                          ],
+                        },
+                      ],
+                    },
+                    { $ifNull: ["$bookedSeats", 0] },
+                    { $add: [{ $ifNull: ["$bookedSeats", 0] }, numSeats] },
+                  ],
+                },
+                reservationClaimKeys: {
+                  $setUnion: [
+                    { $ifNull: ["$reservationClaimKeys", []] },
+                    [flexReservationClaimKey],
+                  ],
+                },
+                inventoryReleaseClaimKeys: {
+                  $setDifference: [
+                    { $ifNull: ["$inventoryReleaseClaimKeys", []] },
+                    [flexReservationClaimKey],
+                  ],
+                },
+              },
+            },
+          ],
           { new: true },
         );
         if (!reserved) {
-          const remaining = Math.max(
-            0,
-            flexRecord.maxBookings - (flexRecord.bookedSeats || 0),
+          const current = await FlexibleDateInventory.findById(
+            flexInventory._id,
           );
-          return res.status(400).json({
+          const remaining =
+            current?.capacity === 0
+              ? null
+              : Math.max(
+                  0,
+                  (current?.capacity || 0) - (current?.bookedSeats || 0),
+                );
+          return res.status(409).json({
             success: false,
             message:
               remaining > 0
-                ? `Only ${remaining} seat${remaining > 1 ? "s" : ""} left for these dates.`
-                : "This date range is fully booked.",
+                ? `Only ${remaining} seat${remaining === 1 ? "" : "s"} left for this start date.`
+                : "This start date is fully booked.",
           });
         }
-      } else {
-        // Unlimited — still track for analytics, non-atomic is fine
-        const FlexibleAvailability = require("../models/FlexibleAvailability");
-        await FlexibleAvailability.updateOne(
-          { _id: flexRecord._id },
-          { $inc: { bookedSeats: numSeats } },
-        );
+        flexInventory = reserved;
+
+        await FlexibleAvailability.updateOne({ _id: flexRecord._id }, [
+          {
+            $set: {
+              bookedSeats: {
+                $cond: [
+                  {
+                    $and: [
+                      {
+                        $in: [
+                          flexReservationClaimKey,
+                          { $ifNull: ["$inventoryReservationClaimKeys", []] },
+                        ],
+                      },
+                      {
+                        $not: [
+                          {
+                            $in: [
+                              flexReservationClaimKey,
+                              { $ifNull: ["$inventoryReleaseClaimKeys", []] },
+                            ],
+                          },
+                        ],
+                      },
+                    ],
+                  },
+                  { $ifNull: ["$bookedSeats", 0] },
+                  { $add: [{ $ifNull: ["$bookedSeats", 0] }, numSeats] },
+                ],
+              },
+              inventoryReservationClaimKeys: {
+                $setUnion: [
+                  { $ifNull: ["$inventoryReservationClaimKeys", []] },
+                  [flexReservationClaimKey],
+                ],
+              },
+              inventoryReleaseClaimKeys: {
+                $setDifference: [
+                  { $ifNull: ["$inventoryReleaseClaimKeys", []] },
+                  [flexReservationClaimKey],
+                ],
+              },
+            },
+          },
+        ]);
+      } finally {
+        await releaseFlexCapacityLease(flexRecord._id, capacityLease.token);
       }
     } else {
       // ── Batch booking — existing flow ──────────────────────────────────────
       batch = await Batch.findById(batchId);
-      if (!batch || !batch.isActive) {
+      if (!batch || !batch.isActive || batch.isArchived) {
         return res.status(404).json({
           success: false,
           message: "Batch not found or not available",
         });
       }
       const now = new Date();
-      if (batch.bookingDeadline < now) {
+      if (isDateKeyPastInclusiveEnd(batch.bookingDeadline, now)) {
         return res.status(400).json({
           success: false,
           message: "Booking deadline has passed for this batch",
@@ -864,21 +2045,23 @@ exports.createBooking = async (req, res) => {
           message: "Batch does not belong to this package",
         });
       }
-      const available = batch.totalSeats - batch.bookedSeats;
-      if (numSeats > available) {
-        return res.status(400).json({
+      if (!batchReservationClaimKey) {
+        return res.status(409).json({
           success: false,
-          message: `Only ${available} seat${available !== 1 ? "s" : ""} available`,
+          message:
+            "A stable payment order is required to reserve batch inventory.",
         });
       }
       const seatReserved = await Batch.findOneAndUpdate(
-        {
-          _id: batchId,
-          $expr: {
-            $lte: [{ $add: ["$bookedSeats", numSeats] }, "$totalSeats"],
-          },
-        },
-        { $inc: { bookedSeats: numSeats } },
+        buildReservationClaimFilter({
+          id: batchId,
+          claimKey: batchReservationClaimKey,
+          seats: numSeats,
+        }),
+        buildReservationClaimPipeline({
+          claimKey: batchReservationClaimKey,
+          seats: numSeats,
+        }),
         { new: true },
       );
       if (!seatReserved) {
@@ -893,53 +2076,138 @@ exports.createBooking = async (req, res) => {
       operatorId = batch.operatorId;
     }
 
+    // Paid finalization uses the immutable quote that produced the captured
+    // provider amount. Live records above were consulted only for eligibility,
+    // ownership, dates, and atomic capacity reservation.
+    if (chargedQuote) {
+      adultPrice = Number(chargedQuote.source?.adultPrice) || 0;
+      childPrice = Number(chargedQuote.source?.childPrice) || 0;
+      operatorId = chargedQuote.source?.operatorId || operatorId;
+    }
+
     // Seats are now reserved (atomically). If ANY later step fails — before the
     // booking row exists — we MUST release them, otherwise payment was captured
     // but inventory stays locked (phantom sold-out).
     const releaseReservedSeats = async () => {
       try {
-        if (isFlexible) {
+        if (isFlexible && flexInventory) {
+          await FlexibleDateInventory.updateOne(
+            {
+              _id: flexInventory._id,
+              reservationClaimKeys: flexReservationClaimKey,
+              inventoryReleaseClaimKeys: { $ne: flexReservationClaimKey },
+            },
+            [
+              {
+                $set: {
+                  bookedSeats: {
+                    $max: [
+                      0,
+                      {
+                        $subtract: [{ $ifNull: ["$bookedSeats", 0] }, numSeats],
+                      },
+                    ],
+                  },
+                  inventoryReleaseClaimKeys: {
+                    $setUnion: [
+                      { $ifNull: ["$inventoryReleaseClaimKeys", []] },
+                      [flexReservationClaimKey],
+                    ],
+                  },
+                },
+              },
+            ],
+          );
           const FlexibleAvailability = require("../models/FlexibleAvailability");
           await FlexibleAvailability.updateOne(
-            { _id: flexRecord._id },
-            { $inc: { bookedSeats: -numSeats } },
+            {
+              _id: flexRecord._id,
+              inventoryReservationClaimKeys: flexReservationClaimKey,
+              inventoryReleaseClaimKeys: { $ne: flexReservationClaimKey },
+            },
+            [
+              {
+                $set: {
+                  bookedSeats: {
+                    $max: [
+                      0,
+                      {
+                        $subtract: [{ $ifNull: ["$bookedSeats", 0] }, numSeats],
+                      },
+                    ],
+                  },
+                  inventoryReleaseClaimKeys: {
+                    $setUnion: [
+                      { $ifNull: ["$inventoryReleaseClaimKeys", []] },
+                      [flexReservationClaimKey],
+                    ],
+                  },
+                },
+              },
+            ],
           );
-        } else {
-          await Batch.findByIdAndUpdate(batchId, {
-            $inc: { bookedSeats: -numSeats },
-          });
+        } else if (batchId && batchReservationClaimKey) {
+          await Batch.updateOne(
+            buildReservationReleaseFilter({
+              id: batchId,
+              claimKey: batchReservationClaimKey,
+            }),
+            buildReservationReleasePipeline({
+              claimKey: batchReservationClaimKey,
+              seats: numSeats,
+            }),
+          );
         }
       } catch (e) {
         console.error("[createBooking] failed to release seats:", e.message);
       }
     };
 
-    // ── Fetch package ──────────────────────────────────────────────────────
-    const pkg = await Package.findById(packageId);
-    if (!pkg || !pkg.isActive || pkg.status !== "APPROVED") {
-      await releaseReservedSeats();
-      return res.status(404).json({
-        success: false,
-        message: "Package not found or not available",
-      });
-    }
+    // Package state and booking mode were validated before reserving seats.
 
     // ── Get live platform settings ─────────────────────────────────────────
-    const platformFeePercent = (await getSetting("platform_fee_percent")) ?? 10;
-    const gstPercent = (await getSetting("gst_percent")) ?? 5;
+    const platformFeePercent = chargedQuote
+      ? Number(chargedQuote.pricing?.platformFeePercent) || 0
+      : ((await getSetting("platform_fee_percent")) ?? 10);
+    const gstPercent = chargedQuote
+      ? Number(chargedQuote.pricing?.gstPercent) || 0
+      : ((await getSetting("gst_percent")) ?? 5);
 
     // ── Compute addon (Snapja) amounts — held by platform until dispatch ──────
     // One creator per booking. Each addon-day: base price (per service type) + per-day outside-city
     // surcharge (fallback to package default) + per-day extra charges.
-    const photographerPrice =
-      (await getSetting("photographer_base_price")) ?? 2000;
-    const videographerPrice =
-      (await getSetting("videographer_base_price")) ?? 2000;
-    let addonSurcharge = 0; // operator's outside-city + extras portion
-    let addonTotalPrice = 0; // base + surcharge (full held amount)
-    const addonDaysData = req.body.addonDays || null;
-    const addonNames = addonDaysData ? Object.keys(addonDaysData) : [];
-    if (addonDaysData) {
+    const photographerPrice = chargedQuote
+      ? 0
+      : ((await getSetting("photographer_base_price")) ?? 2000);
+    const videographerPrice = chargedQuote
+      ? 0
+      : ((await getSetting("videographer_base_price")) ?? 2000);
+    let addonSurcharge = chargedQuote
+      ? Number(chargedQuote.addonSurcharge) || 0
+      : 0; // operator's outside-city + extras portion
+    let addonTotalPrice = chargedQuote
+      ? Number(chargedQuote.addonTotalPrice) || 0
+      : 0; // base + surcharge (full held amount)
+    const addonServiceEntries = chargedQuote
+      ? chargedQuote.addonServiceEntries || []
+      : req.body.addonServiceEntries || [];
+    const addonDaysData = chargedQuote
+      ? chargedQuote.addonDays || null
+      : req.body.addonDays || null;
+    const resolvedAddonSchedule = chargedQuote
+      ? chargedQuote.addonSchedule || null
+      : req.body.addonSchedule || null;
+    const resolvedAddonBookingTypes = chargedQuote
+      ? chargedQuote.addonBookingTypes || {}
+      : req.body.addonBookingTypes || {};
+    const addonNames = chargedQuote
+      ? Array.isArray(chargedQuote.addonNames)
+        ? chargedQuote.addonNames
+        : []
+      : addonDaysData
+        ? Object.keys(addonDaysData)
+        : [];
+    if (addonDaysData && !chargedQuote) {
       for (const addonName of addonNames) {
         const basePrice = pickAddonBasePrice(
           addonName,
@@ -969,18 +2237,22 @@ exports.createBooking = async (req, res) => {
 
     // ── Apply coupon (discount applies to fare only) ──────────────────────────
     const couponCode = (req.body.couponCode || "").trim().toUpperCase();
-    let discountAmount = 0;
-    let appliedCouponId = null;
+    let discountAmount = chargedQuote
+      ? Number(chargedQuote.pricing?.discountAmount) || 0
+      : 0;
+    let appliedCouponId = chargedQuote?.operatorCouponId || null;
     const fareSubtotalRaw = Math.round(
       adultPrice * numAdults + (childPrice || 0) * numChildren,
     );
 
-    if (couponCode) {
+    if (couponCode && !chargedQuote) {
       const Coupon = require("../models/Coupon");
       const now = new Date();
 
       // Flexible coupons are keyed by packageId, batch coupons by batchId
-      const couponMatch = isFlexible ? { packageId } : { batchId };
+      const couponMatch = isFlexible
+        ? { packageId, batchId: null }
+        : { batchId };
       // Atomic: only increment usedCount if coupon is still valid + within limit
       const coupon = await Coupon.findOneAndUpdate(
         {
@@ -1029,9 +2301,11 @@ exports.createBooking = async (req, res) => {
     const platformCouponCode = (req.body.platformCouponCode || "")
       .trim()
       .toUpperCase();
-    let platformDiscountAmount = 0;
-    let appliedPlatformCouponId = null;
-    if (platformCouponCode && discountAmount === 0) {
+    let platformDiscountAmount = chargedQuote
+      ? Number(chargedQuote.pricing?.platformDiscountAmount) || 0
+      : 0;
+    let appliedPlatformCouponId = chargedQuote?.platformCouponId || null;
+    if (platformCouponCode && discountAmount === 0 && !chargedQuote) {
       const { resolvePlatformCoupon } = require("../utils/platformCoupon");
       const res = await resolvePlatformCoupon({
         code: platformCouponCode,
@@ -1062,19 +2336,21 @@ exports.createBooking = async (req, res) => {
     }
 
     // ── Calculate pricing (snapshotted forever) ────────────────────────────
-    const pricing = calcPricing({
-      adultPrice,
-      childPrice: childPrice || 0,
-      adults: numAdults,
-      children: numChildren,
-      seats: numSeats,
-      platformFeePercent,
-      gstPercent,
-      addonAmount: addonTotalPrice,
-      addonSurcharge,
-      discountAmount,
-      platformDiscountAmount,
-    });
+    const pricing = chargedQuote
+      ? { ...chargedQuote.pricing }
+      : calcPricing({
+          adultPrice,
+          childPrice: childPrice || 0,
+          adults: numAdults,
+          children: numChildren,
+          seats: numSeats,
+          platformFeePercent,
+          gstPercent,
+          addonAmount: addonTotalPrice,
+          addonSurcharge,
+          discountAmount,
+          platformDiscountAmount,
+        });
     if (discountAmount > 0) pricing.couponCode = couponCode;
     if (platformDiscountAmount > 0)
       pricing.platformCouponCode = platformCouponCode;
@@ -1089,20 +2365,43 @@ exports.createBooking = async (req, res) => {
         ? parseLocalDateStr(req.body.flexStartDate) || new Date()
         : batch.startDate,
       endDate: isFlexible
-        ? (() => {
-            const d = parseLocalDateStr(req.body.flexStartDate) || new Date();
-            d.setDate(d.getDate() + (pkg.itinerary?.length || 5) - 1);
-            return d;
-          })()
+        ? dateKeyToISTStart(
+            addDaysToDateKey(
+              flexStartDateKey,
+              Math.max(1, pkg.itinerary?.length || 5) - 1,
+            ),
+          )
         : batch.endDate,
       adultPrice,
     };
 
-    // ── Create booking — auto-confirmed (payment simulated) ──────────────────
+    // ── Create processing booking; required effects publish confirmation ─────
     // If create fails, payment was already captured — release the reserved seats
     // and return the consumed coupon slot so inventory isn't lost.
     let booking;
     try {
+      // Fence booking publication with the same PendingOrder lease claimed by
+      // verify/webhook/recovery. Extending immediately before the insert keeps a
+      // stale worker from publishing after another worker starts compensation.
+      if (req._paymentFinalization) {
+        const PendingOrder = require("../models/PendingOrder");
+        const fenced = await PendingOrder.findOneAndUpdate(
+          {
+            razorpayOrderId: req._paymentFinalization.orderId,
+            finalizationState: "PROCESSING",
+            finalizationLeaseToken: req._paymentFinalization.leaseToken,
+            finalizationLeaseUntil: { $gt: new Date() },
+          },
+          {
+            $set: {
+              finalizationLeaseUntil: new Date(Date.now() + 10 * 60 * 1000),
+            },
+          },
+          { new: true },
+        );
+        if (!fenced) throw new Error("Payment finalization lease was lost");
+      }
+
       booking = await TripBooking.create({
         userId: req.user._id,
         packageId,
@@ -1115,9 +2414,19 @@ exports.createBooking = async (req, res) => {
         flexAvailabilityId: isFlexible
           ? req.body.flexAvailabilityId
           : undefined,
+        flexInventoryId: isFlexible ? flexInventory?._id : undefined,
+        flexStartDateKey: isFlexible ? flexStartDateKey : undefined,
+        flexReservationClaimKey: isFlexible
+          ? flexReservationClaimKey
+          : undefined,
+        batchReservationClaimKey: isFlexible
+          ? undefined
+          : batchReservationClaimKey,
         operatorId,
         seats: numSeats,
-        status: "CONFIRMED", // auto-confirmed — no admin approval needed
+        // Versioned bookings remain processing-only until every required effect
+        // is durable; ensureRequiredBookingEffects publishes CONFIRMED atomically.
+        status: "PENDING",
         travelers: Array.isArray(req.body.travelers)
           ? req.body.travelers.slice(0, numSeats).map((t) => ({
               name: String(t.name || "").trim(),
@@ -1126,9 +2435,15 @@ exports.createBooking = async (req, res) => {
             }))
           : [],
         pricing,
+        initialPricing: { ...pricing },
+        initialPaymentAmount: Number(chargedQuote.totalAmount) || 0,
         snapshot,
+        addonServiceEntries,
+        addonEntryClaims: addonServiceEntries.map((entry) => entry.key),
+        addonAppliedEntryKeys: addonServiceEntries.map((entry) => entry.key),
         addonDays: addonDaysData,
-        addonSchedule: req.body.addonSchedule || null,
+        addonSchedule: resolvedAddonSchedule,
+        addonBookingTypes: resolvedAddonBookingTypes,
         addonSurcharge,
         addonNames,
         addonTotalPrice,
@@ -1136,10 +2451,14 @@ exports.createBooking = async (req, res) => {
         addonDispatched: false,
         razorpayPaymentId: req.body.paymentId || "",
         razorpayOrderId: req.body.razorpayOrderId || "",
+        requiredEffectsVersion: 1,
+        requiredEffectsState: "PENDING",
+        operatorCouponId: appliedCouponId || undefined,
+        platformCouponId: appliedPlatformCouponId || undefined,
       });
     } catch (createErr) {
       await releaseReservedSeats();
-      if (appliedCouponId) {
+      if (appliedCouponId && !chargedQuote) {
         try {
           const Coupon = require("../models/Coupon");
           await Coupon.updateOne(
@@ -1148,7 +2467,7 @@ exports.createBooking = async (req, res) => {
           );
         } catch {}
       }
-      if (appliedPlatformCouponId) {
+      if (appliedPlatformCouponId && !chargedQuote) {
         try {
           const PlatformCoupon = require("../models/PlatformCoupon");
           await PlatformCoupon.updateOne(
@@ -1168,24 +2487,19 @@ exports.createBooking = async (req, res) => {
       });
     }
 
-    // ── Side effects — increment seats + bookingCount immediately ──────────
-    // ── Side effects — bookingCount (seats already reserved atomically above) ─
-    await Package.findByIdAndUpdate(packageId, {
-      $inc: { bookingCount: numSeats },
-    });
-    // NOTE: Wallet credit happens via cron 2 days after trip endDate (not now)
-    // outsideCityCharge is also credited at the same time as package earnings (via cron)
+    // PendingOrder may only become COMPLETED after these durable, replay-safe
+    // effects finish. Aggregate-side claim keys make every retry idempotent.
+    const requiredEffects = await ensureRequiredBookingEffects(booking);
+    booking = requiredEffects.booking;
+    const conversation = requiredEffects.conversation;
 
-    // Auto-create chat conversation for this booking
-    const Conversation = require("../models/Conversation");
-    const Message = require("../models/Message");
     const tripEnd = isFlexible
       ? new Date(snapshot.endDate)
       : new Date(batch.endDate);
     const tripStart = isFlexible
       ? new Date(snapshot.startDate)
       : new Date(batch.startDate);
-    const expiresAt = new Date(tripEnd.getTime() + 2 * 24 * 60 * 60 * 1000); // endDate + 2 days
+    const expiresAt = new Date(tripEnd.getTime() + 2 * 24 * 60 * 60 * 1000);
     const startFmt = tripStart.toLocaleDateString("en-IN", {
       day: "2-digit",
       month: "short",
@@ -1197,40 +2511,16 @@ exports.createBooking = async (req, res) => {
       year: "numeric",
     });
 
-    const conversation = await Conversation.create({
-      bookingId: booking._id,
-      userId: req.user._id,
-      operatorId: pkg.operatorId,
-      packageTitle: pkg.title,
-      packageImage: pkg.image_url || "",
-      startsAt: new Date(),
-      expiresAt,
-      lastMessage: "New booking received",
-      lastMessageAt: new Date(),
-      lastSenderType: "system",
-    });
-
-    // Auto-send booking summary as first message (visible to operator)
-    const summaryText = `📋 New Booking!\n\n🎯 Package: ${pkg.title}\n📅 Dates: ${startFmt} — ${endFmt}\n👥 Travelers: ${booking.seats}\n🆔 Booking ID: ${booking.bookingId}\n👤 Name: ${req.user.name || "User"}\n📱 Phone: ${req.user.phone || "—"}\n\nChat is active until ${new Date(expiresAt).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" })}`;
-
-    await Message.create({
-      conversationId: conversation._id,
-      senderId: req.user._id,
-      senderType: "user",
-      senderName: "System",
-      text: summaryText,
-    });
-
     // ── Double-email / notification guard ─────────────────────────────────────
     // The webhook/cron recovery can fire `createBooking` for the same payment if
     // the app's /verify also succeeded. `finalizeBookingFromOrder` prevents a
     // duplicate BOOKING (dedup on razorpayPaymentId), but if both paths succeed
     // on a tight race, the notifications below would fire twice. We stamp
     // `confirmationSentAt` atomically and skip if already set.
-    const stampedOk = await TripBooking.findOneAndUpdate(
-      { _id: booking._id, confirmationSentAt: { $exists: false } },
-      { $set: { confirmationSentAt: new Date() } },
-    );
+    await deliverBookingConfirmation(booking);
+    // Delivery is owned by the replay-safe helper above. Keep the legacy block
+    // disabled so recovery and initial creation cannot send a second copy.
+    const stampedOk = null;
     // If stampedOk is null, another path already sent notifications — skip.
     if (!stampedOk) {
       console.log(
@@ -1517,6 +2807,13 @@ exports.updateBookingStatus = async (req, res) => {
         .status(404)
         .json({ success: false, message: "Booking not found" });
     }
+    if (isBookingFinalizationPending(booking)) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "Booking finalization is still processing; status changes are unavailable.",
+      });
+    }
 
     const prevStatus = booking.status;
 
@@ -1527,7 +2824,10 @@ exports.updateBookingStatus = async (req, res) => {
         message: "Completed bookings cannot be changed",
       });
     }
-    if (prevStatus === "CANCELLED") {
+    if (
+      prevStatus === "CANCELLED" &&
+      booking.cancellationState === "COMPLETED"
+    ) {
       return res.status(400).json({
         success: false,
         message: "Cancelled bookings cannot be changed",
@@ -1536,11 +2836,25 @@ exports.updateBookingStatus = async (req, res) => {
 
     // ── Admin cancellation → 100% refund to user via shared helper ──────────
     if (status === "CANCELLED") {
-      if (prevStatus !== "CONFIRMED" && prevStatus !== "PENDING") {
+      if (
+        !["CONFIRMED", "PENDING", "CANCELLED"].includes(prevStatus) ||
+        (prevStatus === "CANCELLED" &&
+          booking.cancellationState === "COMPLETED")
+      ) {
         return res.status(400).json({
           success: false,
           message: `Cannot cancel a ${prevStatus.toLowerCase()} booking`,
         });
+      }
+      if (prevStatus !== "CANCELLED") {
+        const lifecycleConflict =
+          await operatorCancellationLifecycleConflict(booking);
+        if (lifecycleConflict) {
+          return res.status(409).json({
+            success: false,
+            message: lifecycleConflict,
+          });
+        }
       }
       const summary = await processCancellationRefund(booking, {
         cancelledBy: "admin",
@@ -1552,7 +2866,7 @@ exports.updateBookingStatus = async (req, res) => {
       notifyUser(
         booking.userId,
         "Booking Cancelled by Trip Reel",
-        `Your booking for ${snap.packageTitle || "trip"} was cancelled. A full refund of ₹${summary.refundAmount.toLocaleString("en-IN")} is being processed.`,
+        `Your booking for ${snap.packageTitle || "trip"} was cancelled. ${summary.refundMessage}`,
         { type: "booking_cancelled", bookingId: booking._id.toString() },
       );
       const { notifyOperator } = require("./notificationController");
@@ -1562,13 +2876,6 @@ exports.updateBookingStatus = async (req, res) => {
         `Booking ${booking.bookingId} for ${snap.packageTitle || "your package"} was cancelled by admin.`,
         { type: "booking_cancelled", bookingId: booking._id.toString() },
       );
-      try {
-        const Conversation = require("../models/Conversation");
-        await Conversation.updateMany(
-          { bookingId: booking._id },
-          { isActive: false },
-        );
-      } catch {}
 
       const updated = await TripBooking.findById(booking._id)
         .populate("userId", "name email phone")
@@ -1609,7 +2916,125 @@ exports.updateBookingStatus = async (req, res) => {
 
 // ── Operator ──────────────────────────────────────────────────────────────────
 
-// GET /api/trip-bookings/operator/mine  — operator sees bookings for their packages
+function effectiveBookingStart(booking) {
+  return (
+    booking?.batchId?.startDate ||
+    booking?.flexStartDate ||
+    booking?.snapshot?.startDate ||
+    null
+  );
+}
+
+function effectiveBookingEnd(booking) {
+  return (
+    booking?.batchId?.endDate ||
+    booking?.flexEndDate ||
+    booking?.snapshot?.endDate ||
+    null
+  );
+}
+
+// Resolve cancellation dates without trusting stale client state. Booking
+// snapshots remain the receipt date source; authoritative batch dates provide
+// the fallback and lifecycle state for legacy snapshots with missing dates.
+async function operatorCancellationLifecycleConflict(
+  booking,
+  now = new Date(),
+) {
+  const batchId = booking?.batchId?._id || booking?.batchId || null;
+  const isFlexible =
+    booking?.bookingMode === "flexible" ||
+    Boolean(booking?.flexAvailabilityId || booking?.flexStartDate);
+  let batch = null;
+
+  if (batchId) {
+    batch = await Batch.findById(batchId).select(
+      "startDate endDate bookingDeadline isActive isCancelled isArchived totalSeats bookedSeats",
+    );
+    if (!batch) {
+      return "Trip lifecycle could not be established because its batch is unavailable. Cancellation is blocked.";
+    }
+    const lifecycle = batchLifecycle(batch, now);
+    if (isHistory("batch", lifecycle)) {
+      return `This trip is in History (${lifecycle}) and is read-only. It cannot be cancelled.`;
+    }
+  } else if (!isFlexible) {
+    return "Trip lifecycle could not be established because its batch reference is missing. Cancellation is blocked.";
+  }
+
+  const startDate = batchId
+    ? batch?.startDate || booking?.snapshot?.startDate
+    : booking?.flexStartDate || booking?.snapshot?.startDate;
+  const endDate = batchId
+    ? batch?.endDate || booking?.snapshot?.endDate
+    : booking?.flexEndDate || booking?.snapshot?.endDate;
+
+  if (!storedDateKey(startDate) || !storedDateKey(endDate)) {
+    return "Trip lifecycle could not be established from authoritative dates. Cancellation is blocked.";
+  }
+  if (isDateKeyPastInclusiveEnd(endDate, now)) {
+    return "This trip has ended and is in History. It cannot be cancelled.";
+  }
+  if (isDateKeyStarted(startDate, now)) {
+    return "This trip has already started and is read-only. It cannot be cancelled.";
+  }
+  return null;
+}
+
+function bookingHistoryState(booking, now = new Date()) {
+  if (["COMPLETED", "CANCELLED"].includes(booking.status)) return true;
+  const end = effectiveBookingEnd(booking);
+  // Missing authoritative end dates are unsafe for operational actions. Keep
+  // malformed legacy bookings in read-only History until repaired.
+  return !end || isDateKeyPastInclusiveEnd(end, now);
+}
+
+function serializeOperatorBooking(booking, now = new Date()) {
+  const raw = booking?.toObject ? booking.toObject() : { ...booking };
+  const history = bookingHistoryState(booking, now);
+  return { ...raw, lifecycle: history ? "History" : "Current" };
+}
+
+function bookingDateTime(value, fallback) {
+  const timestamp = value ? new Date(value).getTime() : NaN;
+  return Number.isFinite(timestamp) ? timestamp : fallback;
+}
+
+function compareBookingTieBreakers(a, b) {
+  const createdDiff =
+    bookingDateTime(b.createdAt, 0) - bookingDateTime(a.createdAt, 0);
+  if (createdDiff !== 0) return createdDiff;
+  return String(b._id || "").localeCompare(String(a._id || ""));
+}
+
+function sortOperatorBookings(bookings, view) {
+  return [...bookings].sort((a, b) => {
+    if (view === "current") {
+      const aStart = bookingDateTime(
+        effectiveBookingStart(a),
+        Number.POSITIVE_INFINITY,
+      );
+      const bStart = bookingDateTime(
+        effectiveBookingStart(b),
+        Number.POSITIVE_INFINITY,
+      );
+      if (aStart !== bStart) return aStart < bStart ? -1 : 1;
+    } else if (view === "history") {
+      const aEnd = bookingDateTime(
+        effectiveBookingEnd(a),
+        Number.NEGATIVE_INFINITY,
+      );
+      const bEnd = bookingDateTime(
+        effectiveBookingEnd(b),
+        Number.NEGATIVE_INFINITY,
+      );
+      if (aEnd !== bEnd) return aEnd > bEnd ? -1 : 1;
+    }
+    return compareBookingTieBreakers(a, b);
+  });
+}
+
+// GET /api/operator-bookings — lifecycle-aware operator booking list
 exports.operatorGetMyBookings = async (req, res) => {
   try {
     const {
@@ -1620,39 +3045,107 @@ exports.operatorGetMyBookings = async (req, res) => {
       search,
       fromDate,
       toDate,
-      page = 1,
-      limit = 20,
     } = req.query;
+    const { page, limit, skip } = getPagination(req.query, 20);
+    const viewRaw = String(
+      req.query.view || req.query.scope || "current",
+    ).toLowerCase();
+    const view = ["current", "history", "all"].includes(viewRaw)
+      ? viewRaw
+      : "current";
     const query = { operatorId: req.operator._id };
     if (status && status !== "all") query.status = status;
     if (packageId) query.packageId = packageId;
     if (batchId) query.batchId = batchId;
     if (bookingMode && bookingMode !== "all") query.bookingMode = bookingMode;
-    if (search)
-      query.bookingId = { $regex: escapeRegex(search), $options: "i" };
+    const trimmedSearch = String(search || "").trim();
+    if (trimmedSearch)
+      query.bookingId = { $regex: escapeRegex(trimmedSearch), $options: "i" };
     if (fromDate || toDate) {
       query.createdAt = {};
-      if (fromDate) query.createdAt.$gte = new Date(fromDate);
+      if (fromDate) {
+        const range = getISTDayRange(fromDate);
+        if (!range)
+          return res
+            .status(400)
+            .json({ success: false, message: "fromDate must be YYYY-MM-DD" });
+        query.createdAt.$gte = range.start;
+      }
       if (toDate) {
-        const end = new Date(toDate);
-        end.setHours(23, 59, 59, 999);
-        query.createdAt.$lte = end;
+        const range = getISTDayRange(toDate);
+        if (!range)
+          return res
+            .status(400)
+            .json({ success: false, message: "toDate must be YYYY-MM-DD" });
+        query.createdAt.$lt = range.endExclusive;
       }
     }
+    const docs = await TripBooking.find(query)
+      .populate("userId", "name email phone")
+      .populate("packageId", "title location image_url bookingMode")
+      .populate("batchId", "startDate endDate label totalSeats bookedSeats")
+      .populate(
+        "flexAvailabilityId",
+        "startDate endDate adultPrice childPrice maxBookings",
+      )
+      .populate("flexInventoryId", "startDateKey capacity bookedSeats");
+    const now = new Date();
+    const serialized = docs.map((booking) =>
+      serializeOperatorBooking(booking, now),
+    );
+    const currentTotal = serialized.filter(
+      (booking) => booking.lifecycle === "Current",
+    ).length;
+    const historyTotal = serialized.length - currentTotal;
+    const filtered =
+      view === "all"
+        ? serialized
+        : serialized.filter(
+            (booking) => booking.lifecycle.toLowerCase() === view,
+          );
+    const selected = sortOperatorBookings(filtered, view);
+    const bookings = selected.slice(skip, skip + limit);
+    res.json({
+      success: true,
+      bookings,
+      ...paginationMeta(selected.length, page, limit),
+      currentTotal,
+      historyTotal,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
 
-    const skip = (Number(page) - 1) * Number(limit);
-    const [bookings, total] = await Promise.all([
-      TripBooking.find(query)
-        .populate("userId", "name email phone")
-        .populate("packageId", "title")
-        .populate("batchId", "startDate endDate label")
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(Number(limit)),
-      TripBooking.countDocuments(query),
-    ]);
-
-    res.json({ success: true, total, page: Number(page), bookings });
+exports.operatorGetBookingById = async (req, res) => {
+  try {
+    const booking = await TripBooking.findOne({
+      _id: req.params.id,
+      operatorId: req.operator._id,
+    })
+      .populate("userId", "name email phone")
+      .populate(
+        "packageId",
+        "title location image_url itinerary inclusions exclusions policies bookingMode",
+      )
+      .populate(
+        "batchId",
+        "startDate endDate bookingDeadline adultPrice childPrice totalSeats bookedSeats label",
+      )
+      .populate(
+        "flexAvailabilityId",
+        "startDate endDate adultPrice childPrice maxBookings isActive",
+      )
+      .populate(
+        "flexInventoryId",
+        "startDateKey startDate capacity bookedSeats",
+      )
+      .populate("operatorId", "businessName contactName email phone");
+    if (!booking)
+      return res
+        .status(404)
+        .json({ success: false, message: "Booking not found" });
+    res.json({ success: true, booking: serializeOperatorBooking(booking) });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -1666,26 +3159,32 @@ exports.operatorGetMyBookings = async (req, res) => {
 exports.operatorBookingSummary = async (req, res) => {
   try {
     const operatorId = req.operator._id;
-    const monthStart = new Date();
-    monthStart.setDate(1);
-    monthStart.setHours(0, 0, 0, 0);
+    const monthKey = `${getISTDateKey().slice(0, 7)}-01`;
+    const monthStart = getISTDayRange(monthKey).start;
 
-    const [byStatus, servedAgg, monthAgg] = await Promise.all([
+    const [
+      byStatus,
+      servedAgg,
+      monthAgg,
+      cancelledMonthAgg,
+      packageBookingAgg,
+      lifecycleDocs,
+    ] = await Promise.all([
       TripBooking.aggregate([
         { $match: { operatorId } },
         { $group: { _id: "$status", count: { $sum: 1 } } },
       ]),
-      // Travellers served on confirmed/completed trips
       TripBooking.aggregate([
         {
-          $match: {
-            operatorId,
-            status: { $in: ["CONFIRMED", "COMPLETED"] },
+          $match: { operatorId, status: { $in: ["CONFIRMED", "COMPLETED"] } },
+        },
+        {
+          $group: {
+            _id: null,
+            seats: { $sum: { $ifNull: ["$pricing.seats", "$seats"] } },
           },
         },
-        { $group: { _id: null, seats: { $sum: "$pricing.seats" } } },
       ]),
-      // Operator revenue this month (confirmed/completed)
       TripBooking.aggregate([
         {
           $match: {
@@ -1697,28 +3196,76 @@ exports.operatorBookingSummary = async (req, res) => {
         {
           $group: {
             _id: null,
-            revenue: { $sum: "$pricing.operatorAmount" },
+            revenue: { $sum: { $ifNull: ["$pricing.operatorAmount", 0] } },
           },
         },
       ]),
+      TripBooking.aggregate([
+        {
+          $match: {
+            operatorId,
+            status: "CANCELLED",
+            cancelledAt: { $gte: monthStart },
+          },
+        },
+        {
+          $group: {
+            _id: null,
+            revenue: {
+              $sum: { $ifNull: ["$refundBreakdown.operatorRetained", 0] },
+            },
+          },
+        },
+      ]),
+      TripBooking.aggregate([
+        { $match: { operatorId, packageId: { $ne: null } } },
+        {
+          $group: {
+            _id: "$packageId",
+            tripBookingCount: { $sum: 1 },
+          },
+        },
+        { $sort: { tripBookingCount: -1, _id: 1 } },
+      ]),
+      TripBooking.find({ operatorId })
+        .select("status flexEndDate snapshot.endDate")
+        .populate("batchId", "endDate"),
     ]);
 
-    const statusCounts = byStatus.reduce((acc, s) => {
-      acc[s._id] = s.count;
+    const statusCounts = byStatus.reduce((acc, item) => {
+      acc[item._id] = item.count;
       return acc;
     }, {});
-    const total = byStatus.reduce((sum, s) => sum + s.count, 0);
+    const total = byStatus.reduce((sum, item) => sum + item.count, 0);
+    const now = new Date();
+    const currentTotal = lifecycleDocs.filter(
+      (booking) => !bookingHistoryState(booking, now),
+    ).length;
+    const historyTotal = lifecycleDocs.length - currentTotal;
+    const activeBookingRevenue = Number(monthAgg[0]?.revenue) || 0;
+    const cancelledRetainedRevenue = Number(cancelledMonthAgg[0]?.revenue) || 0;
+    const tripBookingsByPackage = packageBookingAgg.map((item) => ({
+      packageId: String(item._id),
+      tripBookingCount: Number(item.tripBookingCount) || 0,
+    }));
 
     res.json({
       success: true,
       summary: {
         totalBookings: total,
+        currentBookings: currentTotal,
+        historyBookings: historyTotal,
+        currentTotal,
+        historyTotal,
         confirmedBookings: statusCounts.CONFIRMED || 0,
         completedBookings: statusCounts.COMPLETED || 0,
         cancelledBookings: statusCounts.CANCELLED || 0,
         pendingBookings: statusCounts.PENDING || 0,
-        totalTravelers: servedAgg[0]?.seats || 0,
-        monthRevenue: monthAgg[0]?.revenue || 0,
+        totalTravelers: Number(servedAgg[0]?.seats) || 0,
+        activeBookingRevenue,
+        monthRevenue: activeBookingRevenue + cancelledRetainedRevenue,
+        cancelledRetainedRevenue,
+        tripBookingsByPackage,
       },
     });
   } catch (err) {
@@ -1746,23 +3293,29 @@ exports.cancelBooking = async (req, res) => {
         .json({ success: false, message: "Not authorized" });
     }
 
-    // Can only cancel CONFIRMED or PENDING bookings
-    if (!["CONFIRMED", "PENDING"].includes(booking.status)) {
+    // A cancelled but incomplete saga may be resumed by the owner.
+    if (
+      !["CONFIRMED", "PENDING", "CANCELLED"].includes(booking.status) ||
+      (booking.status === "CANCELLED" &&
+        booking.cancellationState === "COMPLETED")
+    ) {
       return res.status(400).json({
         success: false,
         message: `Cannot cancel a ${booking.status.toLowerCase()} booking`,
       });
     }
 
-    // Guard: can't cancel after the trip has started
-    if (
-      booking.snapshot?.startDate &&
-      new Date(booking.snapshot.startDate) <= new Date()
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "This trip has already started and cannot be cancelled.",
-      });
+    // New cancellations must use authoritative batch/flexible dates. A claimed
+    // CANCELLED saga remains resumable so recovery is not stranded mid-refund.
+    if (booking.status !== "CANCELLED") {
+      const lifecycleConflict =
+        await operatorCancellationLifecycleConflict(booking);
+      if (lifecycleConflict) {
+        return res.status(409).json({
+          success: false,
+          message: lifecycleConflict,
+        });
+      }
     }
 
     // ── Process refund (slab-based) via shared helper ────────────────────────
@@ -1779,7 +3332,7 @@ exports.cancelBooking = async (req, res) => {
       booking.userId,
       "Booking Cancelled",
       summary.refundAmount > 0
-        ? `Your booking for ${snap.packageTitle || "trip"} is cancelled. ₹${summary.refundAmount.toLocaleString("en-IN")} refund is being processed to your original payment method.`
+        ? `Your booking for ${snap.packageTitle || "trip"} is cancelled. ${summary.refundMessage}`
         : `Your booking for ${snap.packageTitle || "trip"} has been cancelled. As per the cancellation policy, no refund is applicable.`,
       { type: "booking_cancelled", bookingId: booking._id.toString() },
     );
@@ -1810,19 +3363,10 @@ exports.cancelBooking = async (req, res) => {
         sendMail({
           to: user.email,
           subject: `Booking Cancelled - ${snap.packageTitle || "Trip"}`,
-          text: `Hi ${user.name}, your booking ${booking.bookingId} has been cancelled.${summary.refundAmount > 0 ? ` Refund of Rs.${summary.refundAmount} (${summary.refundPercent}%) is being processed.` : ""}`,
-          html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;"><h2 style="color:#EF4444;">Booking Cancelled</h2><p>Hi <strong>${user.name}</strong>,</p><p>Your booking <strong>${booking.bookingId}</strong> for <strong>${snap.packageTitle || "trip"}</strong> has been cancelled.</p>${summary.refundAmount > 0 ? `<p style="background:#F0FDF4;padding:12px;border-radius:8px;color:#065F46;"><strong>Refund:</strong> Rs.${summary.refundAmount.toLocaleString("en-IN")} (${summary.refundPercent}%) is being processed to your original payment method within 5-7 business days.</p>` : ""}<p style="color:#6B7280;font-size:13px;">If you have questions, contact us via the app.</p><p>Team Trip Reel</p></div>`,
+          text: `Hi ${user.name}, your booking ${booking.bookingId} has been cancelled.${summary.refundAmount > 0 ? ` Refund amount: Rs.${summary.refundAmount} (${summary.refundPercent}%). ${summary.refundMessage}` : ""}`,
+          html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;"><h2 style="color:#EF4444;">Booking Cancelled</h2><p>Hi <strong>${user.name}</strong>,</p><p>Your booking <strong>${booking.bookingId}</strong> for <strong>${snap.packageTitle || "trip"}</strong> has been cancelled.</p>${summary.refundAmount > 0 ? `<p style="background:#F0FDF4;padding:12px;border-radius:8px;color:#065F46;"><strong>Refund amount:</strong> Rs.${summary.refundAmount.toLocaleString("en-IN")} (${summary.refundPercent}%). ${summary.refundMessage}</p>` : ""}<p style="color:#6B7280;font-size:13px;">If you have questions, contact us via the app.</p><p>Team Trip Reel</p></div>`,
         });
       }
-    } catch {}
-
-    // Close chat window
-    try {
-      const Conversation = require("../models/Conversation");
-      await Conversation.updateMany(
-        { bookingId: booking._id },
-        { isActive: false },
-      );
     } catch {}
 
     // ── Audit log ─────────────────────────────────────────────────────────────
@@ -1843,7 +3387,8 @@ exports.cancelBooking = async (req, res) => {
 
     res.json({
       success: true,
-      message: "Booking cancelled successfully",
+      message: `Booking cancelled. ${summary.refundMessage}`,
+      refundMessage: summary.refundMessage,
       refundPercent: summary.refundPercent,
       refundAmount: summary.refundAmount,
       refundStatus: summary.refundStatus,
@@ -1891,8 +3436,20 @@ exports.getRefundPreview = async (req, res) => {
     }
     const refundPercent = await resolveRefundPercent(startDate);
 
-    // Mirror the breakdown logic used in processCancellationRefund
-    const p = booking.pricing || {};
+    // Mirror the breakdown logic used in processCancellationRefund. New rows
+    // keep the original charge separate from every top-up ledger.
+    if (
+      !booking.initialPricing &&
+      (booking.addonTopupPaymentIds || []).length > 0
+    ) {
+      return res.status(409).json({
+        success: false,
+        code: "LEGACY_REFUND_RECONCILIATION_REQUIRED",
+        message:
+          "This legacy booking does not have safe per-payment top-up amounts. Support reconciliation is required.",
+      });
+    }
+    const p = booking.initialPricing || booking.pricing || {};
     const fareSubtotal = Number(p.fareSubtotal) || 0;
     const discountAmount = Number(p.discountAmount) || 0;
     const platformDiscountAmount = Number(p.platformDiscountAmount) || 0;
@@ -1912,9 +3469,62 @@ exports.getRefundPreview = async (req, res) => {
     const addonRefund = addon;
     const gstAddonRefund = addonRefund > 0 ? gstOnAddon : 0;
     const gstRefund = gstFareRefund + gstAddonRefund;
-    const refundAmount = fareRefund + gstRefund + addonRefund;
+    let refundAmount = fareRefund + gstRefund + addonRefund;
+    const AddonEntryRefund = require("../models/AddonEntryRefund");
+    const priorInitial = await AddonEntryRefund.aggregate([
+      {
+        $match: {
+          bookingId: booking._id,
+          paymentSource: "INITIAL",
+          status: { $in: ["REFUNDED", "PROCESSING"] },
+          refundId: { $ne: "" },
+        },
+      },
+      { $group: { _id: null, total: { $sum: "$amount" } } },
+    ]);
+    refundAmount = Math.max(
+      0,
+      refundAmount - Number(priorInitial[0]?.total || 0),
+    );
+    const AddonPurchase = require("../models/AddonPurchase");
+    const purchases = await AddonPurchase.find({
+      bookingId: booking._id,
+      status: {
+        $in: [
+          "CAPTURED",
+          "PROCESSING",
+          "APPLIED",
+          "REFUND_PROCESSING",
+          "REFUNDED",
+        ],
+      },
+    }).select("_id amountPaise");
+    let topupRefundAmount = 0;
+    for (const purchase of purchases) {
+      const prior = await AddonEntryRefund.aggregate([
+        {
+          $match: {
+            bookingId: booking._id,
+            addonPurchaseId: purchase._id,
+            status: { $in: ["REFUNDED", "PROCESSING"] },
+            refundId: { $ne: "" },
+          },
+        },
+        { $group: { _id: null, total: { $sum: "$amount" } } },
+      ]);
+      topupRefundAmount += Math.max(
+        0,
+        Number(purchase.amountPaise) / 100 - Number(prior[0]?.total || 0),
+      );
+    }
+    refundAmount += topupRefundAmount;
 
-    const totalPaid = Number(booking.pricing.totalAmount) || 0;
+    const totalPaid =
+      (Number(booking.initialPaymentAmount) || Number(p.totalAmount) || 0) +
+      purchases.reduce(
+        (sum, purchase) => sum + Number(purchase.amountPaise) / 100,
+        0,
+      );
     const deducted = Math.max(0, totalPaid - refundAmount);
 
     res.json({
@@ -1924,7 +3534,8 @@ exports.getRefundPreview = async (req, res) => {
       refundAmount,
       totalPaid,
       deducted,
-      hasAddon: addon > 0,
+      hasAddon: addon > 0 || purchases.length > 0,
+      topupRefundAmount,
       breakdown: {
         // what user paid, split
         netFare,
@@ -1934,6 +3545,7 @@ exports.getRefundPreview = async (req, res) => {
         fareRefund,
         gstRefund,
         addonRefund,
+        topupRefund: topupRefundAmount,
         // what is kept (non-refundable trip fare + its GST per the slab)
         fareKept: Math.max(0, userNetFare - fareRefund),
         gstKept: Math.max(0, gst - gstRefund),
@@ -1948,7 +3560,13 @@ exports.getRefundPreview = async (req, res) => {
 // POST /api/operator/bookings/:id/cancel  (operatorProtect)
 exports.operatorCancelBooking = async (req, res) => {
   try {
-    const { reason } = req.body;
+    const reason = String(req.body?.reason || "").trim();
+    if (!reason) {
+      return res.status(400).json({
+        success: false,
+        message: "Cancellation reason is required.",
+      });
+    }
     const booking = await TripBooking.findById(req.params.id);
     if (!booking) {
       return res
@@ -1961,16 +3579,45 @@ exports.operatorCancelBooking = async (req, res) => {
         .status(403)
         .json({ success: false, message: "Not authorized" });
     }
-    if (!["CONFIRMED", "PENDING"].includes(booking.status)) {
+    if (booking.status === "COMPLETED") {
+      return res.status(409).json({
+        success: false,
+        message:
+          "This booking is in History (Completed) and is read-only. It cannot be cancelled.",
+      });
+    }
+    if (
+      booking.status === "CANCELLED" &&
+      booking.cancellationState === "COMPLETED"
+    ) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "This booking is in History (Cancelled) and is read-only. It cannot be cancelled again.",
+      });
+    }
+    if (!["CONFIRMED", "PENDING", "CANCELLED"].includes(booking.status)) {
       return res.status(400).json({
         success: false,
         message: `Cannot cancel a ${booking.status.toLowerCase()} booking`,
       });
     }
+    // A claimed cancellation saga must remain resumable even after the trip
+    // crosses its start date. New cancellations fail closed on lifecycle/date.
+    if (booking.status !== "CANCELLED") {
+      const lifecycleConflict =
+        await operatorCancellationLifecycleConflict(booking);
+      if (lifecycleConflict) {
+        return res.status(409).json({
+          success: false,
+          message: lifecycleConflict,
+        });
+      }
+    }
 
     const summary = await processCancellationRefund(booking, {
       cancelledBy: "operator",
-      reason: reason || "Cancelled by operator",
+      reason,
       fullRefund: true, // operator cancel → 100% refund to user
     });
 
@@ -1979,24 +3626,16 @@ exports.operatorCancelBooking = async (req, res) => {
     notifyUser(
       booking.userId,
       "Trip Cancelled by Operator",
-      `Your booking for ${snap.packageTitle || "trip"} was cancelled by the operator. A full refund of ₹${summary.refundAmount.toLocaleString("en-IN")} is being processed.`,
+      `Your booking for ${snap.packageTitle || "trip"} was cancelled by the operator. ${summary.refundMessage}`,
       { type: "booking_cancelled", bookingId: booking._id.toString() },
     );
     // Notify admin (visibility + who cancelled)
     const { notifyAdmin } = require("./notificationController");
     notifyAdmin(
       "Operator Cancelled a Booking",
-      `Operator cancelled booking ${booking.bookingId} (${snap.packageTitle || "trip"}). Full refund ₹${summary.refundAmount.toLocaleString("en-IN")} to user. Reason: ${reason || "—"}`,
+      `Operator cancelled booking ${booking.bookingId} (${snap.packageTitle || "trip"}). Full refund ₹${summary.refundAmount.toLocaleString("en-IN")} to user. Reason: ${reason}`,
       { type: "booking_cancelled", bookingId: booking._id.toString() },
     );
-    try {
-      const Conversation = require("../models/Conversation");
-      await Conversation.updateMany(
-        { bookingId: booking._id },
-        { isActive: false },
-      );
-    } catch {}
-
     res.json({ success: true, refund: summary });
   } catch (err) {
     res
@@ -2009,7 +3648,7 @@ exports.operatorCancelBooking = async (req, res) => {
 // POST /api/operator/batches/:batchId/cancel  (operatorProtect)
 exports.operatorCancelBatch = async (req, res) => {
   try {
-    const { reason } = req.body;
+    const requestedReason = String(req.body?.reason || "").trim();
     const { batchId } = req.params;
 
     const batch = await Batch.findById(batchId);
@@ -2024,9 +3663,63 @@ exports.operatorCancelBatch = async (req, res) => {
         .json({ success: false, message: "Not authorized" });
     }
 
+    const resumingCancelledBatch =
+      batch.isCancelled === true && batch.isArchived !== true;
+    const reason =
+      requestedReason ||
+      (resumingCancelledBatch
+        ? String(batch.cancellationReason || "").trim()
+        : "");
+    if (!reason) {
+      return res.status(400).json({
+        success: false,
+        message: "Cancellation reason is required.",
+      });
+    }
+
+    const now = new Date();
+    if (batch.isArchived) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "This batch is in History (Archived) and is read-only. It cannot be cancelled.",
+      });
+    }
+    // A batch already closed by this workflow may resume unfinished booking
+    // cancellation effects. First-time cancellation always enforces dates.
+    if (!resumingCancelledBatch) {
+      if (!storedDateKey(batch.startDate) || !storedDateKey(batch.endDate)) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "Batch lifecycle could not be established from authoritative dates. Cancellation is blocked.",
+        });
+      }
+      const lifecycle = batchLifecycle(batch, now);
+      if (isHistory("batch", lifecycle)) {
+        return res.status(409).json({
+          success: false,
+          message: `This batch is in History (${lifecycle}) and is read-only. It cannot be cancelled.`,
+        });
+      }
+      if (isDateKeyStarted(batch.startDate, now)) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "This batch trip has already started and is read-only. It cannot be cancelled.",
+        });
+      }
+    }
+
     const bookings = await TripBooking.find({
       batchId,
-      status: { $in: ["CONFIRMED", "PENDING"] },
+      $or: [
+        { status: { $in: ["CONFIRMED", "PENDING"] } },
+        {
+          status: "CANCELLED",
+          cancellationState: { $ne: "COMPLETED" },
+        },
+      ],
     });
 
     const { notifyAdmin } = require("./notificationController");
@@ -2034,6 +3727,11 @@ exports.operatorCancelBatch = async (req, res) => {
     // Deactivate the batch FIRST so no new booking can slip in while we refund.
     // (Previously this happened after the loop, leaving a window open.)
     batch.isActive = false;
+    batch.isCancelled = true;
+    batch.cancelledAt = batch.cancelledAt || new Date();
+    batch.cancellationReason = String(
+      reason || batch.cancellationReason || "Batch cancelled by operator",
+    ).slice(0, 500);
     await batch.save();
 
     // Guard against a request that would time out mid-refund. Each cancellation
@@ -2053,7 +3751,10 @@ exports.operatorCancelBatch = async (req, res) => {
     }
 
     let cancelled = 0;
-    let totalRefund = 0;
+    let totalRefund = 0; // calculated refund liability, not settlement proof
+    let settledCount = 0;
+    let pendingCount = 0;
+    let attentionCount = 0;
     const errors = [];
 
     for (const booking of bookings) {
@@ -2065,20 +3766,33 @@ exports.operatorCancelBatch = async (req, res) => {
         });
         totalRefund += summary.refundAmount;
         cancelled++;
+        if (summary.refundStatus === "REFUNDED") {
+          settledCount++;
+        } else if (
+          summary.financialSettlementState === "RECONCILIATION_REQUIRED" ||
+          ["FAILED", "MANUAL", "RECONCILIATION_REQUIRED"].includes(
+            summary.refundStatus,
+          )
+        ) {
+          attentionCount++;
+          errors.push(
+            `${booking.bookingId}: ${summary.refundStatus} — ${summary.refundMessage}`,
+          );
+        } else if (summary.refundStatus === "PROCESSING") {
+          pendingCount++;
+        } else if (summary.refundAmount > 0) {
+          attentionCount++;
+          errors.push(
+            `${booking.bookingId}: ${summary.refundStatus} — ${summary.refundMessage}`,
+          );
+        }
         const snap = booking.snapshot || {};
         notifyUser(
           booking.userId,
           "Trip Cancelled by Operator",
-          `Your booking for ${snap.packageTitle || "trip"} was cancelled by the operator. A full refund of ₹${summary.refundAmount.toLocaleString("en-IN")} is being processed.`,
+          `Your booking for ${snap.packageTitle || "trip"} was cancelled by the operator. ${summary.refundMessage}`,
           { type: "booking_cancelled", bookingId: booking._id.toString() },
         );
-        try {
-          const Conversation = require("../models/Conversation");
-          await Conversation.updateMany(
-            { bookingId: booking._id },
-            { isActive: false },
-          );
-        } catch {}
       } catch (e) {
         errors.push(`${booking.bookingId}: ${e.message}`);
       }
@@ -2086,35 +3800,38 @@ exports.operatorCancelBatch = async (req, res) => {
 
     notifyAdmin(
       errors.length > 0
-        ? "Batch Cancellation Had Refund Failures"
+        ? "Batch Cancellation Needs Refund Attention"
         : "Operator Cancelled an Entire Batch",
-      `Operator cancelled batch "${batch.label || batchId}" — ${cancelled} of ${bookings.length} booking(s) refunded (₹${totalRefund.toLocaleString("en-IN")} total).${
-        errors.length > 0
-          ? ` ${errors.length} refund(s) FAILED and need manual action: ${errors.join("; ")}`
-          : ""
+      `Operator cancelled batch "${batch.label || batchId}" — ${cancelled} local cancellation(s); ${settledCount} refund(s) processed, ${pendingCount} provider-pending, ${attentionCount} need attention. Calculated refund liability: ₹${totalRefund.toLocaleString("en-IN")}.${
+        errors.length > 0 ? ` Details: ${errors.join("; ")}` : ""
       } Reason: ${reason || "—"}`,
       { type: "booking_cancelled", batchId: String(batchId) },
     );
 
-    // Partial failures used to come back as `success: true`, so the operator
-    // believed every traveller had been refunded.
     if (errors.length > 0) {
       return res.status(207).json({
         success: false,
         partial: true,
         cancelledCount: cancelled,
+        settledCount,
+        pendingCount,
+        attentionCount,
         failedCount: errors.length,
         totalRefund,
         errors,
-        message: `${cancelled} of ${bookings.length} bookings were refunded. ${errors.length} refund(s) could not be processed — our team has been alerted and will complete them.`,
+        message: `${cancelled} booking(s) were cancelled locally. ${settledCount} refund(s) are processed, ${pendingCount} remain provider-pending, and ${attentionCount} require manual attention.`,
       });
     }
 
     res.json({
       success: true,
       cancelledCount: cancelled,
+      settledCount,
+      pendingCount,
+      attentionCount,
       totalRefund,
       errors,
+      message: `${cancelled} booking(s) were cancelled locally. ${settledCount} refund(s) are processed and ${pendingCount} remain provider-pending.`,
     });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -2172,59 +3889,136 @@ exports.adminGetRefunds = async (req, res) => {
 // ── Admin: retry a FAILED refund ──────────────────────────────────────────────
 // POST /api/trip-bookings/admin/refunds/:id/retry
 exports.adminRetryRefund = async (req, res) => {
+  const retryToken = randomUUID();
   try {
-    const booking = await TripBooking.findById(req.params.id);
-    if (!booking) {
+    const existing = await TripBooking.findById(req.params.id);
+    if (!existing) {
       return res
         .status(404)
         .json({ success: false, message: "Booking not found" });
     }
-    if (!["FAILED", "MANUAL"].includes(booking.refundStatus)) {
-      return res.status(400).json({
+    if (!["FAILED", "MANUAL"].includes(existing.refundStatus)) {
+      return res.status(409).json({
         success: false,
-        message: `Refund is '${booking.refundStatus}', nothing to retry`,
+        message: `Refund is '${existing.refundStatus}', nothing to retry`,
       });
     }
-    if (!booking.razorpayPaymentId) {
+    if (!existing.razorpayPaymentId) {
       return res.status(400).json({
         success: false,
         message: "No Razorpay payment id — refund the user manually offline.",
       });
     }
 
-    // Allow admin to optionally override the amount (capped to what user paid)
-    const maxRefundable = booking.pricing?.totalAmount || booking.refundAmount;
-    const rawAmount = Number(req.body.amount) || booking.refundAmount;
+    const maxRefundable =
+      existing.pricing?.totalAmount || existing.refundAmount;
+    const rawAmount = Number(req.body.amount) || existing.refundAmount;
     const amount = Math.min(rawAmount, maxRefundable);
+    const booking = await TripBooking.findOneAndUpdate(
+      {
+        _id: existing._id,
+        refundStatus: { $in: ["FAILED", "MANUAL"] },
+      },
+      {
+        $set: {
+          refundStatus: "PROCESSING",
+          financialSettlementState: "PENDING",
+          refundRetryToken: retryToken,
+          refundRetryLeaseUntil: new Date(Date.now() + 5 * 60 * 1000),
+          refundError: "Admin refund retry submitted",
+        },
+      },
+      { new: true },
+    );
+    if (!booking) {
+      return res.status(409).json({
+        success: false,
+        message: "Another refund action already claimed this booking.",
+      });
+    }
+
     const { refundPayment } = require("../utils/razorpayRefund");
     const result = await refundPayment(booking.razorpayPaymentId, amount, {
       bookingId: booking.bookingId,
       reason: "Admin retry",
     });
 
-    if (result.success) {
-      booking.refundId = result.refundId || "";
-      booking.refundAmount = amount;
-      booking.refundStatus =
-        result.status === "processed" ? "REFUNDED" : "PROCESSING";
-      booking.refundError = "";
-      if (booking.refundStatus === "REFUNDED") booking.refundedAt = new Date();
-      await booking.save();
-      notifyUser(
-        booking.userId,
-        "Refund Processing",
-        `Your refund of ₹${amount.toLocaleString("en-IN")} for ${booking.snapshot?.packageTitle || "your trip"} is being processed.`,
-        { type: "booking_cancelled", bookingId: booking._id.toString() },
-      );
-      return res.json({ success: true, refundStatus: booking.refundStatus });
+    const providerProcessed = result.success && result.status === "processed";
+    const finalized = await TripBooking.updateOne(
+      {
+        _id: booking._id,
+        refundStatus: "PROCESSING",
+        refundRetryToken: retryToken,
+      },
+      {
+        $set: result.success
+          ? {
+              refundId: result.refundId || "",
+              refundAmount: amount,
+              refundStatus: providerProcessed ? "REFUNDED" : "PROCESSING",
+              financialSettlementState: providerProcessed
+                ? "SETTLED"
+                : "PENDING",
+              refundError: providerProcessed
+                ? ""
+                : "Provider accepted the refund; settlement is still pending",
+              refundedAt: providerProcessed ? new Date() : null,
+              refundRetryToken: providerProcessed ? "" : retryToken,
+              refundRetryLeaseUntil: providerProcessed
+                ? null
+                : new Date(Date.now() + 10 * 60 * 1000),
+            }
+          : {
+              refundStatus: "FAILED",
+              financialSettlementState: "RECONCILIATION_REQUIRED",
+              refundError: result.error || "Refund failed",
+              refundRetryToken: "",
+              refundRetryLeaseUntil: null,
+            },
+      },
+    );
+    if (finalized.modifiedCount !== 1) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "Refund provider response could not be fenced to this retry; reconciliation is required.",
+      });
     }
-    booking.refundStatus = "FAILED";
-    booking.refundError = result.error || "Refund failed";
-    await booking.save();
-    res
-      .status(400)
-      .json({ success: false, message: result.error || "Refund failed" });
+
+    if (!result.success) {
+      return res
+        .status(400)
+        .json({ success: false, message: result.error || "Refund failed" });
+    }
+
+    notifyUser(
+      booking.userId,
+      providerProcessed ? "Refund Completed" : "Refund Pending",
+      providerProcessed
+        ? `Your refund of ₹${amount.toLocaleString("en-IN")} for ${booking.snapshot?.packageTitle || "your trip"} was processed.`
+        : `Your refund of ₹${amount.toLocaleString("en-IN")} for ${booking.snapshot?.packageTitle || "your trip"} was accepted and is still processing.`,
+      { type: "booking_cancelled", bookingId: booking._id.toString() },
+    );
+    return res.json({
+      success: true,
+      refundStatus: providerProcessed ? "REFUNDED" : "PROCESSING",
+      message: providerProcessed
+        ? "Refund processed by the provider."
+        : "Refund accepted by the provider and still pending.",
+    });
   } catch (err) {
+    await TripBooking.updateOne(
+      { _id: req.params.id, refundRetryToken: retryToken },
+      {
+        $set: {
+          refundStatus: "FAILED",
+          financialSettlementState: "RECONCILIATION_REQUIRED",
+          refundError: String(err.message || err).slice(0, 500),
+          refundRetryToken: "",
+          refundRetryLeaseUntil: null,
+        },
+      },
+    ).catch(() => {});
     res.status(500).json({ success: false, message: err.message });
   }
 };
@@ -2260,7 +4054,7 @@ exports.adminMarkRefundDone = async (req, res) => {
       });
     }
 
-    const markable = ["FAILED", "MANUAL", "PENDING", "PROCESSING"];
+    const markable = ["FAILED", "MANUAL", "RECONCILIATION_REQUIRED"];
     if (booking.refundStatus && !markable.includes(booking.refundStatus)) {
       return res.status(400).json({
         success: false,
@@ -2276,18 +4070,39 @@ exports.adminMarkRefundDone = async (req, res) => {
       });
     }
 
-    booking.refundStatus = "REFUNDED";
-    booking.refundedAt = new Date();
-    booking.refundError = "";
-    booking.refundMarkedManually = true;
-    booking.refundMarkedBy = req.user._id;
-    booking.refundNote = note;
-    booking.cancelReason =
-      `${booking.cancelReason || ""} | Manual refund by admin: ${note}`.trim();
-    await booking.save();
+    const marked = await TripBooking.findOneAndUpdate(
+      {
+        _id: booking._id,
+        status: "CANCELLED",
+        refundStatus: {
+          $in: ["FAILED", "MANUAL", "RECONCILIATION_REQUIRED"],
+        },
+      },
+      {
+        $set: {
+          refundStatus: "REFUNDED",
+          financialSettlementState: "SETTLED",
+          refundedAt: new Date(),
+          refundError: "",
+          refundMarkedManually: true,
+          refundMarkedBy: req.user._id,
+          refundNote: note,
+          cancelReason:
+            `${booking.cancelReason || ""} | Manual refund by admin: ${note}`.trim(),
+        },
+      },
+      { new: true },
+    );
+    if (!marked) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "Refund state changed or is still processing; verify provider status before marking an offline settlement.",
+      });
+    }
 
     console.log(
-      `[adminMarkRefundDone] booking=${booking.bookingId} amount=${booking.refundAmount} admin=${req.user._id} note="${note}"`,
+      `[adminMarkRefundDone] booking=${marked.bookingId} amount=${marked.refundAmount} admin=${req.user._id} note="${note}"`,
     );
 
     res.json({ success: true });
@@ -2350,23 +4165,42 @@ exports.syncSnapjaStatus = async (req, res) => {
           snapjaBookings[key].status = b.status;
           updated = true;
 
-          // No creator / cancelled / expired on Snapja side → flag for refund.
+          // Definitive remote failure: execute an idempotent partial refund
+          // against the frozen payment source before telling the customer.
           const failStatuses = ["no_creator_available", "cancelled", "expired"];
-          if (
-            failStatuses.includes(String(b.status).toLowerCase()) &&
-            !snapjaBookings[key].refundFlagged
-          ) {
+          if (failStatuses.includes(String(b.status).toLowerCase())) {
+            const refund =
+              await require("../utils/addonEntryRefund").processAddonEntryRefund(
+                {
+                  booking,
+                  entryKey: key,
+                  reason: String(b.status),
+                  providerStatus: String(b.status),
+                },
+              );
             snapjaBookings[key].refundFlagged = true;
             snapjaBookings[key].refundReason = b.status;
-            try {
-              const { notifyUser } = require("./notificationController");
-              notifyUser(
-                booking.userId,
-                "Add-on Could Not Be Assigned",
-                `We couldn't assign a creator for one of your add-on days. A refund for that add-on will be processed.`,
-                { type: "general", bookingId: booking._id.toString() },
-              );
-            } catch {}
+            snapjaBookings[key].refundState = refund.refunded
+              ? "REFUNDED"
+              : refund.pending
+                ? "PROCESSING"
+                : "RECONCILIATION_REQUIRED";
+            snapjaBookings[key].refundAmount = refund.amount || 0;
+            snapjaBookings[key].refundId = refund.refundId || "";
+            if (refund.refunded || refund.pending) {
+              try {
+                require("./notificationController").notifyUser(
+                  booking.userId,
+                  refund.refunded
+                    ? "Add-on Refund Processed"
+                    : "Add-on Refund Started",
+                  refund.refunded
+                    ? "The payment provider processed your add-on refund."
+                    : "The payment provider accepted your add-on refund request.",
+                  { type: "general", bookingId: booking._id.toString() },
+                );
+              } catch {}
+            }
           }
         }
         // Update creator info if assigned (always sync latest)

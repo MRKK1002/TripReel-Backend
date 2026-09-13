@@ -17,6 +17,7 @@ const snapjaDispatchClaimSchema = new mongoose.Schema(
       index: true,
     },
     leaseUntil: Date,
+    nextAttemptAt: { type: Date, default: null, index: true },
     attempts: { type: Number, default: 0 },
     snapjaBooking: { type: mongoose.Schema.Types.Mixed, default: null },
     lastError: { type: String, default: "" },
@@ -29,4 +30,7 @@ snapjaDispatchClaimSchema.index(
   { unique: true },
 );
 
-module.exports = mongoose.model("SnapjaDispatchClaim", snapjaDispatchClaimSchema);
+module.exports = mongoose.model(
+  "SnapjaDispatchClaim",
+  snapjaDispatchClaimSchema,
+);

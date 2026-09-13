@@ -32,6 +32,7 @@ async function resolvePlatformCoupon({
   const coupon = await PlatformCoupon.findOne({
     code: normalized,
     isActive: true,
+    isArchived: { $ne: true },
     validFrom: { $lte: now },
     validUntil: { $gte: now },
   });

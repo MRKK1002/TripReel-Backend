@@ -7,18 +7,17 @@ const { protect, restrictTo } = require("../middleware/authMiddleware");
 const {
   getAllReels,
   getReelById,
-  createReel,
-  updateReel,
   deleteReel,
   incrementReelView,
 } = require("../controllers/reelController");
+const Reel = require("../models/Reel");
+const { REEL_VIDEO_DIR, generateReelThumbnail } = require("../utils/reelMedia");
 
 // ── Multer storage for videos ─────────────────────────────────────────────────
-const videoDir = path.join(__dirname, "../uploads/videos");
-if (!fs.existsSync(videoDir)) fs.mkdirSync(videoDir, { recursive: true });
+fs.mkdirSync(REEL_VIDEO_DIR, { recursive: true });
 
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, videoDir),
+  destination: (req, file, cb) => cb(null, REEL_VIDEO_DIR),
   filename: (req, file, cb) => {
     const unique = `${Date.now()}-${Math.round(Math.random() * 1e6)}`;
     cb(null, `${unique}${path.extname(file.originalname)}`);
@@ -91,16 +90,22 @@ const upload = multer({
   limits: { fileSize: 200 * 1024 * 1024 }, // 200 MB
 });
 
-// Uploaded files are written to disk before the database write runs, so discard
-// them when the save fails. Otherwise each failed save leaves an orphaned file.
-const discardUploadedFiles = (files) => {
-  Object.values(files || {})
-    .flat()
-    .forEach((file) => {
-      fs.promises.unlink(file.path).catch(() => {
+// Uploaded/generated files are written before the database write, so discard
+// them when saving fails. This prevents failed requests leaving orphaned media.
+const discardNewFiles = async (files, extraPaths = []) => {
+  const paths = [
+    ...Object.values(files || {})
+      .flat()
+      .map((file) => file.path),
+    ...extraPaths,
+  ];
+  await Promise.all(
+    [...new Set(paths.filter(Boolean))].map((filePath) =>
+      fs.promises.unlink(filePath).catch(() => {
         /* best effort cleanup */
-      });
-    });
+      }),
+    ),
+  );
 };
 
 // Reject a file field that arrived as a non-file value. Axios serialises
@@ -110,6 +115,52 @@ const readMediaField = (value) => {
   if (typeof value === "string") return value;
   if (value === undefined || value === null) return undefined;
   return null; // present but not a usable value
+};
+
+const parseUser = (body) => {
+  if (typeof body.user !== "string") return;
+  try {
+    body.user = JSON.parse(body.user);
+  } catch {
+    body.user = {};
+  }
+};
+
+const applyMediaFields = (req, body) => {
+  if (req.files?.video?.[0]) {
+    body.video = `/uploads/videos/${req.files.video[0].filename}`;
+  }
+  if (req.files?.thumbnail?.[0]) {
+    body.thumbnail = `/uploads/videos/${req.files.thumbnail[0].filename}`;
+  }
+
+  for (const field of ["video", "thumbnail"]) {
+    if (req.files?.[field]?.[0]) continue;
+    const value = readMediaField(body[field]);
+    if (value === null) return field;
+    if (value === undefined) delete body[field];
+  }
+  return null;
+};
+
+const generateUploadedVideoThumbnail = async (req, body) => {
+  const videoFile = req.files?.video?.[0];
+  const thumbnailFile = req.files?.thumbnail?.[0];
+  if (!videoFile || thumbnailFile) return null;
+
+  try {
+    const generated = await generateReelThumbnail(videoFile.path);
+    // A new video must never retain the previous video's thumbnail string sent
+    // by an edit form. Uploaded thumbnail > generated thumbnail.
+    body.thumbnail = generated.publicPath;
+    return generated;
+  } catch (error) {
+    const uploadError = new Error(
+      `The video was received, but its thumbnail could not be generated: ${error.message}`,
+    );
+    uploadError.statusCode = 422;
+    throw uploadError;
+  }
 };
 
 // ── Public ────────────────────────────────────────────────────────────────────
@@ -127,43 +178,31 @@ router.post(
     { name: "thumbnail", maxCount: 1 },
   ]),
   async (req, res) => {
+    let generatedThumbnail = null;
     try {
       const body = { ...req.body };
-
-      if (req.files?.video?.[0]) {
-        body.video = `/uploads/videos/${req.files.video[0].filename}`;
-      }
-      if (req.files?.thumbnail?.[0]) {
-        body.thumbnail = `/uploads/videos/${req.files.thumbnail[0].filename}`;
-      }
-
-      for (const field of ["video", "thumbnail"]) {
-        if (req.files?.[field]?.[0]) continue;
-        const value = readMediaField(body[field]);
-        if (value === null) {
-          discardUploadedFiles(req.files);
-          return res.status(400).json({
-            success: false,
-            message: `The ${field} was not received as a file. Retry the upload; if it repeats, reload the page.`,
-          });
-        }
-        if (value === undefined) delete body[field];
+      const invalidField = applyMediaFields(req, body);
+      if (invalidField) {
+        await discardNewFiles(req.files);
+        return res.status(400).json({
+          success: false,
+          message: `The ${invalidField} was not received as a file. Retry the upload; if it repeats, reload the page.`,
+        });
       }
 
-      // Parse nested user object sent as JSON string
-      if (typeof body.user === "string") {
-        try {
-          body.user = JSON.parse(body.user);
-        } catch {
-          body.user = {};
-        }
-      }
+      parseUser(body);
+      generatedThumbnail = await generateUploadedVideoThumbnail(req, body);
 
-      const reel = await require("../models/Reel").create(body);
-      res.status(201).json({ success: true, reel });
+      const reel = await Reel.create(body);
+      return res.status(201).json({ success: true, reel });
     } catch (err) {
-      discardUploadedFiles(req.files);
-      res.status(400).json({ success: false, message: err.message });
+      await discardNewFiles(
+        req.files,
+        generatedThumbnail ? [generatedThumbnail.absolutePath] : [],
+      );
+      return res
+        .status(err.statusCode || 400)
+        .json({ success: false, message: err.message });
     }
   },
 );
@@ -178,55 +217,52 @@ router.put(
     { name: "thumbnail", maxCount: 1 },
   ]),
   async (req, res) => {
+    let generatedThumbnail = null;
     try {
-      const body = { ...req.body };
-
-      if (req.files?.video?.[0]) {
-        body.video = `/uploads/videos/${req.files.video[0].filename}`;
-      }
-      if (req.files?.thumbnail?.[0]) {
-        body.thumbnail = `/uploads/videos/${req.files.thumbnail[0].filename}`;
-      }
-
-      for (const field of ["video", "thumbnail"]) {
-        if (req.files?.[field]?.[0]) continue;
-        const value = readMediaField(body[field]);
-        if (value === null) {
-          discardUploadedFiles(req.files);
-          return res.status(400).json({
-            success: false,
-            message: `The ${field} was not received as a file. Retry the upload; if it repeats, reload the page.`,
-          });
-        }
-        if (value === undefined) delete body[field];
-      }
-
-      if (typeof body.user === "string") {
-        try {
-          body.user = JSON.parse(body.user);
-        } catch {
-          body.user = {};
-        }
-      }
-
-      const reel = await require("../models/Reel").findByIdAndUpdate(
-        req.params.id,
-        body,
-        {
-          new: true,
-          runValidators: true,
-        },
-      );
-      if (!reel) {
-        discardUploadedFiles(req.files);
+      const existing = await Reel.findById(req.params.id);
+      if (!existing) {
+        await discardNewFiles(req.files);
         return res
           .status(404)
           .json({ success: false, message: "Reel not found" });
       }
-      res.json({ success: true, reel });
+
+      const body = { ...req.body };
+      const invalidField = applyMediaFields(req, body);
+      if (invalidField) {
+        await discardNewFiles(req.files);
+        return res.status(400).json({
+          success: false,
+          message: `The ${invalidField} was not received as a file. Retry the upload; if it repeats, reload the page.`,
+        });
+      }
+
+      parseUser(body);
+      generatedThumbnail = await generateUploadedVideoThumbnail(req, body);
+
+      const reel = await Reel.findByIdAndUpdate(req.params.id, body, {
+        new: true,
+        runValidators: true,
+      });
+      if (!reel) {
+        await discardNewFiles(
+          req.files,
+          generatedThumbnail ? [generatedThumbnail.absolutePath] : [],
+        );
+        return res
+          .status(404)
+          .json({ success: false, message: "Reel not found" });
+      }
+
+      return res.json({ success: true, reel });
     } catch (err) {
-      discardUploadedFiles(req.files);
-      res.status(400).json({ success: false, message: err.message });
+      await discardNewFiles(
+        req.files,
+        generatedThumbnail ? [generatedThumbnail.absolutePath] : [],
+      );
+      return res
+        .status(err.statusCode || 400)
+        .json({ success: false, message: err.message });
     }
   },
 );

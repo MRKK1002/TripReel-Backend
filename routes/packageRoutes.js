@@ -22,12 +22,38 @@ const {
   requireApprovedOperator,
 } = require("../middleware/operatorAuthMiddleware");
 const upload = require("../middleware/uploadMiddleware");
+const Package = require("../models/Package");
+const { packageLifecycle, isHistory } = require("../utils/lifecycle");
 
 // multer fields for package images
 const packageUpload = upload.fields([
   { name: "image_url", maxCount: 1 },
   { name: "images", maxCount: 4 },
 ]);
+
+// Reject historical package edits before multer writes uploaded files. The
+// controller repeats this authoritative check after upload before changing DB state.
+async function requireMutableOperatorPackage(req, res, next) {
+  try {
+    const pkg = await Package.findOne({
+      _id: req.params.id,
+      operatorId: req.operator._id,
+    });
+    if (!pkg)
+      return res
+        .status(404)
+        .json({ success: false, message: "Package not found or not yours" });
+    const lifecycle = packageLifecycle(pkg);
+    if (isHistory("package", lifecycle))
+      return res.status(409).json({
+        success: false,
+        message: `This package is in History (${lifecycle}) and is read-only. It cannot be changed.`,
+      });
+    next();
+  } catch (err) {
+    next(err);
+  }
+}
 
 // ── Operator routes (must come before /:id to avoid conflicts) ────────────────
 // Writes are gated on admin approval — an unapproved operator can read their
@@ -45,6 +71,7 @@ router.put(
   "/operator/:id",
   operatorProtect,
   requireApprovedOperator,
+  requireMutableOperatorPackage,
   packageUpload,
   operatorUpdatePackage,
 );

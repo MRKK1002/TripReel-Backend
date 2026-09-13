@@ -46,4 +46,29 @@ async function refundPayment(paymentId, amountRupees, notes = {}) {
   }
 }
 
-module.exports = { refundPayment };
+async function fetchRefundStatus(refundId) {
+  if (!refundId) {
+    return { supported: true, success: false, error: "Missing refund id" };
+  }
+  const resource = getRazorpay().refunds;
+  if (!resource || typeof resource.fetch !== "function") {
+    return { supported: false, success: false };
+  }
+  try {
+    const refund = await resource.fetch(refundId);
+    return {
+      supported: true,
+      success: true,
+      refundId: refund.id || refundId,
+      status: refund.status || "unknown",
+    };
+  } catch (err) {
+    return {
+      supported: true,
+      success: false,
+      error: err?.error?.description || err?.message || "Refund fetch failed",
+    };
+  }
+}
+
+module.exports = { refundPayment, fetchRefundStatus };

@@ -273,3 +273,92 @@ exports.getAdminNotifications = async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 };
+
+async function upsertStrictNotification(effectKey, payload) {
+  if (!effectKey) throw new Error("Strict notification effect key is required");
+  try {
+    return await Notification.findOneAndUpdate(
+      { effectKey },
+      { $setOnInsert: { ...payload, effectKey } },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    );
+  } catch (error) {
+    if (error.code !== 11000) throw error;
+    const existing = await Notification.findOne({ effectKey });
+    if (!existing) throw error;
+    return existing;
+  }
+}
+exports.upsertStrictNotification = upsertStrictNotification;
+
+// Strict variants for durable booking-confirmation delivery. Persistence errors
+// propagate to the caller so its channel marker remains retryable; push remains
+// best-effort after the in-app notification is durably stored.
+exports.notifyUserStrict = async (userId, title, body, data = {}) => {
+  const screen = PERSISTED_USER_NOTIFICATION_SCREENS.has(data.screen)
+    ? data.screen
+    : undefined;
+  await upsertStrictNotification(data.effectKey, {
+    recipientId: userId,
+    recipientType: "user",
+    title,
+    body,
+    type: data.type || "general",
+    bookingId: data.bookingId || undefined,
+    packageId: data.packageId || undefined,
+    screen,
+    intentId:
+      screen === "ResumeBooking" ? data.intentId || undefined : undefined,
+  });
+  const user = await User.findById(userId).select("fcmToken");
+  if (user?.fcmToken) {
+    await sendNotification(user.fcmToken, title, body, data).catch((error) => {
+      console.warn("notifyUserStrict push error:", error.message);
+    });
+  }
+  return true;
+};
+
+exports.notifyOperatorStrict = async (operatorId, title, body, data = {}) => {
+  await upsertStrictNotification(data.effectKey, {
+    recipientId: operatorId,
+    recipientType: "operator",
+    title,
+    body,
+    type: data.type || "general",
+    bookingId: data.bookingId || undefined,
+    packageId: data.packageId || undefined,
+  });
+  const operator = await Operator.findById(operatorId).select("fcmToken");
+  if (operator?.fcmToken) {
+    await sendNotification(operator.fcmToken, title, body, data).catch(
+      (error) => {
+        console.warn("notifyOperatorStrict push error:", error.message);
+      },
+    );
+  }
+  return true;
+};
+
+exports.notifyAdminStrict = async (title, body, data = {}) => {
+  const admins = await User.find({ role: "admin" }).select("_id fcmToken");
+  for (const admin of admins) {
+    await upsertStrictNotification(`${data.effectKey}:${admin._id}`, {
+      recipientId: admin._id,
+      recipientType: "admin",
+      title,
+      body,
+      type: data.type || "general",
+      bookingId: data.bookingId || undefined,
+      packageId: data.packageId || undefined,
+    });
+    if (admin.fcmToken) {
+      await sendNotification(admin.fcmToken, title, body, data).catch(
+        (error) => {
+          console.warn("notifyAdminStrict push error:", error.message);
+        },
+      );
+    }
+  }
+  return true;
+};

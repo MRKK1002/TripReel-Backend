@@ -359,8 +359,31 @@ const packageSchema = new mongoose.Schema(
       default: 0,
       min: 0,
     },
+    // Per-booking aggregate claims make increments/releases replay-safe.
+    bookingCountClaimKeys: { type: [String], default: [], select: false },
+    bookingCountReleaseKeys: { type: [String], default: [], select: false },
+    archivedAt: { type: Date, default: null, index: true },
+    archivedBy: { type: String, default: "" },
+    archivedByType: {
+      type: String,
+      enum: ["operator", "admin", "system", ""],
+      default: "",
+    },
+    archivedReason: { type: String, default: "", trim: true, maxlength: 500 },
   },
   { timestamps: true },
 );
+
+packageSchema.pre("validate", function validateSubmittedPickup(next) {
+  if (this.status === "DRAFT") return next();
+  try {
+    require("../utils/packageItineraryValidation").validateSubmittedItinerary(
+      this.itinerary,
+    );
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
 
 module.exports = mongoose.model("Package", packageSchema);

@@ -19,6 +19,8 @@ const messageSchema = new mongoose.Schema(
     },
     senderName: { type: String, default: "" },
     senderAvatar: { type: String, default: "" },
+    // Sparse idempotency key for system-generated booking effects.
+    effectKey: { type: String, default: undefined },
 
     // Content
     text: { type: String, default: "" },
@@ -28,6 +30,11 @@ const messageSchema = new mongoose.Schema(
     read: { type: Boolean, default: false },
   },
   { timestamps: true },
+);
+
+messageSchema.index(
+  { effectKey: 1 },
+  { unique: true, partialFilterExpression: { effectKey: { $type: "string" } } },
 );
 
 module.exports = mongoose.model("Message", messageSchema);

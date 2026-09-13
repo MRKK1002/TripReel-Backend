@@ -1,9 +1,15 @@
 const TripBooking = require("../models/TripBooking");
+const { processCancellationRefund } = require("./tripBookingController");
 const SnapjaDispatchClaim = require("../models/SnapjaDispatchClaim");
 const { randomUUID } = require("crypto");
 const Batch = require("../models/Batch");
 const { getSetting } = require("./platformSettingsController");
 const { getItineraryDateKey } = require("../utils/addonBookingTiming");
+const {
+  storedDateKey,
+  getISTDayRange,
+  DAY_MS,
+} = require("../utils/businessDate");
 const {
   creditOperatorWalletIdempotent,
 } = require("../utils/idempotentWalletCredit");
@@ -14,14 +20,21 @@ const NOTIFICATION_STAGGER_MS = 500; // 500ms gap between each push notification
 const SNAPJA_API =
   process.env.SNAPJA_API_URL || "https://api.snapja.com/api/tripreel/bookings";
 const SNAPJA_API_KEY = process.env.SNAPJA_API_KEY;
+const SNAPJA_DISPATCH_BOOKING_LIMIT = 20;
+const SNAPJA_DISPATCH_CALL_LIMIT = 40;
 
 // Effective trip dates — batch bookings use batch dates, flexible bookings have
 // no batch so fall back to flexEndDate/flexStartDate then the booking snapshot.
 // (Fixes flexible bookings staying "upcoming" forever because batchId is null.)
 const effectiveEndDate = (b) =>
   b?.batchId?.endDate || b?.flexEndDate || b?.snapshot?.endDate || null;
+const effectiveEndExclusive = (b) => {
+  const key = storedDateKey(effectiveEndDate(b));
+  return key ? getISTDayRange(key).endExclusive : null;
+};
 const effectiveStartDate = (b) =>
   b?.batchId?.startDate || b?.flexStartDate || b?.snapshot?.startDate || null;
+exports.effectiveEndExclusive = effectiveEndExclusive;
 
 // Resolve refund % for a given trip start date from admin slabs (0 = no-refund window)
 async function refundPercentForDate(startDate) {
@@ -57,12 +70,278 @@ async function refundPercentForDate(startDate) {
   return 0;
 }
 
+async function dispatchCanonicalEntries({ booking, pkg, user, results }) {
+  const {
+    parseStrictTime,
+    validCoordinates,
+  } = require("../utils/canonicalAddonServices");
+  const entries = booking.addonServiceEntries || [];
+  const snapjaBookings = { ...(booking.snapjaBookings || {}) };
+  const newlyDispatchedKeys = [];
+  const maxAttempts = 5;
+
+  for (const entry of entries) {
+    const key = entry?.key;
+    const location = entry?.location || {};
+    if (!key || snapjaBookings[key]?.bookingId) continue;
+    if (
+      !entry.date ||
+      !parseStrictTime(entry.time) ||
+      !String(location.placeName || "").trim() ||
+      !validCoordinates(location.lat, location.lng) ||
+      !Number.isFinite(Number(entry.basePrice)) ||
+      Number(entry.basePrice) <= 0
+    ) {
+      results.errors.push(
+        `Snapja ${booking.bookingId} ${key || "unknown"}: frozen dispatch data is invalid; manual reconciliation required`,
+      );
+      continue;
+    }
+
+    try {
+      await SnapjaDispatchClaim.updateOne(
+        { tripBookingId: booking._id, entryKey: key },
+        {
+          $setOnInsert: {
+            operationId: randomUUID(),
+            state: "RETRYABLE",
+            nextAttemptAt: new Date(),
+          },
+        },
+        { upsert: true },
+      );
+    } catch (error) {
+      if (error.code !== 11000) throw error;
+    }
+    let existing = await SnapjaDispatchClaim.findOne({
+      tripBookingId: booking._id,
+      entryKey: key,
+    });
+    if (existing?.state === "DISPATCHED") {
+      if (existing.snapjaBooking?.bookingId) {
+        snapjaBookings[key] = existing.snapjaBooking;
+      }
+      continue;
+    }
+    if (existing?.state === "UNCERTAIN") {
+      results.errors.push(
+        `Snapja ${booking.bookingId} ${key}: manual reconciliation required`,
+      );
+      continue;
+    }
+    if (
+      existing?.state === "DISPATCHING" &&
+      existing.leaseUntil &&
+      existing.leaseUntil <= new Date()
+    ) {
+      await SnapjaDispatchClaim.updateOne(
+        { _id: existing._id, state: "DISPATCHING" },
+        {
+          $set: {
+            state: "UNCERTAIN",
+            leaseUntil: null,
+            lastError:
+              "Dispatch lease expired before a reliable result was persisted",
+          },
+        },
+      );
+      results.errors.push(
+        `Snapja ${booking.bookingId} ${key}: expired dispatch is uncertain`,
+      );
+      continue;
+    }
+    if (Number(existing?.attempts) >= maxAttempts) {
+      await SnapjaDispatchClaim.updateOne(
+        { _id: existing._id, state: "RETRYABLE" },
+        {
+          $set: {
+            state: "UNCERTAIN",
+            lastError: "Maximum definite dispatch attempts reached",
+          },
+        },
+      );
+      results.errors.push(
+        `Snapja ${booking.bookingId} ${key}: retry limit reached`,
+      );
+      continue;
+    }
+
+    if (results.callsMade >= results.maxCalls) {
+      results.deferred++;
+      break;
+    }
+
+    const now = new Date();
+    const claim = await SnapjaDispatchClaim.findOneAndUpdate(
+      {
+        tripBookingId: booking._id,
+        entryKey: key,
+        state: "RETRYABLE",
+        $or: [
+          { nextAttemptAt: null },
+          { nextAttemptAt: { $exists: false } },
+          { nextAttemptAt: { $lte: now } },
+        ],
+      },
+      {
+        $set: {
+          state: "DISPATCHING",
+          leaseUntil: new Date(now.getTime() + 10 * 60 * 1000),
+          lastError: "",
+        },
+        $inc: { attempts: 1 },
+      },
+      { new: true },
+    );
+    if (!claim) continue;
+
+    try {
+      results.callsMade++;
+      const response = await fetch(SNAPJA_API, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-API-Key": SNAPJA_API_KEY,
+          "X-Idempotency-Key": claim.operationId,
+        },
+        body: JSON.stringify({
+          service_type: entry.serviceType,
+          location: {
+            address: location.placeName,
+            lat: Number(location.lat),
+            lng: Number(location.lng),
+          },
+          price: Number(entry.basePrice),
+          duration: 1,
+          date: entry.date,
+          time: entry.time,
+          booking_type: entry.bookingType,
+          customer_name: user?.name || "Trip Reel User",
+          customer_phone: user?.phone || "",
+          customer_email: user?.email || "",
+          notes: `Trip Reel: ${pkg?.title || booking.snapshot?.packageTitle || "Trip"} — ${entry.displayName} — Day ${entry.dayIndex + 1} — Booking ${booking.bookingId} — Dispatch ${claim.operationId}`,
+          timezone: "Asia/Kolkata",
+          auto_confirm_payment: true,
+        }),
+      });
+      const data = await response.json().catch(() => ({}));
+      const returnedId = data.booking?.booking_id || data.booking?.id || "";
+      if (response.ok && data.success && returnedId) {
+        const dispatched = {
+          bookingId: data.booking?.booking_id || returnedId,
+          snapjaId: data.booking?.id || "",
+          otp: data.booking?.otp || "",
+          otpExpiresAt: data.booking?.otp_expires_at || "",
+          status: data.booking?.status || "confirmed",
+          bookingType: entry.bookingType,
+          entryKey: key,
+          dispatchedAt: new Date().toISOString(),
+        };
+        await SnapjaDispatchClaim.updateOne(
+          { _id: claim._id, state: "DISPATCHING" },
+          {
+            $set: {
+              state: "DISPATCHED",
+              snapjaBooking: dispatched,
+              leaseUntil: null,
+              nextAttemptAt: null,
+            },
+          },
+        );
+        snapjaBookings[key] = dispatched;
+        newlyDispatchedKeys.push(key);
+      } else {
+        const uncertain =
+          response.status >= 500 ||
+          (response.ok && data.success && !returnedId);
+        const exhausted = Number(claim.attempts) >= maxAttempts;
+        const state = uncertain || exhausted ? "UNCERTAIN" : "RETRYABLE";
+        const message =
+          data.message ||
+          (response.ok
+            ? "Snapja response omitted the booking id"
+            : `HTTP ${response.status}`);
+        const backoffMinutes = Math.min(
+          60,
+          2 ** Math.max(0, Number(claim.attempts) - 1),
+        );
+        await SnapjaDispatchClaim.updateOne(
+          { _id: claim._id, state: "DISPATCHING" },
+          {
+            $set: {
+              state,
+              leaseUntil: null,
+              nextAttemptAt:
+                state === "RETRYABLE"
+                  ? new Date(Date.now() + backoffMinutes * 60 * 1000)
+                  : null,
+              lastError: message,
+            },
+          },
+        );
+        results.errors.push(
+          `Snapja ${booking.bookingId} ${key}: ${message}${state === "UNCERTAIN" ? "; manual reconciliation required" : ""}`,
+        );
+      }
+    } catch (error) {
+      await SnapjaDispatchClaim.updateOne(
+        { _id: claim._id, state: "DISPATCHING" },
+        {
+          $set: {
+            state: "UNCERTAIN",
+            leaseUntil: null,
+            nextAttemptAt: null,
+            lastError: error.message,
+          },
+        },
+      ).catch(() => {});
+      results.errors.push(
+        `Snapja ${booking.bookingId} ${key}: response uncertain; manual reconciliation required`,
+      );
+    }
+  }
+
+  const allDispatched =
+    entries.length > 0 &&
+    entries.every((entry) => Boolean(snapjaBookings[entry.key]?.bookingId));
+  booking.addonDispatched = allDispatched;
+  booking.addonDispatchedAt = allDispatched ? new Date() : null;
+  booking.snapjaBookings = snapjaBookings;
+  booking.markModified("snapjaBookings");
+  await booking.save();
+  if (allDispatched) results.dispatched++;
+
+  if (newlyDispatchedKeys.length > 0) {
+    const otpLines = newlyDispatchedKeys
+      .map((key) => [key, snapjaBookings[key]])
+      .filter(([, value]) => value?.otp)
+      .map(
+        ([key, value]) =>
+          `${key}: OTP ${value.otp} (Snapja ID: ${value.bookingId})`,
+      );
+    if (otpLines.length > 0) {
+      require("./notificationController").notifyUser(
+        booking.userId,
+        "Addon Confirmed 📸",
+        `Your creator service is confirmed. Verify with OTP on the day:\n${otpLines.join("\n")}`,
+        { type: "general", bookingId: booking._id.toString() },
+      );
+    }
+  }
+}
+
 /**
  * Job: dispatch held Snapja addon money once a booking is locked-in
  * (entered the no-refund window). Sends one Snapja booking per service per day.
  */
 async function runSnapjaDispatch(bookingId = null) {
-  const results = { dispatched: 0, callsMade: 0, errors: [] };
+  const results = {
+    dispatched: 0,
+    callsMade: 0,
+    deferred: 0,
+    maxCalls: SNAPJA_DISPATCH_CALL_LIMIT,
+    errors: [],
+  };
   try {
     const Package = require("../models/Package");
     const User = require("../models/User");
@@ -78,10 +357,14 @@ async function runSnapjaDispatch(bookingId = null) {
     };
     if (bookingId) dispatchQuery._id = bookingId;
 
-    const bookings = await TripBooking.find(dispatchQuery).populate(
-      "batchId",
-      "startDate",
-    );
+    let bookingsQuery = TripBooking.find(dispatchQuery).sort({
+      updatedAt: 1,
+      _id: 1,
+    });
+    if (!bookingId) {
+      bookingsQuery = bookingsQuery.limit(SNAPJA_DISPATCH_BOOKING_LIMIT);
+    }
+    const bookings = await bookingsQuery.populate("batchId", "startDate");
 
     console.log(
       `[SNAPJA DISPATCH] Found ${bookings.length} bookings to dispatch`,
@@ -102,6 +385,12 @@ async function runSnapjaDispatch(bookingId = null) {
         const user = await User.findById(booking.userId).select(
           "name phone email",
         );
+        if ((booking.addonServiceEntries || []).length > 0) {
+          await dispatchCanonicalEntries({ booking, pkg, user, results });
+          if (results.callsMade >= results.maxCalls) break;
+          continue;
+        }
+        // Legacy rows only: reconstruct from mutable package/settings data.
         const addonDays = booking.addonDays || {};
         const snapjaBookings = booking.snapjaBookings || {};
         const addonBookingTypes = booking.addonBookingTypes || {};
@@ -166,6 +455,10 @@ async function runSnapjaDispatch(bookingId = null) {
             // (which resets addonDispatched=false) only sends the NEW days and
             // never creates duplicate Snapja bookings for existing ones.
             if (snapjaBookings[key]?.bookingId) continue;
+            if (results.callsMade >= results.maxCalls) {
+              results.deferred++;
+              break;
+            }
 
             // Claim this external side effect in Mongo before calling Snapja.
             // This prevents the immediate verifier and the five-minute cron
@@ -241,6 +534,7 @@ async function runSnapjaDispatch(bookingId = null) {
             if (!claim) continue;
 
             try {
+              results.callsMade++;
               const snapjaRes = await fetch(SNAPJA_API, {
                 method: "POST",
                 headers: {
@@ -277,7 +571,6 @@ async function runSnapjaDispatch(bookingId = null) {
                 }),
               });
               const snapjaData = await snapjaRes.json().catch(() => ({}));
-              results.callsMade++;
 
               const returnedBookingId =
                 snapjaData.booking?.booking_id || snapjaData.booking?.id || "";
@@ -432,7 +725,6 @@ async function runSnapjaAutoCancel() {
 
     const bookings = await TripBooking.find({
       status: "CONFIRMED",
-      addonDispatched: true,
       snapjaBookings: { $exists: true, $ne: null },
     }).populate("batchId", "startDate");
 
@@ -539,7 +831,6 @@ async function runSnapjaStatusSync() {
   try {
     // Find dispatched bookings that have snapjaBookings data and trip hasn't ended
     const bookings = await TripBooking.find({
-      addonDispatched: true,
       snapjaBookings: { $exists: true, $ne: null, $not: { $eq: {} } },
       status: { $in: ["CONFIRMED", "COMPLETED"] },
     }).populate("batchId", "endDate");
@@ -586,31 +877,55 @@ async function runSnapjaStatusSync() {
             snapjaBookings[key].status = b.status;
             updated = true;
 
-            // No creator could be found / booking cancelled on Snapja side →
-            // flag for refund so the held addon money is released to the user.
+            // A definitive Snapja failure triggers a durable per-entry refund
+            // against the frozen initial/top-up payment source.
             const failStatuses = [
               "no_creator_available",
               "cancelled",
               "expired",
             ];
-            if (
-              failStatuses.includes(String(b.status).toLowerCase()) &&
-              !snapjaBookings[key].refundFlagged
-            ) {
+            if (failStatuses.includes(String(b.status).toLowerCase())) {
+              const refund =
+                await require("../utils/addonEntryRefund").processAddonEntryRefund(
+                  {
+                    booking,
+                    entryKey: key,
+                    reason: String(b.status),
+                    providerStatus: String(b.status),
+                  },
+                );
               snapjaBookings[key].refundFlagged = true;
               snapjaBookings[key].refundReason = b.status;
-              results.errors.push(
-                `Snapja no-creator/cancel for ${booking.bookingId} ${key}: ${b.status} — flagged for refund`,
-              );
-              try {
-                const { notifyUser } = require("./notificationController");
-                notifyUser(
-                  booking.userId,
-                  "Add-on Could Not Be Assigned",
-                  `We couldn't assign a creator for one of your add-on days. A refund for that add-on will be processed.`,
-                  { type: "general", bookingId: booking._id.toString() },
-                );
-              } catch {}
+              snapjaBookings[key].refundState = refund.refunded
+                ? "REFUNDED"
+                : refund.pending
+                  ? "PROCESSING"
+                  : "RECONCILIATION_REQUIRED";
+              snapjaBookings[key].refundAmount = refund.amount || 0;
+              snapjaBookings[key].refundId = refund.refundId || "";
+              updated = true;
+              if (refund.refunded || refund.pending) {
+                try {
+                  require("./notificationController").notifyUser(
+                    booking.userId,
+                    refund.refunded
+                      ? "Add-on Refund Processed"
+                      : "Add-on Refund Started",
+                    refund.refunded
+                      ? "A creator could not be assigned and the provider processed the add-on refund."
+                      : "A creator could not be assigned and the add-on refund was accepted by the payment provider.",
+                    { type: "general", bookingId: booking._id.toString() },
+                  );
+                } catch {}
+              } else if (refund.reconciliation) {
+                try {
+                  require("./notificationController").notifyAdmin(
+                    "Add-on Refund Needs Reconciliation",
+                    `Booking ${booking.bookingId}, ${key}: Snapja status ${b.status}; automatic refund could not be confirmed.`,
+                    { type: "general", bookingId: booking._id.toString() },
+                  );
+                } catch {}
+              }
             }
           }
           if (b.creator) {
@@ -805,19 +1120,30 @@ async function runCronJobs() {
 
     // ── Job 2: Auto-cancel expired pending bookings ────────────────────────
     const pendingBookings = await TripBooking.find({
-      status: "PENDING",
+      $or: [
+        { status: "PENDING" },
+        {
+          status: "CANCELLED",
+          cancelledBy: "system",
+          cancellationState: {
+            $nin: ["COMPLETED", "RECONCILIATION_REQUIRED"],
+          },
+        },
+      ],
     }).populate("batchId", "bookingDeadline");
 
     for (const booking of pendingBookings) {
       try {
         if (booking.batchId && booking.batchId.bookingDeadline < now) {
-          booking.status = "CANCELLED";
-          booking.cancelReason = "Booking deadline passed — auto-cancelled";
-          booking.cancelledBy = "system";
-          await booking.save();
-          results.cancelled++;
+          const summary = await processCancellationRefund(booking, {
+            cancelledBy: "system",
+            reason: "Booking deadline passed — auto-cancelled",
+            fullRefund: true,
+          });
+          if (summary.newlyCompleted) results.cancelled++;
         }
       } catch (e) {
+        if (e.code === "CANCELLATION_ALREADY_CLAIMED") continue;
         results.errors.push(`Auto-cancel ${booking.bookingId}: ${e.message}`);
       }
     }
@@ -1206,7 +1532,6 @@ exports.runCron = async (req, res) => {
 // Job 1 + 2 only: auto-complete and auto-cancel + escrow wallet release
 exports.runAutoCompleteAndCancel = async function () {
   const now = new Date();
-  const twoDaysAgo = new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000);
   const leaseUntil = () => new Date(Date.now() + 10 * 60 * 1000);
   const results = { completed: 0, cancelled: 0, walletReleased: 0, errors: [] };
 
@@ -1220,8 +1545,8 @@ exports.runAutoCompleteAndCancel = async function () {
 
     for (const booking of confirmedBookings) {
       try {
-        const endD = effectiveEndDate(booking);
-        if (!endD || new Date(endD) >= now) continue;
+        const endExclusive = effectiveEndExclusive(booking);
+        if (!endExclusive || endExclusive > now) continue;
 
         const completedBooking = await TripBooking.findOneAndUpdate(
           { _id: booking._id, status: "CONFIRMED" },
@@ -1257,8 +1582,11 @@ exports.runAutoCompleteAndCancel = async function () {
     }).populate("batchId", "endDate");
 
     for (const booking of completedUnpaid) {
-      const endD = effectiveEndDate(booking);
-      if (!endD || new Date(endD) >= twoDaysAgo) continue;
+      const endExclusive = effectiveEndExclusive(booking);
+      const releaseAt = endExclusive
+        ? new Date(endExclusive.getTime() + 2 * DAY_MS)
+        : null;
+      if (!releaseAt || releaseAt > now) continue;
 
       const releaseToken = randomUUID();
       let claimed = null;
@@ -1367,26 +1695,29 @@ exports.runAutoCompleteAndCancel = async function () {
 
     // ── Step 3: atomically auto-cancel expired pending bookings ─────────────
     const pendingBookings = await TripBooking.find({
-      status: "PENDING",
+      $or: [
+        { status: "PENDING" },
+        {
+          status: "CANCELLED",
+          cancelledBy: "system",
+          cancellationState: {
+            $nin: ["COMPLETED", "RECONCILIATION_REQUIRED"],
+          },
+        },
+      ],
     }).populate("batchId", "bookingDeadline");
     for (const booking of pendingBookings) {
       try {
         if (!booking.batchId || booking.batchId.bookingDeadline >= now)
           continue;
-        const cancelled = await TripBooking.findOneAndUpdate(
-          { _id: booking._id, status: "PENDING" },
-          {
-            $set: {
-              status: "CANCELLED",
-              cancelReason: "Booking deadline passed — auto-cancelled",
-              cancelledBy: "system",
-              cancelledAt: new Date(),
-            },
-          },
-          { new: true },
-        );
-        if (cancelled) results.cancelled++;
+        const summary = await processCancellationRefund(booking, {
+          cancelledBy: "system",
+          reason: "Booking deadline passed — auto-cancelled",
+          fullRefund: true,
+        });
+        if (summary.newlyCompleted) results.cancelled++;
       } catch (error) {
+        if (error.code === "CANCELLATION_ALREADY_CLAIMED") continue;
         results.errors.push(
           `Auto-cancel ${booking.bookingId}: ${error.message}`,
         );
@@ -1394,6 +1725,183 @@ exports.runAutoCompleteAndCancel = async function () {
     }
   } catch (error) {
     results.errors.push(`Auto-complete/cancel error: ${error.message}`);
+  }
+  return results;
+};
+
+// Reconcile admin refund retries that lost their request worker after the
+// provider call. Never resubmit money movement from this recovery path.
+exports.runRefundRetryRecovery = async function () {
+  const now = new Date();
+  const results = {
+    checked: 0,
+    settled: 0,
+    pending: 0,
+    reconciliationRequired: 0,
+    errors: [],
+  };
+  const bookings = await TripBooking.find({
+    refundStatus: "PROCESSING",
+    refundRetryToken: { $gt: "" },
+    $or: [
+      { refundRetryLeaseUntil: null },
+      { refundRetryLeaseUntil: { $exists: false } },
+      { refundRetryLeaseUntil: { $lte: now } },
+    ],
+  })
+    .sort({ refundRetryLeaseUntil: 1, _id: 1 })
+    .limit(50);
+
+  const { fetchRefundStatus } = require("../utils/razorpayRefund");
+  for (const booking of bookings) {
+    results.checked++;
+    const token = booking.refundRetryToken;
+    try {
+      if (!booking.refundId) {
+        const updated = await TripBooking.updateOne(
+          {
+            _id: booking._id,
+            refundStatus: "PROCESSING",
+            refundRetryToken: token,
+          },
+          {
+            $set: {
+              refundStatus: "RECONCILIATION_REQUIRED",
+              financialSettlementState: "RECONCILIATION_REQUIRED",
+              refundError:
+                "Refund retry worker ended before the provider refund id was durably recorded; verify with the provider before any further action",
+              refundRetryToken: "",
+              refundRetryLeaseUntil: null,
+            },
+          },
+        );
+        if (updated.modifiedCount === 1) results.reconciliationRequired++;
+        continue;
+      }
+
+      const provider = await fetchRefundStatus(booking.refundId);
+      if (
+        provider.supported &&
+        provider.success &&
+        provider.status === "processed"
+      ) {
+        const updated = await TripBooking.updateOne(
+          {
+            _id: booking._id,
+            refundStatus: "PROCESSING",
+            refundRetryToken: token,
+          },
+          {
+            $set: {
+              refundStatus: "REFUNDED",
+              financialSettlementState: "SETTLED",
+              refundedAt: new Date(),
+              refundError: "",
+              refundRetryToken: "",
+              refundRetryLeaseUntil: null,
+            },
+          },
+        );
+        if (updated.modifiedCount === 1) results.settled++;
+        continue;
+      }
+
+      if (
+        provider.supported &&
+        provider.success &&
+        ["pending", "processing"].includes(provider.status)
+      ) {
+        const updated = await TripBooking.updateOne(
+          {
+            _id: booking._id,
+            refundStatus: "PROCESSING",
+            refundRetryToken: token,
+          },
+          {
+            $set: {
+              refundRetryLeaseUntil: new Date(Date.now() + 10 * 60 * 1000),
+              refundError: "Provider refund is still pending",
+            },
+          },
+        );
+        if (updated.modifiedCount === 1) results.pending++;
+        continue;
+      }
+
+      const reason = !provider.supported
+        ? "Configured payment SDK cannot fetch refund status"
+        : provider.error ||
+          `Provider refund status is '${provider.status || "unknown"}'`;
+      const updated = await TripBooking.updateOne(
+        {
+          _id: booking._id,
+          refundStatus: "PROCESSING",
+          refundRetryToken: token,
+        },
+        {
+          $set: {
+            refundStatus: "RECONCILIATION_REQUIRED",
+            financialSettlementState: "RECONCILIATION_REQUIRED",
+            refundError: String(reason).slice(0, 500),
+            refundRetryToken: "",
+            refundRetryLeaseUntil: null,
+          },
+        },
+      );
+      if (updated.modifiedCount === 1) results.reconciliationRequired++;
+    } catch (error) {
+      results.errors.push(`${booking.bookingId}: ${error.message}`);
+    }
+  }
+  return results;
+};
+
+// Bounded recovery for every locally incomplete cancellation, independent of
+// actor or booking deadline. Legacy rows without markers are deliberately moved
+// to reconciliation by processCancellationRefund rather than replayed.
+exports.runCancellationRecovery = async function () {
+  const now = new Date();
+  const results = {
+    checked: 0,
+    completed: 0,
+    reconciliationRequired: 0,
+    errors: [],
+  };
+  const bookings = await TripBooking.find({
+    status: "CANCELLED",
+    $or: [
+      {
+        cancellationState: "PROCESSING",
+        $or: [
+          { cancellationLeaseUntil: null },
+          { cancellationLeaseUntil: { $exists: false } },
+          { cancellationLeaseUntil: { $lte: now } },
+        ],
+      },
+      { cancellationState: "NONE" },
+      { cancellationState: { $exists: false } },
+    ],
+  })
+    .sort({ cancelledAt: 1, _id: 1 })
+    .limit(100);
+
+  for (const booking of bookings) {
+    results.checked++;
+    try {
+      const summary = await processCancellationRefund(booking, {
+        cancelledBy: booking.cancelledBy || "system",
+        reason: booking.cancelReason || "Cancellation recovery",
+        fullRefund: booking.cancelledBy !== "user",
+      });
+      if (summary.newlyCompleted) results.completed++;
+    } catch (error) {
+      if (error.code === "CANCELLATION_ALREADY_CLAIMED") continue;
+      if (error.code === "CANCELLATION_RECONCILIATION_REQUIRED") {
+        results.reconciliationRequired++;
+        continue;
+      }
+      results.errors.push(`${booking.bookingId}: ${error.message}`);
+    }
   }
   return results;
 };
@@ -2049,3 +2557,151 @@ exports.runBookingSanityCheck = async function () {
   }
   return results;
 };
+
+// Canonical proactive cancellation checks each service's actual itinerary date.
+// Missing/failed Snapja DELETE is never represented as a successful cancellation.
+async function runSnapjaAutoCancelCanonical() {
+  const results = { cancelled: 0, reconciliation: 0, errors: [] };
+  const {
+    dateKeyInTimeZone,
+    getItineraryDateKey,
+  } = require("../utils/addonBookingTiming");
+  const { addDaysToDateKey } = require("../utils/businessDate");
+  const tomorrowKey = addDaysToDateKey(dateKeyInTimeZone(new Date()), 1);
+  const bookings = await TripBooking.find({
+    status: "CONFIRMED",
+    snapjaBookings: { $exists: true, $ne: null },
+  }).populate("batchId", "startDate");
+
+  for (const booking of bookings) {
+    try {
+      const snapjaBookings = JSON.parse(
+        JSON.stringify(booking.snapjaBookings || {}),
+      );
+      let updated = false;
+      for (const [key, snap] of Object.entries(snapjaBookings)) {
+        if (
+          !snap?.bookingId ||
+          snap.creatorName ||
+          snap.refundState === "REFUNDED"
+        )
+          continue;
+        const frozen = (booking.addonServiceEntries || []).find(
+          (entry) => entry.key === key,
+        );
+        let serviceDate = frozen?.date;
+        if (!serviceDate) {
+          const separator = key.lastIndexOf("_");
+          const legacyIndex = Number(key.slice(separator + 1));
+          if (Number.isInteger(legacyIndex)) {
+            serviceDate = getItineraryDateKey(booking, legacyIndex);
+          }
+        }
+        if (serviceDate !== tomorrowKey) continue;
+
+        let liveResponse;
+        let liveData;
+        try {
+          liveResponse = await fetch(`${SNAPJA_API}/${snap.bookingId}`, {
+            headers: { "X-API-Key": SNAPJA_API_KEY },
+          });
+          if (!liveResponse.ok) {
+            throw new Error(`status check HTTP ${liveResponse.status}`);
+          }
+          liveData = await liveResponse.json();
+        } catch (error) {
+          snapjaBookings[key].cancellationState = "RECONCILIATION_REQUIRED";
+          snapjaBookings[key].cancellationError =
+            `Snapja status could not be confirmed: ${error.message}`;
+          results.reconciliation++;
+          updated = true;
+          continue;
+        }
+        const remote = liveData.booking || liveData;
+        if (remote.creator?.name || remote.creator?.display_name) {
+          snapjaBookings[key].creatorName =
+            remote.creator.name || remote.creator.display_name;
+          snapjaBookings[key].creatorPhone = remote.creator.phone || "";
+          snapjaBookings[key].status = remote.status || "confirmed";
+          updated = true;
+          continue;
+        }
+
+        const definitiveFailure = [
+          "no_creator_available",
+          "cancelled",
+          "expired",
+        ].includes(String(remote.status || "").toLowerCase());
+        if (!definitiveFailure) {
+          let deleteResponse;
+          try {
+            deleteResponse = await fetch(`${SNAPJA_API}/${snap.bookingId}`, {
+              method: "DELETE",
+              headers: { "X-API-Key": SNAPJA_API_KEY },
+            });
+          } catch (error) {
+            snapjaBookings[key].cancellationState = "RECONCILIATION_REQUIRED";
+            snapjaBookings[key].cancellationError =
+              `Snapja cancellation response was unavailable: ${error.message}`;
+            results.reconciliation++;
+            updated = true;
+            continue;
+          }
+          if (!deleteResponse.ok) {
+            snapjaBookings[key].cancellationState = "RECONCILIATION_REQUIRED";
+            snapjaBookings[key].cancellationError =
+              `Snapja cancellation endpoint returned HTTP ${deleteResponse.status}`;
+            results.reconciliation++;
+            updated = true;
+            continue;
+          }
+        }
+
+        const refund =
+          await require("../utils/addonEntryRefund").processAddonEntryRefund({
+            booking,
+            entryKey: key,
+            reason: definitiveFailure
+              ? String(remote.status)
+              : "auto_cancelled_no_assignment",
+            providerStatus: String(remote.status || "cancelled"),
+          });
+        snapjaBookings[key].status = "cancelled";
+        snapjaBookings[key].cancellationState = "CANCELLED";
+        snapjaBookings[key].refundFlagged = true;
+        snapjaBookings[key].refundState = refund.refunded
+          ? "REFUNDED"
+          : refund.pending
+            ? "PROCESSING"
+            : "RECONCILIATION_REQUIRED";
+        snapjaBookings[key].refundAmount = refund.amount || 0;
+        snapjaBookings[key].refundId = refund.refundId || "";
+        updated = true;
+        if (refund.refunded || refund.pending) results.cancelled++;
+        else results.reconciliation++;
+      }
+
+      if (updated) {
+        booking.snapjaBookings = snapjaBookings;
+        booking.markModified("snapjaBookings");
+        await booking.save();
+      }
+      const needsAttention = Object.entries(snapjaBookings).filter(
+        ([, value]) => value?.cancellationState === "RECONCILIATION_REQUIRED",
+      );
+      if (needsAttention.length > 0) {
+        try {
+          require("./notificationController").notifyAdmin(
+            "Snapja Cancellation Needs Reconciliation",
+            `Booking ${booking.bookingId}: ${needsAttention.map(([key, value]) => `${key} (${value.cancellationError})`).join(", ")}`,
+            { type: "general", bookingId: booking._id.toString() },
+          );
+        } catch {}
+      }
+    } catch (error) {
+      results.errors.push(`Auto-cancel ${booking.bookingId}: ${error.message}`);
+    }
+  }
+  return results;
+}
+exports.runSnapjaAutoCancel = runSnapjaAutoCancelCanonical;

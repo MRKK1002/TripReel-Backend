@@ -35,8 +35,26 @@ const flexibleAvailabilitySchema = new mongoose.Schema(
     },
     // Current booked seat count (atomically incremented on each booking)
     bookedSeats: { type: Number, default: 0, min: 0 },
+    inventoryReservationClaimKeys: {
+      type: [String],
+      default: [],
+      select: false,
+    },
+    inventoryReleaseClaimKeys: { type: [String], default: [], select: false },
+    // Short document lease serializes reservations with capacity reductions.
+    capacityLeaseToken: { type: String, default: "", select: false },
+    capacityLeaseUntil: { type: Date, default: null, select: false },
     // Operator can disable without deleting
     isActive: { type: Boolean, default: true },
+    isArchived: { type: Boolean, default: false, index: true },
+    archivedAt: { type: Date, default: null },
+    archivedReason: { type: String, default: "", trim: true, maxlength: 500 },
+    archivedBy: { type: String, default: "" },
+    archivedByType: {
+      type: String,
+      enum: ["operator", "admin", "system", ""],
+      default: "",
+    },
   },
   { timestamps: true },
 );

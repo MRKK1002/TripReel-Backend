@@ -19,7 +19,6 @@ const {
 
 // ── Public ────────────────────────────────────────────────────────────────────
 router.get("/", getBatchesForPackage); // ?packageId=X
-router.get("/:id", getBatchById);
 
 // ── Operator (write actions require an approved account) ──────────────────────
 router.get("/operator/mine", operatorProtect, operatorGetMyBatches);
@@ -30,6 +29,10 @@ router.delete("/:id", operatorProtect, requireApprovedOperator, deleteBatch);
 
 // ── Admin ─────────────────────────────────────────────────────────────────────
 router.get("/admin/all", protect, restrictTo("admin"), adminGetAllBatches);
+
+// Keep parameterized GET routes after named GET routes so future one-segment
+// endpoints cannot be consumed as batch IDs.
+router.get("/:id", getBatchById);
 router.patch("/:id/active", protect, restrictTo("admin"), adminToggleActive);
 
 module.exports = router;

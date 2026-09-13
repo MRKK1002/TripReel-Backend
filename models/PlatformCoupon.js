@@ -84,6 +84,25 @@ const platformCouponSchema = new mongoose.Schema(
       default: 0,
       min: 0,
     },
+    usageClaimKeys: { type: [String], default: [], select: false },
+    releaseClaimKeys: { type: [String], default: [], select: false },
+    // Active usage can be released on cancellation, while these aggregate and
+    // per-user histories remain monotonic for audit and eligibility replay.
+    everUsedCount: { type: Number, default: 0, min: 0 },
+    firstUsedAt: { type: Date, default: null },
+    lastUsedAt: { type: Date, default: null },
+    userUsageClaims: {
+      type: [
+        {
+          userKey: { type: String, required: true },
+          activeClaimKeys: { type: [String], default: [] },
+          lifetimeClaimKeys: { type: [String], default: [] },
+          _id: false,
+        },
+      ],
+      default: [],
+      select: false,
+    },
     perUserLimit: {
       type: Number,
       default: 1, // how many times a single user can use it
@@ -104,6 +123,10 @@ const platformCouponSchema = new mongoose.Schema(
       type: Boolean,
       default: true,
     },
+    isArchived: { type: Boolean, default: false, index: true },
+    archivedAt: { type: Date, default: null },
+    archivedReason: { type: String, default: "", trim: true, maxlength: 500 },
+    archivedBy: { type: String, default: "" },
 
     // Marketing
     description: {

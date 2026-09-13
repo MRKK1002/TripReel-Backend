@@ -325,6 +325,7 @@ async function main() {
   const Package = require("../models/Package");
   const Batch = require("../models/Batch");
   const FlexibleAvailability = require("../models/FlexibleAvailability");
+  const FlexibleDateInventory = require("../models/FlexibleDateInventory");
   const Coupon = require("../models/Coupon");
   const PlatformCoupon = require("../models/PlatformCoupon");
   const PendingOrder = require("../models/PendingOrder");
@@ -334,6 +335,26 @@ async function main() {
   const OperatorWallet = require("../models/OperatorWallet");
   const WalletTransaction = require("../models/WalletTransaction");
   const Withdrawal = require("../models/Withdrawal");
+  const {
+    getISTDateKey,
+    addDaysToDateKey,
+    getISTDayRange,
+    isDateKeyPastInclusiveEnd,
+  } = require("../utils/businessDate");
+
+  const boundaryKey = "2026-01-15";
+  record(
+    "Inclusive IST final day expires only at the next IST midnight",
+    isDateKeyPastInclusiveEnd(
+      boundaryKey,
+      new Date("2026-01-15T18:29:59.999Z"),
+    ) === false &&
+      isDateKeyPastInclusiveEnd(
+        boundaryKey,
+        new Date("2026-01-15T18:30:00.000Z"),
+      ) === true,
+    `boundary=${boundaryKey}`,
+  );
 
   assert.strictEqual(
     mongoose.connection.name,
@@ -654,8 +675,24 @@ async function main() {
       durationDays: "2",
       durationNights: "1",
       itinerary: JSON.stringify([
-        { day: 1, title: "Synthetic arrival", points: ["Synthetic stop"] },
-        { day: 2, title: "Synthetic departure", points: [] },
+        {
+          day: 1,
+          title: "Synthetic arrival",
+          points: ["Synthetic stop"],
+          pickupPoint: "Panaji Bus Stand",
+          pickupTime: "10:00",
+          pickupLat: 15.4909,
+          pickupLng: 73.8278,
+        },
+        {
+          day: 2,
+          title: "Synthetic departure",
+          points: [],
+          pickupPoint: "Dona Paula Circle",
+          pickupTime: "09:30",
+          pickupLat: 15.4589,
+          pickupLng: 73.806,
+        },
       ]),
       pricing: JSON.stringify({
         adultPrice: bookingMode === "batch" ? 1000 : 1200,
@@ -874,7 +911,6 @@ async function main() {
     token: customerToken,
     json: {
       batchId,
-      packageId: batchPackageId,
       code: couponCode,
       guests: 1,
       subtotal: 1000,
@@ -904,7 +940,7 @@ async function main() {
   );
 
   let paymentSequence = 0;
-  async function createPaidBooking({
+  async function createPaymentOrder({
     packageId,
     batchId: chosenBatchId,
     bookingMode = "batch",
@@ -912,14 +948,14 @@ async function main() {
     flexStartDate,
     couponCode: chosenCoupon = "",
     platformCouponCode: chosenPlatformCoupon = "",
+    seats = 1,
   }) {
-    const travelers = [
-      {
-        name: `Synthetic Traveller ${++paymentSequence}`,
-        age: 30,
-        gender: "Other",
-      },
-    ];
+    const sequence = ++paymentSequence;
+    const travelers = Array.from({ length: seats }, (_, index) => ({
+      name: `Synthetic Traveller ${sequence}-${index + 1}`,
+      age: 30,
+      gender: "Other",
+    }));
     const orderCreate = await api("/api/payments/create-order", {
       method: "POST",
       token: customerToken,
@@ -929,7 +965,7 @@ async function main() {
         bookingMode,
         flexAvailabilityId: chosenFlexId || null,
         flexStartDate: flexStartDate || null,
-        seats: 1,
+        seats,
         couponCode: chosenCoupon,
         platformCouponCode: chosenPlatformCoupon,
         travelers,
@@ -938,9 +974,9 @@ async function main() {
       },
     });
     record(
-      `Payment order created (${bookingMode}, #${paymentSequence})`,
+      `Payment order created (${bookingMode}, #${sequence})`,
       orderCreate.status === 200 && Boolean(orderCreate.body.razorpayOrderId),
-      `status=${orderCreate.status}, amount=${orderCreate.body.amount}`,
+      `status=${orderCreate.status}, amount=${orderCreate.body.amount}, message=${orderCreate.body.message || ""}`,
     );
     const orderId = requireValue(
       orderCreate.body.razorpayOrderId,
@@ -950,50 +986,238 @@ async function main() {
       fakeState.orders.get(orderId),
       "fake Razorpay order",
     );
-    const paymentId = `pay_e2e_${paymentSequence}`;
+    return { sequence, travelers, orderCreate, orderId, order };
+  }
+
+  function captureFakePayment(orderContext) {
+    const paymentId = `pay_e2e_${orderContext.sequence}`;
     fakeState.payments.set(paymentId, {
       id: paymentId,
-      order_id: orderId,
-      amount: order.amount,
+      order_id: orderContext.orderId,
+      amount: orderContext.order.amount,
       currency: "INR",
       status: "captured",
     });
+    return paymentId;
+  }
+
+  async function verifyPaymentOrder(orderContext, paymentId) {
     const signature = crypto
       .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
-      .update(`${orderId}|${paymentId}`)
+      .update(`${orderContext.orderId}|${paymentId}`)
       .digest("hex");
     const verification = await api("/api/payments/verify", {
       method: "POST",
       token: customerToken,
       json: {
-        razorpay_order_id: orderId,
+        razorpay_order_id: orderContext.orderId,
         razorpay_payment_id: paymentId,
         razorpay_signature: signature,
-        orderId,
-        travelers,
+        orderId: orderContext.orderId,
+        travelers: orderContext.travelers,
         addonSchedule: null,
       },
     });
     record(
-      `Payment verified and booking confirmed (${bookingMode}, #${paymentSequence})`,
+      `Payment verified and booking confirmed (#${orderContext.sequence})`,
       verification.status === 200 && Boolean(verification.body.bookingId),
       `status=${verification.status}, bookingId=${verification.body.bookingId || ""}`,
     );
+    return verification;
+  }
+
+  async function createPaidBooking(options) {
+    const orderContext = await createPaymentOrder(options);
+    const paymentId = captureFakePayment(orderContext);
+    await verifyPaymentOrder(orderContext, paymentId);
     const booking = await TripBooking.findOne({
       razorpayPaymentId: paymentId,
     }).lean();
     requireValue(booking?._id, "persisted booking id");
     const pendingOrder = await PendingOrder.findOne({
-      razorpayOrderId: orderId,
+      razorpayOrderId: orderContext.orderId,
     }).lean();
     record(
-      `PendingOrder completed durably (${bookingMode}, #${paymentSequence})`,
+      `PendingOrder completed durably (#${orderContext.sequence})`,
       pendingOrder?.status === "completed" &&
         String(pendingOrder?.bookingId) === String(booking._id),
       `status=${pendingOrder?.status || "missing"}`,
     );
     return booking;
   }
+
+  // Pre-charge validation must fail before any provider order or reservation.
+  const rejectionTravelers = [
+    { name: "Synthetic Rejection Traveller", age: 30, gender: "Other" },
+  ];
+  const orderCountBeforeModeGuards = fakeState.orders.size;
+  const batchAsFlexible = await api("/api/payments/create-order", {
+    method: "POST",
+    token: customerToken,
+    json: {
+      packageId: batchPackageId,
+      bookingMode: "flexible",
+      flexAvailabilityId,
+      flexStartDate: dateOnlyDaysFromNow(42),
+      seats: 1,
+      travelers: rejectionTravelers,
+    },
+  });
+  const flexAsBatch = await api("/api/payments/create-order", {
+    method: "POST",
+    token: customerToken,
+    json: {
+      packageId: flexPackageId,
+      bookingMode: "batch",
+      batchId,
+      seats: 1,
+      travelers: rejectionTravelers,
+    },
+  });
+  record(
+    "Booking mode mismatches are rejected before provider order creation",
+    batchAsFlexible.status === 400 &&
+      flexAsBatch.status === 400 &&
+      fakeState.orders.size === orderCountBeforeModeGuards,
+    `statuses=${batchAsFlexible.status},${flexAsBatch.status}, orders=${fakeState.orders.size - orderCountBeforeModeGuards}`,
+  );
+
+  await Batch.updateOne(
+    { _id: batchId },
+    { $set: { bookingDeadline: isoDaysFromNow(-1) } },
+  );
+  const deadlineRejected = await api("/api/payments/create-order", {
+    method: "POST",
+    token: customerToken,
+    json: {
+      packageId: batchPackageId,
+      bookingMode: "batch",
+      batchId,
+      seats: 1,
+      travelers: rejectionTravelers,
+    },
+  });
+  await Batch.updateOne(
+    { _id: batchId },
+    { $set: { bookingDeadline: isoDaysFromNow(25) } },
+  );
+  await Batch.updateOne(
+    { _id: batchId },
+    { $set: { totalSeats: 1, bookedSeats: 1 } },
+  );
+  const capacityRejected = await api("/api/payments/create-order", {
+    method: "POST",
+    token: customerToken,
+    json: {
+      packageId: batchPackageId,
+      bookingMode: "batch",
+      batchId,
+      seats: 1,
+      travelers: rejectionTravelers,
+    },
+  });
+  await Batch.updateOne(
+    { _id: batchId },
+    { $set: { totalSeats: 10, bookedSeats: 0 } },
+  );
+  record(
+    "Expired deadlines and exhausted capacity are rejected pre-charge",
+    deadlineRejected.status === 400 && capacityRejected.status === 400,
+    `deadline=${deadlineRejected.status}, capacity=${capacityRejected.status}`,
+  );
+
+  // Real pending checkout rows fence every referenced resource from deletion.
+  const guardedBatchOrder = await createPaymentOrder({
+    packageId: batchPackageId,
+    batchId,
+    couponCode,
+  });
+  const guardedFlexOrder = await createPaymentOrder({
+    packageId: flexPackageId,
+    bookingMode: "flexible",
+    flexAvailabilityId,
+    flexStartDate: dateOnlyDaysFromNow(42),
+  });
+  const guardedDeletes = await Promise.all([
+    api(`/api/packages/operator/${batchPackageId}`, {
+      method: "DELETE",
+      token: operatorToken,
+    }),
+    api(`/api/batches/${batchId}`, {
+      method: "DELETE",
+      token: operatorToken,
+    }),
+    api(`/api/coupons/${couponId}`, {
+      method: "DELETE",
+      token: operatorToken,
+    }),
+    api(`/api/flexible-availability/${flexAvailabilityId}`, {
+      method: "DELETE",
+      token: operatorToken,
+    }),
+  ]);
+  record(
+    "Charged-capable pending checkout fences package, batch, coupon, and flexible deletion",
+    guardedDeletes.every((response) => response.status === 409),
+    `statuses=${guardedDeletes.map((response) => response.status).join(",")}`,
+  );
+  await PendingOrder.deleteMany({
+    razorpayOrderId: {
+      $in: [guardedBatchOrder.orderId, guardedFlexOrder.orderId],
+    },
+  });
+  fakeState.orders.delete(guardedBatchOrder.orderId);
+  fakeState.orders.delete(guardedFlexOrder.orderId);
+
+  // A captured payment without /verify must be recovered once across racing workers.
+  const orphanOrder = await createPaymentOrder({
+    packageId: batchPackageId,
+    batchId,
+  });
+  const orphanPaymentId = captureFakePayment(orphanOrder);
+  await PendingOrder.updateOne(
+    { razorpayOrderId: orphanOrder.orderId },
+    {
+      $set: {
+        providerPaymentId: orphanPaymentId,
+        paidAt: new Date(),
+        finalizationState: "PENDING",
+      },
+    },
+  );
+  const {
+    runOrphanPaymentRecovery,
+  } = require("../controllers/paymentController");
+  const orphanRuns = await Promise.all([
+    runOrphanPaymentRecovery(),
+    runOrphanPaymentRecovery(),
+  ]);
+  const orphanBooking = await TripBooking.findOne({
+    razorpayPaymentId: orphanPaymentId,
+  }).lean();
+  const recoveredPending = await PendingOrder.findOne({
+    razorpayOrderId: orphanOrder.orderId,
+  }).lean();
+  record(
+    "Concurrent orphan-payment recovery finalizes captured payment exactly once",
+    orphanRuns.reduce((sum, run) => sum + run.recovered, 0) === 1 &&
+      Boolean(orphanBooking?._id) &&
+      recoveredPending?.status === "completed" &&
+      recoveredPending?.finalizationState === "COMPLETED",
+    `recovered=${orphanRuns.reduce((sum, run) => sum + run.recovered, 0)}, booking=${Boolean(orphanBooking)}, state=${recoveredPending?.finalizationState}`,
+  );
+  const orphanCancel = orphanBooking
+    ? await api(`/api/trip-bookings/${orphanBooking._id}/cancel`, {
+        method: "POST",
+        token: customerToken,
+        json: { reason: "Reset orphan recovery inventory" },
+      })
+    : { status: 0 };
+  record(
+    "Recovered booking remains cancellable through durable refund flow",
+    orphanCancel.status === 200,
+    `status=${orphanCancel.status}`,
+  );
 
   const batchBooking = await createPaidBooking({
     packageId: batchPackageId,
@@ -1082,6 +1306,30 @@ async function main() {
     "Normal cancellation restores operator coupon usage",
     operatorCoupon?.usedCount === 0,
     `usedCount=${operatorCoupon?.usedCount}`,
+  );
+  const lockedCouponUpdate = await api(`/api/coupons/${couponId}`, {
+    method: "PUT",
+    token: operatorToken,
+    json: { value: 25 },
+  });
+  const allowedCouponUpdate = await api(`/api/coupons/${couponId}`, {
+    method: "PUT",
+    token: operatorToken,
+    json: { description: "Synthetic immutable-history coupon" },
+  });
+  operatorCoupon = await Coupon.findById(couponId).lean();
+  const immutableBookingSnapshot = await TripBooking.findById(
+    batchBooking._id,
+  ).lean();
+  record(
+    "Lifetime coupon use keeps commercial terms immutable after net usage returns to zero",
+    lockedCouponUpdate.status === 409 &&
+      allowedCouponUpdate.status === 200 &&
+      operatorCoupon?.usedCount === 0 &&
+      Number(operatorCoupon?.everUsedCount) >= 1 &&
+      immutableBookingSnapshot?.pricing?.couponCode === couponCode &&
+      Number(immutableBookingSnapshot?.pricing?.discountAmount) > 0,
+    `locked=${lockedCouponUpdate.status}, allowed=${allowedCouponUpdate.status}, used=${operatorCoupon?.usedCount}, everUsed=${operatorCoupon?.everUsedCount}`,
   );
   const repeatedCancellation = await api(
     `/api/trip-bookings/${batchBooking._id}/cancel`,
@@ -1185,6 +1433,155 @@ async function main() {
     "Flexible cancellation restores flexible bookedSeats",
     flexState?.bookedSeats === 0,
     `bookedSeats=${flexState?.bookedSeats}`,
+  );
+
+  // Flexible capacity is isolated per selected start date, including both range edges.
+  const todayKey = getISTDateKey();
+  const flexEdgeStart = addDaysToDateKey(todayKey, 60);
+  const flexEdgeEnd = addDaysToDateKey(todayKey, 65);
+  const isolatedFlexCreate = await api("/api/flexible-availability", {
+    method: "POST",
+    token: operatorToken,
+    json: {
+      packageId: flexPackageId,
+      startDate: flexEdgeStart,
+      endDate: flexEdgeEnd,
+      adultPrice: 1200,
+      childPrice: 700,
+      maxBookings: 1,
+    },
+  });
+  const isolatedFlexId = requireValue(
+    isolatedFlexCreate.body.item?._id,
+    "isolated per-date flexible availability id",
+  );
+  const edgeStartBooking = await createPaidBooking({
+    packageId: flexPackageId,
+    bookingMode: "flexible",
+    flexAvailabilityId: isolatedFlexId,
+    flexStartDate: flexEdgeStart,
+  });
+  const providerOrdersBeforeFullDate = fakeState.orders.size;
+  const fullStartDateAttempt = await api("/api/payments/create-order", {
+    method: "POST",
+    token: customerToken,
+    json: {
+      packageId: flexPackageId,
+      bookingMode: "flexible",
+      flexAvailabilityId: isolatedFlexId,
+      flexStartDate: flexEdgeStart,
+      seats: 1,
+      travelers: rejectionTravelers,
+    },
+  });
+  const edgeEndBooking = await createPaidBooking({
+    packageId: flexPackageId,
+    bookingMode: "flexible",
+    flexAvailabilityId: isolatedFlexId,
+    flexStartDate: flexEdgeEnd,
+  });
+  const beforeWindowAttempt = await api("/api/payments/create-order", {
+    method: "POST",
+    token: customerToken,
+    json: {
+      packageId: flexPackageId,
+      bookingMode: "flexible",
+      flexAvailabilityId: isolatedFlexId,
+      flexStartDate: addDaysToDateKey(flexEdgeStart, -1),
+      seats: 1,
+      travelers: rejectionTravelers,
+    },
+  });
+  const afterWindowAttempt = await api("/api/payments/create-order", {
+    method: "POST",
+    token: customerToken,
+    json: {
+      packageId: flexPackageId,
+      bookingMode: "flexible",
+      flexAvailabilityId: isolatedFlexId,
+      flexStartDate: addDaysToDateKey(flexEdgeEnd, 1),
+      seats: 1,
+      travelers: rejectionTravelers,
+    },
+  });
+  let edgeStartInventory = await FlexibleDateInventory.findOne({
+    flexAvailabilityId: isolatedFlexId,
+    startDateKey: flexEdgeStart,
+  }).lean();
+  let edgeEndInventory = await FlexibleDateInventory.findOne({
+    flexAvailabilityId: isolatedFlexId,
+    startDateKey: flexEdgeEnd,
+  }).lean();
+  record(
+    "Flexible capacity is per selected date and range boundaries are inclusive",
+    fullStartDateAttempt.status === 400 &&
+      fakeState.orders.size === providerOrdersBeforeFullDate + 1 &&
+      beforeWindowAttempt.status === 400 &&
+      afterWindowAttempt.status === 400 &&
+      edgeStartInventory?.capacity === 1 &&
+      edgeStartInventory?.bookedSeats === 1 &&
+      edgeEndInventory?.capacity === 1 &&
+      edgeEndInventory?.bookedSeats === 1,
+    `full=${fullStartDateAttempt.status}, outside=${beforeWindowAttempt.status}/${afterWindowAttempt.status}, start=${edgeStartInventory?.bookedSeats}/${edgeStartInventory?.capacity}, end=${edgeEndInventory?.bookedSeats}/${edgeEndInventory?.capacity}`,
+  );
+  await api(`/api/trip-bookings/${edgeStartBooking._id}/cancel`, {
+    method: "POST",
+    token: customerToken,
+    json: { reason: "Release selected start-date inventory" },
+  });
+  edgeStartInventory = await FlexibleDateInventory.findOne({
+    flexAvailabilityId: isolatedFlexId,
+    startDateKey: flexEdgeStart,
+  }).lean();
+  edgeEndInventory = await FlexibleDateInventory.findOne({
+    flexAvailabilityId: isolatedFlexId,
+    startDateKey: flexEdgeEnd,
+  }).lean();
+  record(
+    "Cancelling one flexible date does not release another date",
+    edgeStartInventory?.bookedSeats === 0 &&
+      edgeEndInventory?.bookedSeats === 1,
+    `start=${edgeStartInventory?.bookedSeats}, end=${edgeEndInventory?.bookedSeats}`,
+  );
+
+  // Expired cancellation leases are safely claimed once by concurrent recovery workers.
+  await TripBooking.updateOne(
+    { _id: edgeEndBooking._id },
+    {
+      $set: {
+        status: "CANCELLED",
+        cancelledBy: "operator",
+        cancelReason: "Synthetic expired cancellation lease",
+        cancelledAt: new Date(),
+        cancellationState: "PROCESSING",
+        cancellationLeaseToken: "expired-e2e-lease",
+        cancellationLeaseUntil: new Date(Date.now() - 60 * 1000),
+        financialSettlementState: "NONE",
+        refundStatus: "NONE",
+      },
+    },
+  );
+  const refundsBeforeCancellationRecovery = fakeState.refunds.length;
+  const { runCancellationRecovery } = require("../controllers/cronController");
+  const cancellationRecoveryRuns = await Promise.all([
+    runCancellationRecovery(),
+    runCancellationRecovery(),
+  ]);
+  const recoveredCancellation = await TripBooking.findById(
+    edgeEndBooking._id,
+  ).lean();
+  edgeEndInventory = await FlexibleDateInventory.findOne({
+    flexAvailabilityId: isolatedFlexId,
+    startDateKey: flexEdgeEnd,
+  }).lean();
+  record(
+    "Concurrent cancellation recovery completes an expired lease exactly once",
+    cancellationRecoveryRuns.reduce((sum, run) => sum + run.completed, 0) ===
+      1 &&
+      recoveredCancellation?.cancellationState === "COMPLETED" &&
+      edgeEndInventory?.bookedSeats === 0 &&
+      fakeState.refunds.length === refundsBeforeCancellationRecovery + 1,
+    `completed=${cancellationRecoveryRuns.reduce((sum, run) => sum + run.completed, 0)}, state=${recoveredCancellation?.cancellationState}, booked=${edgeEndInventory?.bookedSeats}`,
   );
 
   // Fast-forward one isolated booking to test concurrent trip completion and escrow release.
@@ -1463,6 +1860,203 @@ async function main() {
       !listContainsId(secondOperatorBookings.body.bookings, escrowBooking._id),
     `status=${secondOperatorBookings.status}, total=${secondOperatorBookings.body.total}, hasBatchBooking=${listContainsId(secondOperatorBookings.body.bookings || [], batchBooking._id)}, hasEscrowBooking=${listContainsId(secondOperatorBookings.body.bookings || [], escrowBooking._id)}`,
   );
+
+  const ownedDetail = await api(`/api/operator-bookings/${batchBooking._id}`, {
+    token: operatorToken,
+  });
+  const foreignDetail = await api(
+    `/api/operator-bookings/${batchBooking._id}`,
+    { token: secondOperatorToken },
+  );
+  record(
+    "Owned booking detail is populated while foreign ownership returns 404",
+    ownedDetail.status === 200 &&
+      String(ownedDetail.body.booking?._id) === String(batchBooking._id) &&
+      Boolean(ownedDetail.body.booking?.userId?.name) &&
+      foreignDetail.status === 404,
+    `owner=${ownedDetail.status}, foreign=${foreignDetail.status}`,
+  );
+
+  const scalePrefix = `E2ESCALE-${suffix}`;
+  const scaleDocs = Array.from({ length: 205 }, (_, index) => ({
+    bookingId: `${scalePrefix}-${String(index).padStart(3, "0")}`,
+    userId: customerId,
+    packageId: batchPackageId,
+    batchId,
+    operatorId,
+    bookingMode: "batch",
+    seats: 1,
+    status: "CONFIRMED",
+    snapshot: {
+      packageTitle: "Synthetic Scale Package",
+      startDate: addDaysToDateKey(todayKey, 100 + index),
+      endDate: addDaysToDateKey(todayKey, 101 + index),
+    },
+    pricing: { seats: 1, operatorAmount: 0, totalAmount: 0 },
+    createdAt: new Date(Date.now() - index * 1000),
+    updatedAt: new Date(Date.now() - index * 1000),
+  }));
+  await TripBooking.insertMany(scaleDocs);
+  const scalePages = await Promise.all(
+    [1, 2, 3].map((pageNumber) =>
+      api(
+        `/api/operator-bookings?view=current&search=${scalePrefix}&page=${pageNumber}&limit=100`,
+        { token: operatorToken },
+      ),
+    ),
+  );
+  const scaleRows = scalePages.flatMap(
+    (pageResult) => pageResult.body.bookings || [],
+  );
+  record(
+    "Operator booking pagination remains complete and stable beyond two pages",
+    scalePages.every((pageResult) => pageResult.status === 200) &&
+      scalePages[0].body.bookings?.length === 100 &&
+      scalePages[1].body.bookings?.length === 100 &&
+      scalePages[2].body.bookings?.length === 5 &&
+      scalePages.every(
+        (pageResult) =>
+          pageResult.body.total === 205 &&
+          pageResult.body.totalPages === 3 &&
+          pageResult.body.currentTotal === 205 &&
+          pageResult.body.historyTotal === 0,
+      ) &&
+      new Set(scaleRows.map((booking) => String(booking._id))).size === 205 &&
+      scaleRows[0]?.bookingId === `${scalePrefix}-000` &&
+      scaleRows[204]?.bookingId === `${scalePrefix}-204`,
+    `sizes=${scalePages.map((pageResult) => pageResult.body.bookings?.length).join(",")}, unique=${new Set(scaleRows.map((booking) => String(booking._id))).size}`,
+  );
+
+  const historyPrefix = `E2EHIST-${suffix}`;
+  await TripBooking.insertMany([
+    {
+      bookingId: `${historyPrefix}-LATEST`,
+      userId: customerId,
+      packageId: batchPackageId,
+      operatorId,
+      bookingMode: "batch",
+      status: "CANCELLED",
+      snapshot: {
+        startDate: addDaysToDateKey(todayKey, -2),
+        endDate: addDaysToDateKey(todayKey, -1),
+      },
+    },
+    {
+      bookingId: `${historyPrefix}-OLDEST`,
+      userId: customerId,
+      packageId: batchPackageId,
+      operatorId,
+      bookingMode: "batch",
+      status: "COMPLETED",
+      snapshot: {
+        startDate: addDaysToDateKey(todayKey, -4),
+        endDate: addDaysToDateKey(todayKey, -3),
+      },
+    },
+    {
+      bookingId: `${historyPrefix}-ENDED-CONFIRMED`,
+      userId: customerId,
+      packageId: batchPackageId,
+      operatorId,
+      bookingMode: "batch",
+      status: "CONFIRMED",
+      snapshot: {
+        startDate: addDaysToDateKey(todayKey, -3),
+        endDate: addDaysToDateKey(todayKey, -2),
+      },
+    },
+  ]);
+  const historyList = await api(
+    `/api/operator-bookings?view=history&search=${historyPrefix}&limit=10`,
+    { token: operatorToken },
+  );
+  record(
+    "History includes ended confirmed trips and orders latest effective end first",
+    historyList.status === 200 &&
+      historyList.body.total === 3 &&
+      historyList.body.currentTotal === 0 &&
+      historyList.body.historyTotal === 3 &&
+      historyList.body.bookings
+        ?.map((booking) => booking.bookingId)
+        .join(",") ===
+        `${historyPrefix}-LATEST,${historyPrefix}-ENDED-CONFIRMED,${historyPrefix}-OLDEST`,
+    `order=${historyList.body.bookings?.map((booking) => booking.bookingId).join(",")}`,
+  );
+
+  const todayRange = getISTDayRange(todayKey);
+  const datePrefix = `E2EDATE-${suffix}`;
+  await TripBooking.insertMany([
+    {
+      bookingId: `${datePrefix}-START`,
+      userId: customerId,
+      packageId: batchPackageId,
+      operatorId,
+      bookingMode: "batch",
+      status: "CONFIRMED",
+      snapshot: {
+        startDate: addDaysToDateKey(todayKey, 400),
+        endDate: addDaysToDateKey(todayKey, 401),
+      },
+      createdAt: todayRange.start,
+      updatedAt: todayRange.start,
+    },
+    {
+      bookingId: `${datePrefix}-END`,
+      userId: customerId,
+      packageId: batchPackageId,
+      operatorId,
+      bookingMode: "batch",
+      status: "CONFIRMED",
+      snapshot: {
+        startDate: addDaysToDateKey(todayKey, 402),
+        endDate: addDaysToDateKey(todayKey, 403),
+      },
+      createdAt: new Date(todayRange.endExclusive.getTime() - 1),
+      updatedAt: new Date(todayRange.endExclusive.getTime() - 1),
+    },
+    {
+      bookingId: `${datePrefix}-NEXT`,
+      userId: customerId,
+      packageId: batchPackageId,
+      operatorId,
+      bookingMode: "batch",
+      status: "CONFIRMED",
+      snapshot: {
+        startDate: addDaysToDateKey(todayKey, 404),
+        endDate: addDaysToDateKey(todayKey, 405),
+      },
+      createdAt: todayRange.endExclusive,
+      updatedAt: todayRange.endExclusive,
+    },
+  ]);
+  const createdDateList = await api(
+    `/api/operator-bookings?view=current&search=${datePrefix}&fromDate=${todayKey}&toDate=${todayKey}&limit=10`,
+    { token: operatorToken },
+  );
+  record(
+    "Booking-created date filters include the full IST day and exclude next midnight",
+    createdDateList.status === 200 &&
+      createdDateList.body.total === 2 &&
+      listContainsId(createdDateList.body, `${datePrefix}-START`) &&
+      listContainsId(createdDateList.body, `${datePrefix}-END`) &&
+      !listContainsId(createdDateList.body, `${datePrefix}-NEXT`),
+    `status=${createdDateList.status}, total=${createdDateList.body.total}`,
+  );
+  const scaledSummary = await api("/api/operator-bookings/summary", {
+    token: operatorToken,
+  });
+  record(
+    "Server booking summary counts records beyond list page limits",
+    scaledSummary.status === 200 &&
+      Number(scaledSummary.body.summary?.totalBookings) >= 211 &&
+      scaledSummary.body.summary?.tripBookingsByPackage?.some(
+        (item) =>
+          String(item.packageId) === String(batchPackageId) &&
+          Number(item.tripBookingCount) >= 208,
+      ),
+    `status=${scaledSummary.status}, total=${scaledSummary.body.summary?.totalBookings}`,
+  );
+
   const secondOperatorWallet = await api("/api/wallet", {
     token: secondOperatorToken,
   });
@@ -1592,8 +2186,24 @@ async function main() {
     durationDays: "2",
     durationNights: "1",
     itinerary: JSON.stringify([
-      { day: 1, title: "Reviewed day one", points: [] },
-      { day: 2, title: "Reviewed day two", points: [] },
+      {
+        day: 1,
+        title: "Reviewed day one",
+        points: [],
+        pickupPoint: "Reviewed Panaji Pickup",
+        pickupTime: "10:15",
+        pickupLat: 15.4909,
+        pickupLng: 73.8278,
+      },
+      {
+        day: 2,
+        title: "Reviewed day two",
+        points: [],
+        pickupPoint: "Reviewed Dona Paula Pickup",
+        pickupTime: "09:45",
+        pickupLat: 15.4589,
+        pickupLng: 73.806,
+      },
     ]),
     pricing: JSON.stringify({ adultPrice: 1000, childPrice: 600 }),
     existing_image_url: existingBatchPackage?.image_url || "",
@@ -1666,6 +2276,96 @@ async function main() {
       packageAfterRevisionApproval?.title === editedTitle &&
       !packageAfterRevisionApproval?.pendingRevision,
     `reviewStatus=${approveEditedRevision.status}, detailStatus=${detailAfterRevisionApproval.status}, title=${detailAfterRevisionApproval.body.package?.title || ""}`,
+  );
+
+  // Referenced history is archived and retained; active bookings block archival.
+  const activePackageDelete = await api(
+    `/api/packages/operator/${batchPackageId}`,
+    { method: "DELETE", token: operatorToken },
+  );
+  const usedCouponDelete = await api(`/api/coupons/${couponId}`, {
+    method: "DELETE",
+    token: operatorToken,
+  });
+  const archivedCoupon = await Coupon.findById(couponId).lean();
+  record(
+    "Active package deletion is blocked while historically used coupon is archived",
+    activePackageDelete.status === 409 &&
+      usedCouponDelete.status === 200 &&
+      archivedCoupon?.isArchived === true &&
+      archivedCoupon?.isActive === false,
+    `package=${activePackageDelete.status}, coupon=${usedCouponDelete.status}, archived=${archivedCoupon?.isArchived}`,
+  );
+
+  await TripBooking.updateMany(
+    { packageId: batchPackageId },
+    { $set: { status: "COMPLETED" } },
+  );
+  const referencedBatchDelete = await api(`/api/batches/${batchId}`, {
+    method: "DELETE",
+    token: operatorToken,
+  });
+  const referencedFlexDelete = await api(
+    `/api/flexible-availability/${isolatedFlexId}`,
+    { method: "DELETE", token: operatorToken },
+  );
+  const archivedBatch = await Batch.findById(batchId).lean();
+  const archivedFlex =
+    await FlexibleAvailability.findById(isolatedFlexId).lean();
+  const retainedFlexInventories = await FlexibleDateInventory.countDocuments({
+    flexAvailabilityId: isolatedFlexId,
+  });
+  record(
+    "Referenced batch and flexible history are archived without deleting detail or date inventory",
+    referencedBatchDelete.status === 200 &&
+      referencedFlexDelete.status === 200 &&
+      archivedBatch?.isArchived === true &&
+      archivedFlex?.isArchived === true &&
+      retainedFlexInventories === 2,
+    `batch=${referencedBatchDelete.status}/${archivedBatch?.isArchived}, flex=${referencedFlexDelete.status}/${archivedFlex?.isArchived}, inventories=${retainedFlexInventories}`,
+  );
+
+  const archivedMutationResults = await Promise.all([
+    api(`/api/batches/${batchId}`, {
+      method: "PUT",
+      token: operatorToken,
+      json: { isActive: true, label: "Resurrection attempt" },
+    }),
+    api(`/api/flexible-availability/${isolatedFlexId}`, {
+      method: "PUT",
+      token: operatorToken,
+      json: { isActive: true, maxBookings: 2 },
+    }),
+    api(`/api/coupons/${couponId}`, {
+      method: "PUT",
+      token: operatorToken,
+      json: { isActive: true, description: "Resurrection attempt" },
+    }),
+  ]);
+  record(
+    "Archived batch, flexible range, and coupon reject reactivation or mutation",
+    archivedMutationResults.every((response) => response.status === 409),
+    `statuses=${archivedMutationResults.map((response) => response.status).join(",")}`,
+  );
+
+  const historicalPackageDelete = await api(
+    `/api/packages/operator/${batchPackageId}`,
+    { method: "DELETE", token: operatorToken },
+  );
+  const archivedPackage = await Package.findById(batchPackageId).lean();
+  const archivedPublicDetail = await api(`/api/packages/${batchPackageId}`);
+  const archivedPackageToggle = await api(
+    `/api/packages/operator/${batchPackageId}/toggle-active`,
+    { method: "PATCH", token: operatorToken, json: {} },
+  );
+  record(
+    "Historical package archives in place, leaves detail retained, and cannot be reactivated",
+    historicalPackageDelete.status === 200 &&
+      archivedPackage?.status === "ARCHIVED" &&
+      archivedPackage?.isActive === false &&
+      archivedPublicDetail.status === 404 &&
+      archivedPackageToggle.status === 409,
+    `delete=${historicalPackageDelete.status}, state=${archivedPackage?.status}, public=${archivedPublicDetail.status}, toggle=${archivedPackageToggle.status}`,
   );
 
   // Final isolated-database invariants and summary.

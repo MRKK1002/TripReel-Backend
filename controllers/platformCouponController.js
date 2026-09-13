@@ -1,5 +1,8 @@
 const PlatformCoupon = require("../models/PlatformCoupon");
 const Package = require("../models/Package");
+const PendingOrder = require("../models/PendingOrder");
+const TripBooking = require("../models/TripBooking");
+const { IN_FLIGHT_STATES } = require("../utils/resourceIntegrity");
 const escapeRegex = require("../utils/escapeRegex");
 const { resolvePlatformCoupon } = require("../utils/platformCoupon");
 
@@ -188,15 +191,79 @@ exports.adminUpdate = async (req, res) => {
   }
 };
 
-// ── Admin: delete ──────────────────────────────────────────────────────────────
+// ── Admin: delete/archive ─────────────────────────────────────────────────────
 exports.adminDelete = async (req, res) => {
   try {
-    const coupon = await PlatformCoupon.findByIdAndDelete(req.params.id);
+    const coupon = await PlatformCoupon.findById(req.params.id).select(
+      "+usageClaimKeys +releaseClaimKeys +userUsageClaims",
+    );
     if (!coupon)
       return res
         .status(404)
         .json({ success: false, message: "Coupon not found" });
-    res.json({ success: true, message: "Coupon deleted." });
+
+    const inFlight = await PendingOrder.exists({
+      status: "pending",
+      $and: [
+        {
+          $or: [
+            { finalizationState: { $in: IN_FLIGHT_STATES } },
+            { finalizationState: { $exists: false } },
+          ],
+        },
+        {
+          $or: [
+            { "chargedPricingSnapshot.platformCouponId": coupon._id },
+            { "payload.platformCouponCode": coupon.code },
+            {
+              "chargedPricingSnapshot.pricing.platformCouponCode": coupon.code,
+            },
+          ],
+        },
+      ],
+    });
+    if (inFlight) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "Cannot delete or archive this coupon while a paid booking order is still being finalized.",
+      });
+    }
+
+    const bookingRef = await TripBooking.exists({
+      $or: [
+        { platformCouponId: coupon._id },
+        { "pricing.platformCouponCode": coupon.code },
+      ],
+    });
+    const used =
+      Number(coupon.everUsedCount) > 0 ||
+      Number(coupon.usedCount) > 0 ||
+      coupon.usageClaimKeys.length > 0 ||
+      coupon.releaseClaimKeys.length > 0 ||
+      coupon.userUsageClaims.length > 0;
+    if (used || bookingRef) {
+      coupon.isActive = false;
+      coupon.isArchived = true;
+      coupon.archivedAt = new Date();
+      coupon.archivedBy = String(req.user?._id || "admin");
+      coupon.archivedReason = String(
+        req.body?.reason || "Usage history preserved",
+      ).slice(0, 500);
+      await coupon.save();
+      return res.json({
+        success: true,
+        archived: true,
+        message: "Coupon has durable history and was archived.",
+      });
+    }
+
+    await coupon.deleteOne();
+    res.json({
+      success: true,
+      archived: false,
+      message: "Coupon deleted.",
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -215,6 +282,7 @@ exports.getAvailableForPackage = async (req, res) => {
     const now = new Date();
     const coupons = await PlatformCoupon.find({
       isActive: true,
+      isArchived: { $ne: true },
       featured: true,
       validFrom: { $lte: now },
       validUntil: { $gte: now },

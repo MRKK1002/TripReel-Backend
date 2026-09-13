@@ -1,11 +1,248 @@
 const Package = require("../models/Package");
 const Batch = require("../models/Batch");
+const TripBooking = require("../models/TripBooking");
+const { getPagination, paginationMeta } = require("../utils/pagination");
+const {
+  normalizeView,
+  packageLifecycle,
+  applyLifecycleView,
+  isHistory,
+} = require("../utils/lifecycle");
+const { pendingReferenceQuery } = require("../utils/resourceIntegrity");
+const { getISTDateKey, getISTDayRange } = require("../utils/businessDate");
+const {
+  validateSubmittedItinerary,
+} = require("../utils/packageItineraryValidation");
+
+// Count live bookings whose effective trip end is today or later. Batch dates
+// remain authoritative; flexible/snapshotted dates cover flexible and legacy
+// bookings without a populated batch reference.
+function activeBookingEndCutoff(now = new Date()) {
+  return getISTDayRange(getISTDateKey(now)).start;
+}
+
+async function countFutureOrOngoingLiveBookings(packageId, now = new Date()) {
+  const activeEndCutoff = activeBookingEndCutoff(now);
+  const result = await TripBooking.aggregate([
+    {
+      $match: {
+        packageId,
+        status: { $in: ["CONFIRMED", "PENDING"] },
+      },
+    },
+    {
+      $lookup: {
+        from: Batch.collection.name,
+        localField: "batchId",
+        foreignField: "_id",
+        as: "effectiveBatch",
+      },
+    },
+    {
+      $set: {
+        effectiveEndDate: {
+          $ifNull: [
+            { $arrayElemAt: ["$effectiveBatch.endDate", 0] },
+            { $ifNull: ["$flexEndDate", "$snapshot.endDate"] },
+          ],
+        },
+      },
+    },
+    { $match: { effectiveEndDate: { $gte: activeEndCutoff } } },
+    { $count: "count" },
+  ]);
+
+  return result[0]?.count || 0;
+}
+exports.activeBookingEndCutoff = activeBookingEndCutoff;
+
+async function hasInFlightPackageOrder(packageId) {
+  const PendingOrder = require("../models/PendingOrder");
+  return PendingOrder.exists({
+    $or: [
+      { ...pendingReferenceQuery("packageId", packageId) },
+      {
+        packageId,
+        status: "pending",
+        finalizationState: {
+          $in: require("../utils/resourceIntegrity").IN_FLIGHT_STATES,
+        },
+      },
+    ],
+  });
+}
+
+async function assertBookingModeChangeAllowed(pkg, nextMode) {
+  if (!nextMode || nextMode === pkg.bookingMode) return;
+  const [bookingHistory, pendingOrder] = await Promise.all([
+    TripBooking.exists({ packageId: pkg._id }),
+    hasInFlightPackageOrder(pkg._id),
+  ]);
+  if (bookingHistory || pendingOrder) {
+    const error = new Error(
+      "Booking mode cannot change after booking history or an in-flight payment order exists.",
+    );
+    error.statusCode = 409;
+    throw error;
+  }
+
+  const FlexibleAvailability = require("../models/FlexibleAvailability");
+  const Coupon = require("../models/Coupon");
+  const incompatible =
+    nextMode === "flexible"
+      ? await Promise.all([
+          Batch.exists({
+            packageId: pkg._id,
+            isActive: { $ne: false },
+            isArchived: { $ne: true },
+          }),
+          Coupon.exists({
+            packageId: pkg._id,
+            batchId: { $ne: null },
+            isActive: { $ne: false },
+            isArchived: { $ne: true },
+          }),
+        ])
+      : await Promise.all([
+          FlexibleAvailability.exists({
+            packageId: pkg._id,
+            isActive: { $ne: false },
+            isArchived: { $ne: true },
+          }),
+          Coupon.exists({
+            packageId: pkg._id,
+            batchId: null,
+            isActive: { $ne: false },
+            isArchived: { $ne: true },
+          }),
+        ]);
+  if (incompatible.some(Boolean)) {
+    const error = new Error(
+      "Deactivate or remove incompatible active inventory and coupons before changing booking mode.",
+    );
+    error.statusCode = 409;
+    throw error;
+  }
+}
+
+async function deleteOrArchivePackage(
+  pkg,
+  { actorId = "", actorType = "system", reason = "" } = {},
+) {
+  const PendingOrder = require("../models/PendingOrder");
+  const Review = require("../models/Review");
+  const Trip = require("../models/Trip");
+  const TripGroup = require("../models/TripGroup");
+  const Coupon = require("../models/Coupon");
+  const FlexibleAvailability = require("../models/FlexibleAvailability");
+  const FlexibleDateInventory = require("../models/FlexibleDateInventory");
+  const BookingIntent = require("../models/BookingIntent");
+
+  const [liveBookings, inFlightOrder] = await Promise.all([
+    TripBooking.countDocuments({
+      packageId: pkg._id,
+      status: { $in: ["CONFIRMED", "PENDING"] },
+    }),
+    hasInFlightPackageOrder(pkg._id),
+  ]);
+  if (liveBookings > 0 || inFlightOrder) {
+    const error = new Error(
+      liveBookings > 0
+        ? `Cannot delete — ${liveBookings} active booking${liveBookings === 1 ? "" : "s"} reference this package.`
+        : "Cannot delete while a payment order for this package is still in flight.",
+    );
+    error.statusCode = 409;
+    throw error;
+  }
+
+  const [bookingRef, reviewRef, tripRef, groupRef, usedCouponRef] =
+    await Promise.all([
+      TripBooking.exists({ packageId: pkg._id }),
+      Review.exists({ packageId: pkg._id }),
+      Trip.exists({ package: pkg._id }),
+      TripGroup.exists({ packageId: pkg._id }),
+      Coupon.exists({
+        packageId: pkg._id,
+        $or: [
+          { everUsedCount: { $gt: 0 } },
+          { usedCount: { $gt: 0 } },
+          { usageClaimKeys: { $exists: true, $ne: [] } },
+        ],
+      }),
+    ]);
+  const hasHistory = [
+    bookingRef,
+    reviewRef,
+    tripRef,
+    groupRef,
+    usedCouponRef,
+  ].some(Boolean);
+  if (hasHistory) {
+    const now = new Date();
+    const archive = {
+      isActive: false,
+      isArchived: true,
+      archivedAt: now,
+      archivedBy: String(actorId || ""),
+      archivedByType: actorType,
+      archivedReason: String(reason || "Historical references preserved").slice(
+        0,
+        500,
+      ),
+    };
+    pkg.isActive = false;
+    pkg.status = "ARCHIVED";
+    pkg.archivedAt = now;
+    pkg.archivedBy = archive.archivedBy;
+    pkg.archivedByType = actorType;
+    pkg.archivedReason = archive.archivedReason;
+    await Promise.all([
+      pkg.save(),
+      Batch.updateMany(
+        { packageId: pkg._id, isArchived: { $ne: true } },
+        { $set: archive },
+      ),
+      FlexibleAvailability.updateMany(
+        { packageId: pkg._id, isArchived: { $ne: true } },
+        { $set: archive },
+      ),
+      Coupon.updateMany(
+        { packageId: pkg._id, isArchived: { $ne: true } },
+        { $set: archive },
+      ),
+    ]);
+    return { archived: true };
+  }
+
+  const flexIds = await FlexibleAvailability.find({
+    packageId: pkg._id,
+  }).distinct("_id");
+  await Promise.all([
+    Batch.deleteMany({ packageId: pkg._id }),
+    Coupon.deleteMany({ packageId: pkg._id }),
+    FlexibleAvailability.deleteMany({ packageId: pkg._id }),
+    FlexibleDateInventory.deleteMany({
+      $or: [{ packageId: pkg._id }, { flexAvailabilityId: { $in: flexIds } }],
+    }),
+    BookingIntent.deleteMany({ packageId: pkg._id }),
+    PendingOrder.deleteMany({
+      status: { $in: ["expired"] },
+      $or: [
+        { packageId: pkg._id },
+        { "payload.packageId": { $in: [pkg._id, String(pkg._id)] } },
+      ],
+    }),
+  ]);
+  await pkg.deleteOne();
+  return { archived: false };
+}
 
 // Helper: Attach nearest upcoming batch price to each package
 async function enrichWithBatchPrice(packages) {
   if (!packages || packages.length === 0) return packages;
 
   const now = new Date();
+  const dayStart = getISTDayRange(getISTDateKey(now)).start;
   const packageIds = packages.map((p) => p._id || p);
 
   // Find the nearest upcoming active batch for each package
@@ -44,7 +281,7 @@ async function enrichWithBatchPrice(packages) {
       $match: {
         packageId: { $in: packageIds },
         isActive: true,
-        endDate: { $gte: now },
+        endDate: { $gte: dayStart },
       },
     },
     { $sort: { adultPrice: 1 } },
@@ -55,6 +292,7 @@ async function enrichWithBatchPrice(packages) {
         flexChildPrice: { $first: "$childPrice" },
         flexStartDate: { $first: "$startDate" },
         flexEndDate: { $last: "$endDate" },
+        flexMaxBookings: { $first: "$maxBookings" },
       },
     },
   ]);
@@ -67,6 +305,8 @@ async function enrichWithBatchPrice(packages) {
       flexStartDate: f.flexStartDate,
       flexEndDate: f.flexEndDate,
       hasFlexibility: true,
+      capacityMode: "per_start_date",
+      maxBookingsPerStartDate: f.flexMaxBookings || 0,
     };
   });
 
@@ -85,6 +325,8 @@ async function enrichWithBatchPrice(packages) {
       obj.flexStartDate = flexMap[id].flexStartDate;
       obj.flexEndDate = flexMap[id].flexEndDate;
       obj.hasFlexibility = true;
+      obj.capacityMode = flexMap[id].capacityMode;
+      obj.maxBookingsPerStartDate = flexMap[id].maxBookingsPerStartDate;
     }
     return obj;
   });
@@ -121,17 +363,19 @@ exports.getAllPackages = async (req, res) => {
       const Batch = require("../models/Batch");
       const FlexibleAvailability = require("../models/FlexibleAvailability");
 
-      const istOffset = 5.5 * 60 * 60 * 1000;
-      const toISTDayStart = (str) => {
-        const [y, m, d] = str.split("-").map(Number);
-        return new Date(Date.UTC(y, m - 1, d) - istOffset);
-      };
-      const toISTDayEnd = (str) => {
-        const [y, m, d] = str.split("-").map(Number);
-        return new Date(
-          Date.UTC(y, m - 1, d) - istOffset + 24 * 60 * 60 * 1000,
-        );
-      };
+      const toISTDayStart = (value) => getISTDayRange(value)?.start;
+      const toISTDayEnd = (value) => getISTDayRange(value)?.endExclusive;
+      if (
+        [date, dateFrom, dateTo].some(
+          (value) => value && !getISTDayRange(value),
+        )
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "date, dateFrom and dateTo must use valid YYYY-MM-DD business dates",
+        });
+      }
 
       let startFilter;
       if (hasRange) {
@@ -601,6 +845,13 @@ exports.reviewPackage = async (req, res) => {
         .status(404)
         .json({ success: false, message: "Package not found" });
     }
+    if (pkg.status === "ARCHIVED") {
+      return res.status(409).json({
+        success: false,
+        message:
+          "Archived packages cannot re-enter review without a dedicated restore workflow.",
+      });
+    }
 
     const revision = pkg.pendingRevision;
     const isApprovedRevision =
@@ -618,6 +869,8 @@ exports.reviewPackage = async (req, res) => {
     if (isApprovedRevision) {
       if (action === "approve") {
         const approvedData = pickOperatorEditableFields(revision.data);
+        validateSubmittedItinerary(approvedData.itinerary);
+        await assertBookingModeChangeAllowed(pkg, approvedData.bookingMode);
         Object.entries(approvedData).forEach(([field, value]) => {
           pkg.set(field, value);
         });
@@ -633,6 +886,15 @@ exports.reviewPackage = async (req, res) => {
         await pkg.save({ validateModifiedOnly: true });
       }
     } else {
+      if (action === "approve") {
+        if (pkg.status !== "PENDING") {
+          return res.status(409).json({
+            success: false,
+            message: "Only a submitted package can be approved.",
+          });
+        }
+        validateSubmittedItinerary(pkg.itinerary);
+      }
       pkg.status = statusMap[action];
       pkg.adminNotes = (adminNotes || "").trim();
       pkg.isActive = action === "approve";
@@ -668,7 +930,8 @@ exports.reviewPackage = async (req, res) => {
 
     res.json({ success: true, package: toAdminReviewView(pkg) });
   } catch (err) {
-    const status = err.name === "ValidationError" ? 400 : 500;
+    const status =
+      err.statusCode || (err.name === "ValidationError" ? 400 : 500);
     res.status(status).json({ success: false, message: err.message });
   }
 };
@@ -677,52 +940,27 @@ exports.reviewPackage = async (req, res) => {
 exports.deletePackage = async (req, res) => {
   try {
     const pkg = await Package.findById(req.params.id);
-    if (!pkg)
+    if (!pkg) {
       return res
         .status(404)
         .json({ success: false, message: "Package not found" });
-
-    // Don't orphan live bookings — same guard as the operator delete path.
-    const TripBooking = require("../models/TripBooking");
-    const liveBookings = await TripBooking.countDocuments({
-      packageId: pkg._id,
-      status: { $in: ["CONFIRMED", "PENDING"] },
-    });
-    if (liveBookings > 0) {
-      return res.status(400).json({
-        success: false,
-        message: `Cannot delete — ${liveBookings} active booking${liveBookings > 1 ? "s" : ""} reference this package. Cancel them first, or suspend the package to hide it.`,
-      });
     }
-
-    // Keep packages that have any booking history for audit — archive instead
-    const anyBookings = await TripBooking.countDocuments({
-      packageId: pkg._id,
+    const result = await deleteOrArchivePackage(pkg, {
+      actorId: req.user?._id,
+      actorType: "admin",
+      reason: req.body?.reason || req.body?.archivedReason,
     });
-    if (anyBookings > 0) {
-      pkg.isActive = false;
-      pkg.status = "ARCHIVED";
-      await pkg.save();
-      return res.json({
-        success: true,
-        archived: true,
-        message:
-          "Package has booking history — archived and hidden instead of deleted.",
-      });
-    }
-
-    const Batch = require("../models/Batch");
-    const Coupon = require("../models/Coupon");
-    const FlexibleAvailability = require("../models/FlexibleAvailability");
-    await Promise.all([
-      Batch.deleteMany({ packageId: pkg._id }),
-      Coupon.deleteMany({ packageId: pkg._id }),
-      FlexibleAvailability.deleteMany({ packageId: pkg._id }),
-    ]);
-    await pkg.deleteOne();
-    res.json({ success: true, message: "Package deleted successfully" });
+    return res.json({
+      success: true,
+      archived: result.archived,
+      message: result.archived
+        ? "Package has durable history and was archived with its active inventory and coupons."
+        : "Package and disposable dependents deleted successfully",
+    });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    res
+      .status(err.statusCode || 500)
+      .json({ success: false, message: err.message });
   }
 };
 
@@ -759,10 +997,54 @@ function normalizeBatches(batches) {
 // GET /api/packages/operator/mine  (operator — their own packages)
 exports.operatorGetMyPackages = async (req, res) => {
   try {
-    const packages = await Package.find({ operatorId: req.operator._id }).sort({
-      createdAt: -1,
+    const { page, limit, skip } = getPagination(req.query, 20);
+    const view = normalizeView(req.query);
+    const query = { operatorId: req.operator._id };
+    if (req.query.packageId) {
+      const mongoose = require("mongoose");
+      if (!mongoose.isValidObjectId(req.query.packageId)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid packageId",
+        });
+      }
+      query._id = req.query.packageId;
+    }
+    if (req.query.search) {
+      const escapeRegex = require("../utils/escapeRegex");
+      const safe = escapeRegex(String(req.query.search));
+      query.$or = [
+        { title: { $regex: safe, $options: "i" } },
+        { location: { $regex: safe, $options: "i" } },
+        { city: { $regex: safe, $options: "i" } },
+        { destination: { $regex: safe, $options: "i" } },
+        { "pendingRevision.data.title": { $regex: safe, $options: "i" } },
+        { "pendingRevision.data.location": { $regex: safe, $options: "i" } },
+        { "pendingRevision.data.city": { $regex: safe, $options: "i" } },
+        {
+          "pendingRevision.data.destination": {
+            $regex: safe,
+            $options: "i",
+          },
+        },
+      ];
+    }
+    const all = await Package.find(query).sort({ createdAt: -1, _id: -1 });
+    const classified = applyLifecycleView(
+      all,
+      "package",
+      packageLifecycle,
+      view,
+    );
+    const packages = classified.items.slice(skip, skip + limit);
+    res.json({
+      success: true,
+      packages,
+      count: packages.length,
+      ...paginationMeta(classified.items.length, page, limit),
+      currentTotal: classified.currentTotal,
+      historyTotal: classified.historyTotal,
     });
-    res.json({ success: true, packages });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -935,6 +1217,7 @@ exports.operatorCreatePackage = async (req, res) => {
     delete body.submissionMode;
 
     const status = submissionMode === "DRAFT" ? "DRAFT" : "PENDING";
+    if (status !== "DRAFT") validateSubmittedItinerary(body.itinerary);
 
     // Drafts are partial — skip Mongoose schema validators for them.
     // Submitted packages get full validation.
@@ -980,8 +1263,16 @@ exports.operatorUpdatePackage = async (req, res) => {
       return res
         .status(404)
         .json({ success: false, message: "Package not found or not yours" });
+    const lifecycle = packageLifecycle(pkg);
+    if (isHistory("package", lifecycle)) {
+      return res.status(409).json({
+        success: false,
+        message: `This package is in History (${lifecycle}) and is read-only. It cannot be changed.`,
+      });
+    }
 
     const body = stripPlatformFields({ ...req.body });
+    await assertBookingModeChangeAllowed(pkg, body.bookingMode);
 
     // slot-0 → image_url (cover), slots 1-3 → images (gallery)
     applyImageFields(body, req.files);
@@ -1075,7 +1366,10 @@ exports.operatorUpdatePackage = async (req, res) => {
         isActive: pkg.isActive,
         pendingRevision: undefined,
       });
-      if (nextStatus === "PENDING") await candidate.validate();
+      if (nextStatus === "PENDING") {
+        validateSubmittedItinerary(candidate.itinerary);
+        await candidate.validate();
+      }
 
       const candidateData = pickOperatorEditableFields(candidate.toObject());
       pkg.pendingRevision = {
@@ -1094,6 +1388,18 @@ exports.operatorUpdatePackage = async (req, res) => {
       updated = pkg;
       reviewTitle = candidateData.title || pkg.title;
     } else {
+      if (nextStatus === "PENDING") {
+        const candidate = new Package({
+          ...pkg.toObject(),
+          ...pickOperatorEditableFields(body),
+          _id: pkg._id,
+          operatorId: pkg.operatorId,
+          status: nextStatus,
+          isActive: false,
+        });
+        validateSubmittedItinerary(candidate.itinerary);
+        await candidate.validate();
+      }
       updated = await Package.findByIdAndUpdate(
         req.params.id,
         {
@@ -1126,7 +1432,9 @@ exports.operatorUpdatePackage = async (req, res) => {
       );
     }
   } catch (err) {
-    res.status(400).json({ success: false, message: err.message });
+    res
+      .status(err.statusCode || 400)
+      .json({ success: false, message: err.message });
   }
 };
 
@@ -1137,58 +1445,34 @@ exports.operatorDeletePackage = async (req, res) => {
       _id: req.params.id,
       operatorId: req.operator._id,
     });
-    if (!pkg)
+    if (!pkg) {
       return res
         .status(404)
         .json({ success: false, message: "Package not found or not yours" });
-
-    // ── Never orphan a paid booking ───────────────────────────────────────────
-    // This used to be a bare findOneAndDelete, so a package with CONFIRMED
-    // bookings could be hard-deleted, leaving TripBooking.packageId dangling
-    // along with its batches, coupons and flexible date ranges.
-    const TripBooking = require("../models/TripBooking");
-    const liveBookings = await TripBooking.countDocuments({
-      packageId: pkg._id,
-      status: { $in: ["CONFIRMED", "PENDING"] },
-    });
-    if (liveBookings > 0) {
-      return res.status(400).json({
+    }
+    const lifecycle = packageLifecycle(pkg);
+    if (isHistory("package", lifecycle)) {
+      return res.status(409).json({
         success: false,
-        message: `Cannot delete — ${liveBookings} active booking${liveBookings > 1 ? "s" : ""} reference this package. Cancel them first, or disable the package to hide it from travellers.`,
+        message: `This package is in History (${lifecycle}) and is read-only. It cannot be deleted.`,
       });
     }
-
-    // Any booking at all (including past/cancelled) means we keep the record for
-    // history and audit — disable instead of destroying it.
-    const anyBookings = await TripBooking.countDocuments({
-      packageId: pkg._id,
+    const result = await deleteOrArchivePackage(pkg, {
+      actorId: req.operator._id,
+      actorType: "operator",
+      reason: req.body?.reason || req.body?.archivedReason,
     });
-    if (anyBookings > 0) {
-      pkg.isActive = false;
-      pkg.status = "ARCHIVED";
-      await pkg.save();
-      return res.json({
-        success: true,
-        archived: true,
-        message:
-          "This package has booking history, so it was archived and hidden from travellers instead of being deleted.",
-      });
-    }
-
-    // No bookings ever — safe to remove, along with its dependent records
-    const Batch = require("../models/Batch");
-    const Coupon = require("../models/Coupon");
-    const FlexibleAvailability = require("../models/FlexibleAvailability");
-    await Promise.all([
-      Batch.deleteMany({ packageId: pkg._id }),
-      Coupon.deleteMany({ packageId: pkg._id }),
-      FlexibleAvailability.deleteMany({ packageId: pkg._id }),
-    ]);
-    await pkg.deleteOne();
-
-    res.json({ success: true, message: "Package deleted" });
+    res.json({
+      success: true,
+      archived: result.archived,
+      message: result.archived
+        ? "This package has durable history and was archived with its active inventory and coupons."
+        : "Package and disposable dependents deleted",
+    });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    res
+      .status(err.statusCode || 500)
+      .json({ success: false, message: err.message });
   }
 };
 
@@ -1204,23 +1488,22 @@ exports.operatorToggleActive = async (req, res) => {
       return res
         .status(404)
         .json({ success: false, message: "Package not found or not yours" });
+    const lifecycle = packageLifecycle(pkg);
+    if (isHistory("package", lifecycle)) {
+      return res.status(409).json({
+        success: false,
+        message: `This package is in History (${lifecycle}) and is read-only. Its active state cannot be changed.`,
+      });
+    }
 
     // If trying to disable, check for active bookings
     if (pkg.isActive) {
-      const now = new Date();
-      const TripBooking = require("../models/TripBooking");
-
-      // Check for confirmed bookings on upcoming/ongoing batches or flex dates
-      const activeBookings = await TripBooking.countDocuments({
-        packageId: pkg._id,
-        status: { $in: ["CONFIRMED", "PENDING"] },
-        tripEndDate: { $gte: now },
-      });
+      const activeBookings = await countFutureOrOngoingLiveBookings(pkg._id);
 
       if (activeBookings > 0) {
         return res.status(400).json({
           success: false,
-          message: `Cannot disable — ${activeBookings} active booking${activeBookings > 1 ? "s" : ""} exist for upcoming trips. Wait until all trips are completed or cancel them first.`,
+          message: `Cannot disable — ${activeBookings} active booking${activeBookings > 1 ? "s" : ""} exist for upcoming or ongoing trips. Wait until all trips are completed or cancel them first.`,
         });
       }
     }
@@ -1247,6 +1530,24 @@ exports.adminTogglePackageSuspend = async (req, res) => {
       return res
         .status(404)
         .json({ success: false, message: "Package not found" });
+    if (pkg.status === "ARCHIVED") {
+      return res.status(409).json({
+        success: false,
+        message:
+          "Archived packages cannot be activated through suspension controls.",
+      });
+    }
+
+    if (pkg.isActive) {
+      const activeBookings = await countFutureOrOngoingLiveBookings(pkg._id);
+      if (activeBookings > 0) {
+        return res.status(400).json({
+          success: false,
+          message: `Cannot suspend — ${activeBookings} active booking${activeBookings > 1 ? "s" : ""} exist for upcoming or ongoing trips. Wait until all trips are completed or cancel them first.`,
+        });
+      }
+    }
+
     pkg.isActive = !pkg.isActive;
     await pkg.save();
     res.json({

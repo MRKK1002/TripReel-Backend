@@ -96,7 +96,16 @@ const tripBookingSchema = new mongoose.Schema(
     flexAvailabilityId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "FlexibleAvailability",
+      index: true,
     },
+    flexInventoryId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "FlexibleDateInventory",
+      index: true,
+    },
+    flexStartDateKey: { type: String, match: /^\d{4}-\d{2}-\d{2}$/ },
+    flexReservationClaimKey: { type: String, default: "" },
+    batchReservationClaimKey: { type: String, default: "" },
     operatorId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Operator",
@@ -135,8 +144,13 @@ const tripBookingSchema = new mongoose.Schema(
       default: "PENDING",
     },
 
-    // Pricing locked at booking time
+    // Current aggregate pricing. Top-up applications may increase this value.
     pricing: pricingSchema,
+    // Original provider charge and pricing are frozen separately so cancellation
+    // never submits top-up money against the original payment.
+    initialPricing: pricingSchema,
+    initialPaymentAmount: { type: Number, default: 0 },
+    initialAddonRefundInFlight: { type: Boolean, default: false },
 
     // Snapshot for receipts (never changes even if package/batch is edited)
     snapshot: snapshotSchema,
@@ -162,6 +176,32 @@ const tripBookingSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
+    // Durable cancellation saga state. Legacy cancelled bookings have no
+    // trustworthy effect markers and are conservatively sent to reconciliation.
+    cancellationState: {
+      type: String,
+      enum: ["NONE", "PROCESSING", "COMPLETED", "RECONCILIATION_REQUIRED"],
+      default: "NONE",
+      index: true,
+    },
+    cancellationLeaseToken: { type: String, default: "" },
+    cancellationLeaseUntil: { type: Date, default: null },
+    cancellationError: { type: String, default: "" },
+    // Local cancellation effects and financial settlement are deliberately
+    // separate: inventory may be released while a refund still needs attention.
+    financialSettlementState: {
+      type: String,
+      enum: ["NONE", "PENDING", "SETTLED", "RECONCILIATION_REQUIRED"],
+      default: "NONE",
+      index: true,
+    },
+    refundRetryToken: { type: String, default: "" },
+    refundRetryLeaseUntil: { type: Date, default: null },
+    inventoryReleasedAt: { type: Date, default: null },
+    couponReleasedAt: { type: Date, default: null },
+    platformCouponReleasedAt: { type: Date, default: null },
+    retentionCreditedAt: { type: Date, default: null },
+    conversationClosedAt: { type: Date, default: null },
     refundPercent: {
       type: Number,
       default: 0,
@@ -173,7 +213,14 @@ const tripBookingSchema = new mongoose.Schema(
     // Refund processing status
     refundStatus: {
       type: String,
-      enum: ["NONE", "PROCESSING", "REFUNDED", "FAILED", "MANUAL"],
+      enum: [
+        "NONE",
+        "PROCESSING",
+        "REFUNDED",
+        "FAILED",
+        "MANUAL",
+        "RECONCILIATION_REQUIRED",
+      ],
       default: "NONE",
     },
     refundId: { type: String, default: "" }, // Razorpay refund id
@@ -191,6 +238,14 @@ const tripBookingSchema = new mongoose.Schema(
     razorpayPaymentId: { type: String, default: "" },
     razorpayOrderId: { type: String, default: "" },
 
+    // Frozen canonical service entries are authoritative for all new records.
+    // Legacy addonDays/schedule fields remain as a presentation compatibility view.
+    addonServiceEntries: {
+      type: [mongoose.Schema.Types.Mixed],
+      default: [],
+    },
+    addonEntryClaims: { type: [String], default: [] },
+    addonAppliedEntryKeys: { type: [String], default: [] },
     // Addon day selections — { addonName: [dayIndex, ...] }
     addonDays: {
       type: mongoose.Schema.Types.Mixed,
@@ -239,8 +294,41 @@ const tripBookingSchema = new mongoose.Schema(
     walletReleaseLeaseUntil: { type: Date, default: null },
     walletReleaseError: { type: String, default: "" },
 
-    // Guards against sending duplicate confirmation emails/push (webhook + app
-    // verify can both fire for the same payment).
+    // Required post-insert effects are replayed before PendingOrder may become
+    // COMPLETED. Version 1 rows have aggregate-side idempotency claims.
+    requiredEffectsVersion: { type: Number, default: 0 },
+    requiredEffectsState: {
+      type: String,
+      enum: ["PENDING", "COMPLETED", "RECONCILIATION_REQUIRED"],
+      default: "PENDING",
+      index: true,
+    },
+    packageCountAppliedAt: { type: Date, default: null },
+    conversationPreparedAt: { type: Date, default: null },
+    systemMessagePreparedAt: { type: Date, default: null },
+    operatorCouponId: { type: mongoose.Schema.Types.ObjectId, ref: "Coupon" },
+    platformCouponId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "PlatformCoupon",
+    },
+
+    // Replay-safe post-publication confirmation delivery. Each channel marks
+    // completion only after dispatch, so recovery retries omissions after crash.
+    confirmationDeliveryState: {
+      type: String,
+      enum: ["PENDING", "PROCESSING", "COMPLETED", "FAILED"],
+      default: "PENDING",
+      index: true,
+    },
+    confirmationDeliveryToken: { type: String, default: "" },
+    confirmationDeliveryLeaseUntil: { type: Date, default: null },
+    confirmationDeliveryAttempts: { type: Number, default: 0 },
+    confirmationDeliveryError: { type: String, default: "" },
+    userConfirmationSentAt: { type: Date, default: null },
+    operatorConfirmationSentAt: { type: Date, default: null },
+    adminConfirmationSentAt: { type: Date, default: null },
+    itineraryConfirmationSentAt: { type: Date, default: null },
+    emailConfirmationSentAt: { type: Date, default: null },
     confirmationSentAt: { type: Date },
 
     // Set when the amount charged (order) differs from the recomputed booking
@@ -273,6 +361,12 @@ const tripBookingSchema = new mongoose.Schema(
     addonTopupPaymentIds: {
       type: [String],
       default: [],
+    },
+    addonPurchaseRefundAmount: { type: Number, default: 0 },
+    addonPurchaseRefundStatus: {
+      type: String,
+      enum: ["NONE", "PROCESSING", "REFUNDED", "RECONCILIATION_REQUIRED"],
+      default: "NONE",
     },
     // Audit trail for top-up payments refunded because server-side eligibility
     // changed between Razorpay order creation and payment verification.

@@ -9,6 +9,7 @@ const helmet = require("helmet");
 const mongoSanitize = require("express-mongo-sanitize");
 
 dotenv.config();
+const { PUBLIC_UPLOAD_ROOTS } = require("./utils/reelMedia");
 
 // ── Force Indian Standard Time for ALL server-side date math ────────────────
 process.env.TZ = process.env.TZ || "Asia/Kolkata";
@@ -190,11 +191,13 @@ app.use(
     res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
     next();
   },
-  express.static(path.join(__dirname, "uploads"), {
-    acceptRanges: true,
-    etag: true,
-    lastModified: true,
-  }),
+  ...PUBLIC_UPLOAD_ROOTS.map((root) =>
+    express.static(root, {
+      acceptRanges: true,
+      etag: true,
+      lastModified: true,
+    }),
+  ),
 );
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -335,7 +338,8 @@ mongoose
       runInactiveUserReminders,
       runBookingSanityCheck,
       runStaleDraftExpiry,
-      runCronJobs,
+      runCancellationRecovery,
+      runRefundRetryRecovery,
     } = require("./controllers/cronController");
 
     // 12:00 AM IST (Midnight) — Auto-complete trips + auto-cancel expired bookings + wallet credits
@@ -402,9 +406,9 @@ mongoose
       async () => {
         try {
           const result = await runSnapjaDispatch();
-          if (result.dispatched) {
+          if (result.dispatched || result.deferred) {
             console.log(
-              `✅ Cron (Snapja dispatch): ${result.dispatched} bookings, ${result.callsMade} Snapja calls`,
+              `✅ Cron (Snapja dispatch): ${result.dispatched} bookings, ${result.callsMade} Snapja calls, ${result.deferred} entries deferred`,
             );
           }
         } catch (err) {
@@ -521,6 +525,36 @@ mongoose
       { timezone: "Asia/Kolkata" },
     );
 
+    // Every 10 minutes — resume expired/abandoned cancellation sagas for every
+    // actor. The worker is bounded and aggregate release claims make replays safe.
+    cron.schedule(
+      "*/10 * * * *",
+      async () => {
+        try {
+          const result = await runCancellationRecovery();
+          if (result.completed || result.reconciliationRequired) {
+            console.log(
+              `✅ Cron (cancellation recovery): ${result.completed} completed, ${result.reconciliationRequired} reconciliation`,
+            );
+          }
+        } catch (err) {
+          console.error("❌ Cron cancellation recovery error:", err.message);
+        }
+
+        try {
+          const refunds = await runRefundRetryRecovery();
+          if (refunds.settled || refunds.reconciliationRequired) {
+            console.log(
+              `✅ Cron (refund retry recovery): ${refunds.settled} settled, ${refunds.reconciliationRequired} reconciliation`,
+            );
+          }
+        } catch (err) {
+          console.error("❌ Cron refund retry recovery error:", err.message);
+        }
+      },
+      { timezone: "Asia/Kolkata" },
+    );
+
     // Every 10 minutes — recover bookings for orders paid but never verified
     // (app killed right after checkout). Safety net alongside the webhook.
     cron.schedule(
@@ -529,9 +563,15 @@ mongoose
         try {
           const paymentController = require("./controllers/paymentController");
           const result = await paymentController.runOrphanPaymentRecovery();
-          if (result.recovered || result.expired) {
+          if (
+            result.recovered ||
+            result.expired ||
+            result.addonApplied ||
+            result.addonRefunded ||
+            result.reconciliationRequired
+          ) {
             console.log(
-              `✅ Cron (payment recovery): ${result.recovered} recovered, ${result.expired} expired`,
+              `✅ Cron (payment recovery): ${result.recovered} bookings recovered, ${result.expired} expired, ${result.addonApplied || 0} add-ons applied, ${result.addonRefunded || 0} add-ons refunded, ${result.reconciliationRequired || 0} reconciliation`,
             );
           }
         } catch (err) {

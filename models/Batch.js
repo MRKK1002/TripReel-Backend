@@ -54,6 +54,12 @@ const batchSchema = new mongoose.Schema(
       default: 0,
       min: 0,
     },
+    inventoryReservationClaimKeys: {
+      type: [String],
+      default: [],
+      select: false,
+    },
+    inventoryReleaseClaimKeys: { type: [String], default: [], select: false },
 
     // ── Display ────────────────────────────────────────────────────────────
     label: {
@@ -66,6 +72,23 @@ const batchSchema = new mongoose.Schema(
     isActive: {
       type: Boolean,
       default: true,
+    },
+    isCancelled: { type: Boolean, default: false, index: true },
+    cancelledAt: { type: Date, default: null },
+    cancellationReason: {
+      type: String,
+      default: "",
+      trim: true,
+      maxlength: 500,
+    },
+    isArchived: { type: Boolean, default: false, index: true },
+    archivedAt: { type: Date, default: null },
+    archivedReason: { type: String, default: "", trim: true, maxlength: 500 },
+    archivedBy: { type: String, default: "" },
+    archivedByType: {
+      type: String,
+      enum: ["operator", "admin", "system", ""],
+      default: "",
     },
   },
   { timestamps: true },
@@ -108,8 +131,8 @@ batchSchema.set("toObject", { virtuals: true });
 
 // ── Validation ────────────────────────────────────────────────────────────────
 batchSchema.pre("validate", function (next) {
-  if (this.endDate && this.startDate && this.endDate <= this.startDate) {
-    return next(new Error("End date must be after start date"));
+  if (this.endDate && this.startDate && this.endDate < this.startDate) {
+    return next(new Error("End date must be on or after start date"));
   }
   if (
     this.bookingDeadline &&

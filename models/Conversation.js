@@ -52,4 +52,8 @@ conversationSchema.methods.isExpired = function () {
   return new Date() > this.expiresAt;
 };
 
+// One durable conversation per booking; findOneAndUpdate(upsert) can safely be
+// replayed after a finalization worker dies.
+conversationSchema.index({ bookingId: 1 }, { unique: true });
+
 module.exports = mongoose.model("Conversation", conversationSchema);
