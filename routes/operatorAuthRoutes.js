@@ -54,7 +54,8 @@ router.post(
           .json({ success: false, message: "Photo file required" });
       }
       const { Operator } = require("../models/Operator");
-      const photoPath = "/uploads/" + req.file.filename;
+      const { syncUploadedFile } = require("../utils/s3Storage");
+      const photoPath = await syncUploadedFile(req.file, "");
       const operator = await Operator.findByIdAndUpdate(
         req.operator._id,
         { profilePhoto: photoPath },

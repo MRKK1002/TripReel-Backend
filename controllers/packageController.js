@@ -2,6 +2,7 @@ const Package = require("../models/Package");
 const Batch = require("../models/Batch");
 const TripBooking = require("../models/TripBooking");
 const { getPagination, paginationMeta } = require("../utils/pagination");
+const { syncUploadedFile } = require("../utils/s3Storage");
 const {
   normalizeView,
   packageLifecycle,
@@ -1108,17 +1109,17 @@ function sanitizeExistingImagePaths(value) {
 
 // Resolve cover image + gallery from freshly uploaded files plus any retained
 // existing paths. Shared by create and update (was duplicated in both).
-function applyImageFields(body, files) {
+async function applyImageFields(body, files) {
   const cover = files?.["image_url"]?.[0];
   if (cover) {
-    body.image_url = "/uploads/" + cover.filename;
+    body.image_url = await syncUploadedFile(cover, "");
   } else if (body.existing_image_url) {
     body.image_url = sanitizeExistingImagePaths(body.existing_image_url)[0];
     if (!body.image_url) delete body.image_url;
   }
 
-  const newUrls = (files?.["images"] || []).map(
-    (f) => "/uploads/" + f.filename,
+  const newUrls = await Promise.all(
+    (files?.["images"] || []).map((f) => syncUploadedFile(f, "")),
   );
   const keptUrls = body.existing_images
     ? sanitizeExistingImagePaths(body.existing_images)
@@ -1155,7 +1156,7 @@ exports.operatorCreatePackage = async (req, res) => {
     }
 
     // slot-0 → image_url (cover), slots 1-3 → images (gallery)
-    applyImageFields(body, req.files);
+    await applyImageFields(body, req.files);
 
     const parseJSON = (val, fallback) => {
       if (typeof val !== "string") return val;
@@ -1275,7 +1276,7 @@ exports.operatorUpdatePackage = async (req, res) => {
     await assertBookingModeChangeAllowed(pkg, body.bookingMode);
 
     // slot-0 → image_url (cover), slots 1-3 → images (gallery)
-    applyImageFields(body, req.files);
+    await applyImageFields(body, req.files);
 
     const parseJSON = (val, fallback) => {
       if (typeof val !== "string") return val;

@@ -3,6 +3,7 @@ const mongoose = require("mongoose");
 const jwt = require("jsonwebtoken");
 const User = require("../models/User");
 const Otp = require("../models/Otp");
+const { syncUploadedFile } = require("../utils/s3Storage");
 
 const signToken = (id) =>
   jwt.sign({ id }, process.env.JWT_SECRET, {
@@ -963,13 +964,9 @@ exports.uploadAvatar = async (req, res) => {
         .status(400)
         .json({ success: false, message: "Image file is required" });
     }
-    // Multer saves into a subfolder (e.g. /uploads/profiles/...). Build the URL
-    // from the real path so it keeps that subfolder — using just the filename
-    // produced a "/uploads/<file>" URL that 404'd (file is in /profiles/).
-    const normalized = req.file.path.replace(/\\/g, "/");
-    const idx = normalized.indexOf("/uploads/");
-    const avatarPath =
-      idx >= 0 ? normalized.substring(idx) : "/uploads/" + req.file.filename;
+    // uploadMiddleware stores flat in /uploads, and the S3 key mirrors that, so
+    // the stored value is unchanged whether or not cloud storage is enabled.
+    const avatarPath = await syncUploadedFile(req.file, "");
     const user = await User.findByIdAndUpdate(
       req.user.id,
       { avatar: avatarPath },

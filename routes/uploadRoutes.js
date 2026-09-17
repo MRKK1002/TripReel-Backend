@@ -4,16 +4,24 @@ const path = require("path");
 const fs = require("fs");
 const { protect, restrictTo } = require("../middleware/authMiddleware");
 const upload = require("../middleware/uploadMiddleware");
+const {
+  isCloudStorageEnabled,
+  keyForUpload,
+  uploadBufferToS3,
+  syncUploadedFile,
+} = require("../utils/s3Storage");
 
-// Helper: get base URL
-function getBaseUrl() {
-  return process.env.BASE_URL || `http://localhost:${process.env.PORT || 5001}`;
+// Only these characters may reach a filesystem path or an S3 key. A body value
+// like "../../src" previously escaped the uploads directory.
+function sanitizeFolder(folder) {
+  const value = String(folder || "general");
+  return /^[a-zA-Z0-9_-]+$/.test(value) ? value : "general";
 }
 
-// POST /api/upload — accepts base64 data URI, saves to disk, returns URL (admin only)
-router.post("/", protect, restrictTo("admin"), (req, res) => {
+// POST /api/upload — accepts base64 data URI, stores it, returns URL (admin only)
+router.post("/", protect, restrictTo("admin"), async (req, res) => {
   try {
-    const { data, filename, folder } = req.body;
+    const { data, folder } = req.body;
 
     if (!data || !data.startsWith("data:image/")) {
       return res
@@ -37,16 +45,30 @@ router.post("/", protect, restrictTo("admin"), (req, res) => {
         .json({ success: false, message: "Image too large (max 8 MB)" });
     }
 
-    // Use subfolder if specified, otherwise "general"
-    const subfolder = folder || "general";
+    const subfolder = sanitizeFolder(folder);
+    const safeName = `${Date.now()}-${Math.round(Math.random() * 1e6)}.${ext}`;
+    const key = keyForUpload(subfolder, safeName);
+
+    // Keep a local copy as well, so the static route still works when no CDN is
+    // configured and so the migration script can re-sync if needed.
     const uploadDir = path.join(__dirname, "../uploads", subfolder);
     if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-
-    const safeName = `${Date.now()}-${Math.round(Math.random() * 1e6)}.${ext}`;
     fs.writeFileSync(path.join(uploadDir, safeName), buffer);
 
-    const url = `${getBaseUrl()}/uploads/${subfolder}/${safeName}`;
-    res.json({ success: true, url });
+    // A failed upload must fail the request: with a CDN configured, clients
+    // never read media from this server, so "succeeded locally" would hand back
+    // a URL that can never resolve.
+    if (isCloudStorageEnabled()) {
+      await uploadBufferToS3({
+        buffer,
+        key,
+        contentType: `image/${ext === "jpg" ? "jpeg" : ext}`,
+      });
+    }
+
+    // Relative path is the canonical stored form; clients resolve it against
+    // the CDN (or the API host when no CDN is configured).
+    res.json({ success: true, url: `/${key}` });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -58,18 +80,15 @@ router.post(
   protect,
   restrictTo("admin"),
   upload.single("file"),
-  (req, res) => {
+  async (req, res) => {
     try {
       if (!req.file) {
         return res
           .status(400)
           .json({ success: false, message: "File required" });
       }
-      const relativePath = path.relative(
-        path.join(__dirname, "../uploads"),
-        req.file.path,
-      );
-      const url = `${getBaseUrl()}/uploads/${relativePath.replace(/\\/g, "/")}`;
+      // uploadMiddleware stores flat in /uploads, so there is no sub-directory.
+      const url = await syncUploadedFile(req.file, "");
       res.json({ success: true, url });
     } catch (err) {
       res.status(500).json({ success: false, message: err.message });
@@ -78,19 +97,14 @@ router.post(
 );
 
 // POST /api/upload/chat — multipart image upload for chat (any logged-in user)
-router.post("/chat", protect, upload.single("image"), (req, res) => {
+router.post("/chat", protect, upload.single("image"), async (req, res) => {
   try {
     if (!req.file) {
       return res
         .status(400)
         .json({ success: false, message: "Image file required" });
     }
-    // file is already in /uploads/chat/ subfolder thanks to middleware
-    const relativePath = path.relative(
-      path.join(__dirname, "../uploads"),
-      req.file.path,
-    );
-    const url = `${getBaseUrl()}/uploads/${relativePath.replace(/\\/g, "/")}`;
+    const url = await syncUploadedFile(req.file, "");
     res.json({ success: true, url });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });

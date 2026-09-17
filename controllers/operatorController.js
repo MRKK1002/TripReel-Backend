@@ -5,6 +5,7 @@ const {
   ALLOWED_TRANSITIONS,
   CORRECTABLE_FIELDS,
 } = require("../models/Operator");
+const { syncUploadedFile } = require("../utils/s3Storage");
 const {
   collapseSpaces,
   validatePersonName,
@@ -871,8 +872,10 @@ exports.submitOnboarding = async (req, res) => {
     // Files
     if (req.files) {
       if (req.files["governmentId"]?.[0]) {
-        operator.governmentId =
-          "/uploads/operators/" + req.files["governmentId"][0].filename;
+        operator.governmentId = await syncUploadedFile(
+          req.files["governmentId"][0],
+          "operators",
+        );
         if (!operator.documentStatus) operator.documentStatus = {};
         operator.documentStatus.governmentId = {
           status: "PENDING",
@@ -881,8 +884,10 @@ exports.submitOnboarding = async (req, res) => {
         };
       }
       if (req.files["selfieVerification"]?.[0]) {
-        operator.selfieVerification =
-          "/uploads/operators/" + req.files["selfieVerification"][0].filename;
+        operator.selfieVerification = await syncUploadedFile(
+          req.files["selfieVerification"][0],
+          "operators",
+        );
         if (!operator.documentStatus) operator.documentStatus = {};
         operator.documentStatus.selfieVerification = {
           status: "PENDING",
@@ -891,8 +896,10 @@ exports.submitOnboarding = async (req, res) => {
         };
       }
       if (req.files["tradeLicense"]?.[0]) {
-        operator.tradeLicensePath =
-          "/uploads/operators/" + req.files["tradeLicense"][0].filename;
+        operator.tradeLicensePath = await syncUploadedFile(
+          req.files["tradeLicense"][0],
+          "operators",
+        );
         if (!operator.documentStatus) operator.documentStatus = {};
         operator.documentStatus.tradeLicense = {
           status: "PENDING",
@@ -901,8 +908,10 @@ exports.submitOnboarding = async (req, res) => {
         };
       }
       if (req.files["panCard"]?.[0]) {
-        operator.panCardPath =
-          "/uploads/operators/" + req.files["panCard"][0].filename;
+        operator.panCardPath = await syncUploadedFile(
+          req.files["panCard"][0],
+          "operators",
+        );
         if (!operator.documentStatus) operator.documentStatus = {};
         operator.documentStatus.panCard = {
           status: "PENDING",
@@ -1014,8 +1023,9 @@ exports.reuploadDocument = async (req, res) => {
       tradeLicense: "tradeLicensePath",
       panCard: "panCardPath",
     };
-    // operatorUploadMiddleware stores files under /uploads/operators/
-    operator[fieldMap[key]] = "/uploads/operators/" + req.file.filename;
+    // operatorUploadMiddleware stores files under /uploads/operators/, and the
+    // S3 key mirrors that path so the private prefix check still applies.
+    operator[fieldMap[key]] = await syncUploadedFile(req.file, "operators");
     operator.documentStatus[key] = {
       status: "PENDING",
       remark: "",

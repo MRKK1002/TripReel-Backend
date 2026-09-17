@@ -12,6 +12,7 @@ const {
 } = require("../controllers/reelController");
 const Reel = require("../models/Reel");
 const { REEL_VIDEO_DIR, generateReelThumbnail } = require("../utils/reelMedia");
+const { syncUploadedFile, deleteStoredMedia } = require("../utils/s3Storage");
 
 // ── Multer storage for videos ─────────────────────────────────────────────────
 fs.mkdirSync(REEL_VIDEO_DIR, { recursive: true });
@@ -93,12 +94,8 @@ const upload = multer({
 // Uploaded/generated files are written before the database write, so discard
 // them when saving fails. This prevents failed requests leaving orphaned media.
 const discardNewFiles = async (files, extraPaths = []) => {
-  const paths = [
-    ...Object.values(files || {})
-      .flat()
-      .map((file) => file.path),
-    ...extraPaths,
-  ];
+  const uploaded = Object.values(files || {}).flat();
+  const paths = [...uploaded.map((file) => file.path), ...extraPaths];
   await Promise.all(
     [...new Set(paths.filter(Boolean))].map((filePath) =>
       fs.promises.unlink(filePath).catch(() => {
@@ -106,6 +103,17 @@ const discardNewFiles = async (files, extraPaths = []) => {
       }),
     ),
   );
+
+  // The S3 copies are written before the request can still be rejected, so the
+  // mirrored keys have to go too — otherwise every failed upload leaves a
+  // publicly cached, immutable object behind.
+  const storedValues = [
+    ...uploaded.map((file) => `/uploads/videos/${file.filename}`),
+    ...extraPaths.map((p) => `/uploads/reel-thumbnails/${path.basename(p)}`),
+  ];
+  await deleteStoredMedia(...storedValues).catch(() => {
+    /* best effort cleanup */
+  });
 };
 
 // Reject a file field that arrived as a non-file value. Axios serialises
@@ -126,12 +134,14 @@ const parseUser = (body) => {
   }
 };
 
-const applyMediaFields = (req, body) => {
+const applyMediaFields = async (req, body) => {
+  // Both fields are written into uploads/videos by the multer config above, so
+  // the S3 key mirrors that path and the stored value stays identical.
   if (req.files?.video?.[0]) {
-    body.video = `/uploads/videos/${req.files.video[0].filename}`;
+    body.video = await syncUploadedFile(req.files.video[0], "videos");
   }
   if (req.files?.thumbnail?.[0]) {
-    body.thumbnail = `/uploads/videos/${req.files.thumbnail[0].filename}`;
+    body.thumbnail = await syncUploadedFile(req.files.thumbnail[0], "videos");
   }
 
   for (const field of ["video", "thumbnail"]) {
@@ -181,7 +191,7 @@ router.post(
     let generatedThumbnail = null;
     try {
       const body = { ...req.body };
-      const invalidField = applyMediaFields(req, body);
+      const invalidField = await applyMediaFields(req, body);
       if (invalidField) {
         await discardNewFiles(req.files);
         return res.status(400).json({
@@ -228,7 +238,7 @@ router.put(
       }
 
       const body = { ...req.body };
-      const invalidField = applyMediaFields(req, body);
+      const invalidField = await applyMediaFields(req, body);
       if (invalidField) {
         await discardNewFiles(req.files);
         return res.status(400).json({

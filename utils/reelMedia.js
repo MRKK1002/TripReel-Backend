@@ -2,6 +2,11 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
+const {
+  isCloudStorageEnabled,
+  uploadFileToS3,
+  deleteStoredMedia,
+} = require("./s3Storage");
 
 const DEFAULT_UPLOAD_ROOT = path.resolve(__dirname, "..", "uploads");
 const REEL_UPLOAD_ROOT = path.resolve(
@@ -9,11 +14,16 @@ const REEL_UPLOAD_ROOT = path.resolve(
 );
 const REEL_VIDEO_DIR = path.join(REEL_UPLOAD_ROOT, "videos");
 const REEL_THUMBNAIL_DIR = path.join(REEL_UPLOAD_ROOT, "reel-thumbnails");
-const PUBLIC_UPLOAD_ROOTS = [...new Set([REEL_UPLOAD_ROOT, DEFAULT_UPLOAD_ROOT])];
+const PUBLIC_UPLOAD_ROOTS = [
+  ...new Set([REEL_UPLOAD_ROOT, DEFAULT_UPLOAD_ROOT]),
+];
 
 const isInside = (candidate, parent) => {
   const relative = path.relative(parent, candidate);
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  return (
+    relative === "" ||
+    (!relative.startsWith("..") && !path.isAbsolute(relative))
+  );
 };
 
 const ensureReelMediaDirectories = async () => {
@@ -45,7 +55,11 @@ const ownedMediaCandidates = (value) => {
   if (!match) return [];
 
   const [, directory, filename] = match;
-  if (!filename || filename !== path.basename(filename) || filename.includes("..")) {
+  if (
+    !filename ||
+    filename !== path.basename(filename) ||
+    filename.includes("..")
+  ) {
     return [];
   }
 
@@ -58,7 +72,11 @@ const ownedMediaCandidates = (value) => {
 
 const resolveOwnedReelMediaPath = (value) => {
   const candidates = ownedMediaCandidates(value);
-  return candidates.find((candidate) => fs.existsSync(candidate)) || candidates[0] || null;
+  return (
+    candidates.find((candidate) => fs.existsSync(candidate)) ||
+    candidates[0] ||
+    null
+  );
 };
 
 const removeOwnedReelMedia = async (...values) => {
@@ -67,11 +85,17 @@ const removeOwnedReelMedia = async (...values) => {
     paths.map((filePath) =>
       fs.promises.unlink(filePath).catch((error) => {
         if (error.code !== "ENOENT") {
-          console.warn(`[reels] Could not remove ${filePath}: ${error.message}`);
+          console.warn(
+            `[reels] Could not remove ${filePath}: ${error.message}`,
+          );
         }
       }),
     ),
   );
+  // Remove the S3 copies too, otherwise cloud storage accumulates orphans.
+  if (isCloudStorageEnabled()) {
+    await deleteStoredMedia(...values);
+  }
 };
 
 const runFfmpeg = (inputPath, outputPath, seekSeconds) =>
@@ -140,7 +164,9 @@ const generateReelThumbnail = async (inputPath) => {
   const allowedVideoDirs = PUBLIC_UPLOAD_ROOTS.map((root) =>
     path.resolve(root, "videos"),
   );
-  if (!allowedVideoDirs.some((directory) => isInside(resolvedInput, directory))) {
+  if (
+    !allowedVideoDirs.some((directory) => isInside(resolvedInput, directory))
+  ) {
     throw new Error("Reel thumbnail input must be an owned video upload.");
   }
 
@@ -161,9 +187,22 @@ const generateReelThumbnail = async (inputPath) => {
         throw new Error("FFmpeg produced an empty thumbnail.");
       }
       await fs.promises.rename(temporaryPath, finalPath);
+
+      // Mirror the generated thumbnail into S3 using the same key layout, so
+      // both the live upload path and the backfill script publish to the CDN.
+      // A failure here must propagate: behind a CDN the local copy is never read.
+      const key = `uploads/reel-thumbnails/${filename}`;
+      if (isCloudStorageEnabled()) {
+        await uploadFileToS3({
+          filePath: finalPath,
+          key,
+          contentType: "image/jpeg",
+        });
+      }
+
       return {
         absolutePath: finalPath,
-        publicPath: `/uploads/reel-thumbnails/${filename}`,
+        publicPath: `/${key}`,
       };
     } catch (error) {
       lastError = error;

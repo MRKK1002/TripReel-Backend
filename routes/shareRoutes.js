@@ -1,6 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const Package = require("../models/Package");
+const { absoluteMediaUrl } = require("../utils/s3Storage");
 
 // Store links (override via env once the apps are published)
 const ANDROID_STORE_URL =
@@ -36,7 +37,9 @@ router.get("/package/:id", async (req, res) => {
   const price = pkg?.pricing?.adultPrice
     ? `From ₹${Number(pkg.pricing.adultPrice).toLocaleString("en-IN")}`
     : "";
-  const image = esc(pkg?.image_url || "");
+  // og:image requires an absolute URL. Stored media is a relative
+  // "/uploads/..." path, so resolve it against the CDN (or this API host).
+  const image = esc(absoluteMediaUrl(pkg?.image_url));
   // Preserve an abandoned-booking intent id so the app can resume the draft.
   const intentId =
     typeof req.query.intent === "string"

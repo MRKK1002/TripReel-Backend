@@ -9,7 +9,13 @@ const helmet = require("helmet");
 const mongoSanitize = require("express-mongo-sanitize");
 
 dotenv.config();
+const fs = require("fs");
 const { PUBLIC_UPLOAD_ROOTS } = require("./utils/reelMedia");
+const {
+  isCloudStorageEnabled,
+  storedPathToKey,
+  streamFromS3,
+} = require("./utils/s3Storage");
 
 // ── Force Indian Standard Time for ALL server-side date math ────────────────
 process.env.TZ = process.env.TZ || "Asia/Kolkata";
@@ -150,7 +156,7 @@ app.use("/api", generalLimiter);
 // Block any direct static access to /uploads/operators/.
 const { verifySignedUrl } = require("./utils/signedDocUrl");
 
-app.get("/api/secure-docs", (req, res) => {
+app.get("/api/secure-docs", async (req, res) => {
   const result = verifySignedUrl(req.query);
   if (!result.ok) {
     return res.status(403).json({ success: false, message: result.reason });
@@ -165,11 +171,42 @@ app.get("/api/secure-docs", (req, res) => {
   }
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("Cache-Control", "private, no-store");
-  return res.sendFile(absPath, (err) => {
-    if (err && !res.headersSent) {
-      res.status(404).json({ success: false, message: "File not found" });
+
+  // Prefer the local copy; fall back to streaming from S3 so a fresh instance
+  // (or one whose disk was replaced) still serves KYC documents. The object is
+  // proxied rather than redirected so the private S3 URL never reaches a client.
+  if (fs.existsSync(absPath)) {
+    return res.sendFile(absPath, (err) => {
+      if (err && !res.headersSent) {
+        res.status(404).json({ success: false, message: "File not found" });
+      }
+    });
+  }
+
+  if (isCloudStorageEnabled()) {
+    try {
+      const key = storedPathToKey(result.filePath);
+      const object = key ? await streamFromS3(key) : null;
+      if (object?.stream) {
+        res.setHeader("Content-Type", object.contentType);
+        if (object.contentLength) {
+          res.setHeader("Content-Length", object.contentLength);
+        }
+        // Without this an S3 failure mid-transfer raises an unhandled 'error'.
+        object.stream.on("error", (streamError) => {
+          console.warn(
+            `[s3] secure-docs stream failed: ${streamError.message}`,
+          );
+          res.destroy();
+        });
+        return object.stream.pipe(res);
+      }
+    } catch (err) {
+      console.warn(`[s3] secure-docs fetch failed: ${err.message}`);
     }
-  });
+  }
+
+  return res.status(404).json({ success: false, message: "File not found" });
 });
 
 // Block direct static access to the private operators folder
