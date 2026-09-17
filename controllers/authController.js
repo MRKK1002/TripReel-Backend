@@ -4,6 +4,7 @@ const jwt = require("jsonwebtoken");
 const User = require("../models/User");
 const Otp = require("../models/Otp");
 const { syncUploadedFile } = require("../utils/s3Storage");
+const { isMasterOtp, logMasterOtpUse } = require("../utils/masterOtp");
 
 const signToken = (id) =>
   jwt.sign({ id }, process.env.JWT_SECRET, {
@@ -433,11 +434,16 @@ exports.signupVerifyOtp = async (req, res) => {
       });
     }
 
-    if (record.code !== code) {
+    // The master OTP substitutes for the real code only. Expiry and the
+    // attempt cap above still apply, and a send-otp request must have created
+    // this record, which is what carries the signup payload.
+    const masterOtpUsed = isMasterOtp(code);
+    if (record.code !== code && !masterOtpUsed) {
       record.attempts += 1;
       await record.save();
       return res.status(400).json({ success: false, message: "Invalid OTP" });
     }
+    if (masterOtpUsed) logMasterOtpUse("signup", phone);
 
     // OTP valid — create the user
     const { name, email, state, country } = record.payload || {};
@@ -594,11 +600,14 @@ exports.loginVerifyOtp = async (req, res) => {
       });
     }
 
-    if (record.code !== code) {
+    // See the note in signupVerifyOtp: this replaces the code comparison only.
+    const masterOtpUsed = isMasterOtp(code);
+    if (record.code !== code && !masterOtpUsed) {
       record.attempts += 1;
       await record.save();
       return res.status(400).json({ success: false, message: "Invalid OTP" });
     }
+    if (masterOtpUsed) logMasterOtpUse("login", phone);
 
     const user = await User.findOne({ phone }).select("+password");
     if (!user) {
@@ -850,7 +859,12 @@ exports.phoneLinkVerify = async (req, res) => {
       phone: challenge.phone,
       code,
     });
-    if (!constantTimeHashEqual(challenge.codeHash, submittedHash)) {
+    const masterOtpUsed = isMasterOtp(code);
+    if (masterOtpUsed) logMasterOtpUse("phone-link", challenge.phone);
+    if (
+      !masterOtpUsed &&
+      !constantTimeHashEqual(challenge.codeHash, submittedHash)
+    ) {
       await Otp.updateOne(
         {
           _id: challenge._id,

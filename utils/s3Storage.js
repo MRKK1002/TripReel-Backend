@@ -17,8 +17,10 @@
  *    for the FFmpeg reel-thumbnail step.
  *
  * 3. Public objects are read through CloudFront. Private objects (operator KYC)
- *    are read through short-lived S3 presigned GET URLs, so no CloudFront key
- *    pair or private-key PEM has to live on the server.
+ *    are NOT given a direct URL at all: they are streamed back through the
+ *    authenticated /api/secure-docs route via streamFromS3, so no CloudFront key
+ *    pair, private-key PEM, or presigned URL has to exist. CloudFront must also
+ *    deny "/uploads/operators/*" so the CDN can never expose them.
  *
  * 4. If the bucket is not configured the module reports disabled and every
  *    caller falls back to the existing local-disk behaviour.
@@ -41,10 +43,9 @@ const AWS_REGION = (process.env.AWS_REGION || "ap-south-1").trim();
 const CDN_DOMAIN_RAW = (process.env.CLOUDFRONT_DOMAIN || "").trim();
 
 // Everything under this key prefix is private and never served via CloudFront.
+// These objects are streamed through the authenticated /api/secure-docs route,
+// so there is no expiring URL and therefore no TTL to configure.
 const PRIVATE_KEY_PREFIX = "uploads/operators/";
-const PRIVATE_URL_TTL_SECONDS = Number(
-  process.env.PRIVATE_MEDIA_URL_TTL_SECONDS || 3600,
-);
 
 // Normalise the CDN base once: strip trailing slashes, ensure a scheme.
 const CDN_BASE = (() => {
@@ -320,7 +321,6 @@ module.exports = {
   AWS_REGION,
   CDN_BASE,
   PRIVATE_KEY_PREFIX,
-  PRIVATE_URL_TTL_SECONDS,
   isCloudStorageEnabled,
   isCdnConfigured,
   isPrivateKey,
