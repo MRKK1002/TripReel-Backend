@@ -16,6 +16,10 @@ yarn-error.log*
 .env.staging
 .env.*.local
 .env.backup
+# Editor/CLI backups of the env file — these contain real secrets.
+.env.save
+.env.save.*
+.env.bak
 
 # Firebase service account keys (JSON credentials)
 *serviceAccount*.json
@@ -64,6 +68,10 @@ ehthumbs.db
 # ========================
 # Uploads / User content
 # ========================
+# Never commit user media. uploads/operators/ holds operator KYC documents
+# (ID proofs, bank papers), so an accidental "git add -A" would publish
+# personal data into the repository. Media lives on disk and in S3, never here.
+uploads/
 
 temp/
 tmp/
