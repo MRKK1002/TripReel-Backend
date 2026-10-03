@@ -495,7 +495,6 @@ exports.forgotPassword = async (req, res) => {
       method === "phone"
         ? {
             phone: { $in: operatorPhoneVariants(normalizedValue) },
-            phoneVerified: true,
           }
         : { email: normalizedValue };
     const operator = await Operator.findOne(query);
@@ -585,7 +584,6 @@ exports.resetPassword = async (req, res) => {
       method === "phone"
         ? {
             phone: { $in: operatorPhoneVariants(normalizedValue) },
-            phoneVerified: true,
           }
         : { email: normalizedValue };
     const operator = await Operator.findOne(query).select("+password");

@@ -114,6 +114,81 @@ exports.getRevenueDashboard = async (req, res) => {
     const totalBookings = await TripBooking.countDocuments();
     const totalCancellations = cancelledBookings.length;
 
+    // Escrow / Held Funds (confirmed bookings awaiting trip completion)
+    const activeConfirmedBookings = allBookings.filter(
+      (b) => b.status === "CONFIRMED",
+    );
+    const escrowHeldAmount = activeConfirmedBookings.reduce(
+      (s, b) => s + (b.pricing?.operatorAmount || 0),
+      0,
+    );
+
+    // Operator Onboarding & Withdrawal Pipeline
+    let pendingOperatorsCount = 0;
+    try {
+      pendingOperatorsCount = await Operator.countDocuments({
+        onboardingState: "PENDING_APPROVAL",
+      });
+    } catch {}
+
+    let pendingWithdrawalsCount = 0;
+    let pendingWithdrawalsAmount = 0;
+    try {
+      const Withdrawal = require("../models/Withdrawal");
+      const pendingWithdrawalsDocs = await Withdrawal.find({
+        status: { $in: ["PENDING", "PROCESSING"] },
+      }).lean();
+      pendingWithdrawalsCount = pendingWithdrawalsDocs.length;
+      pendingWithdrawalsAmount = pendingWithdrawalsDocs.reduce(
+        (s, w) => s + (w.amount || 0),
+        0,
+      );
+    } catch {}
+
+    // Support reports count
+    let openReportsCount = 0;
+    try {
+      const mongoose = require("mongoose");
+      const Report = mongoose.models.Report;
+      if (Report) {
+        openReportsCount = await Report.countDocuments({
+          status: { $in: ["open", "in_progress"] },
+        });
+      }
+    } catch {}
+
+    // Platform performance metrics
+    const platformMarginPercent =
+      totalRevenue > 0
+        ? Number(((totalPlatformEarnings / totalRevenue) * 100).toFixed(1))
+        : 0;
+    const averageOrderValue =
+      allBookings.length > 0
+        ? Math.round(totalRevenue / allBookings.length)
+        : 0;
+
+    // Repeat traveler rate
+    const userBookingCounts = {};
+    allBookings.forEach((b) => {
+      const uid = b.userId?.toString();
+      if (uid) userBookingCounts[uid] = (userBookingCounts[uid] || 0) + 1;
+    });
+    const repeatTravelersCount = Object.values(userBookingCounts).filter(
+      (c) => c >= 2,
+    ).length;
+
+    // Funnel views & wishlists
+    let totalPackageViews = 0;
+    try {
+      const PackageView = require("../models/PackageView");
+      totalPackageViews = await PackageView.countDocuments();
+    } catch {}
+    let totalWishlists = 0;
+    try {
+      const Wishlist = require("../models/Wishlist");
+      totalWishlists = await Wishlist.countDocuments();
+    } catch {}
+
     // Top operators by revenue
     const operatorRevenue = {};
     allBookings.forEach((b) => {
@@ -147,6 +222,16 @@ exports.getRevenueDashboard = async (req, res) => {
         totalGstCollected,
         totalSnapjaPayouts,
         netPlatformProfit,
+        escrowHeldAmount,
+        pendingOperatorsCount,
+        pendingWithdrawalsCount,
+        pendingWithdrawalsAmount,
+        openReportsCount,
+        platformMarginPercent,
+        averageOrderValue,
+        repeatTravelersCount,
+        totalPackageViews,
+        totalWishlists,
         thisMonthRevenue,
         thisMonthPlatformFee,
         lastMonthRevenue,
