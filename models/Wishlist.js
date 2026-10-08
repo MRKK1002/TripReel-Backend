@@ -18,6 +18,11 @@ const wishlistSchema = new mongoose.Schema(
                 ref: 'Package',
             },
         ],
+        packageDates: {
+            type: Map,
+            of: Date,
+            default: () => ({}),
+        },
         location: {
             type: String,
             default: '',

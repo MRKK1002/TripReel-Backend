@@ -32,11 +32,33 @@ exports.getMyWishlists = async (req, res) => {
     const wishlists = await Wishlist.find({ user: req.user.id })
       .populate({
         path: "packages",
-        select: "title image_url images price location isActive",
+        select: "title image_url images price location isActive createdAt updatedAt",
         match: { isActive: true },
       })
       .sort({ createdAt: -1 });
-    res.json({ success: true, count: wishlists.length, wishlists });
+
+    const formattedWishlists = wishlists.map(wl => {
+      const wlObj = wl.toObject ? wl.toObject() : wl;
+      const packageDates = wlObj.packageDates || {};
+      if (Array.isArray(wlObj.packages)) {
+        wlObj.packages = wlObj.packages.map(pkg => {
+          if (!pkg || typeof pkg !== "object") return pkg;
+          const pkgIdStr = pkg._id ? pkg._id.toString() : String(pkg);
+          const addedAt =
+            packageDates[pkgIdStr] ||
+            wlObj.updatedAt ||
+            wlObj.createdAt ||
+            new Date();
+          return {
+            ...pkg,
+            addedAt,
+          };
+        });
+      }
+      return wlObj;
+    });
+
+    res.json({ success: true, count: formattedWishlists.length, wishlists: formattedWishlists });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -61,6 +83,7 @@ exports.createWishlist = async (req, res) => {
         .slice(0, 100),
       image: String(req.body.image || "").trim(),
       packages: [],
+      packageDates: {},
     });
     res.status(201).json({ success: true, wishlist });
   } catch (err) {
@@ -72,17 +95,40 @@ exports.createWishlist = async (req, res) => {
 exports.addPackageToWishlist = async (req, res) => {
   try {
     const { packageId } = req.body;
+    const now = new Date();
     const wishlist = await Wishlist.findOneAndUpdate(
       { _id: req.params.id, user: req.user.id },
-      { $addToSet: { packages: packageId } },
+      {
+        $addToSet: { packages: packageId },
+        $set: { [`packageDates.${packageId}`]: now },
+      },
       { new: true },
-    ).populate("packages", "title image_url images price location");
+    ).populate("packages", "title image_url images price location createdAt updatedAt");
 
     if (!wishlist)
       return res
         .status(404)
         .json({ success: false, message: "Wishlist not found" });
-    res.json({ success: true, wishlist });
+
+    const wlObj = wishlist.toObject ? wishlist.toObject() : wishlist;
+    const packageDates = wlObj.packageDates || {};
+    if (Array.isArray(wlObj.packages)) {
+      wlObj.packages = wlObj.packages.map(pkg => {
+        if (!pkg || typeof pkg !== "object") return pkg;
+        const pkgIdStr = pkg._id ? pkg._id.toString() : String(pkg);
+        const addedAt =
+          packageDates[pkgIdStr] ||
+          wlObj.updatedAt ||
+          wlObj.createdAt ||
+          now;
+        return {
+          ...pkg,
+          addedAt,
+        };
+      });
+    }
+
+    res.json({ success: true, wishlist: wlObj });
   } catch (err) {
     res.status(400).json({ success: false, message: err.message });
   }
@@ -93,9 +139,12 @@ exports.removePackageFromWishlist = async (req, res) => {
   try {
     const wishlist = await Wishlist.findOneAndUpdate(
       { _id: req.params.id, user: req.user.id },
-      { $pull: { packages: req.params.packageId } },
+      {
+        $pull: { packages: req.params.packageId },
+        $unset: { [`packageDates.${req.params.packageId}`]: "" },
+      },
       { new: true },
-    ).populate("packages", "title image_url images price location");
+    ).populate("packages", "title image_url images price location createdAt updatedAt");
 
     if (!wishlist)
       return res
