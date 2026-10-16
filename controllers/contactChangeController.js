@@ -17,7 +17,7 @@ const User = require("../models/User");
 const Otp = require("../models/Otp");
 
 const OTP_TTL_MINUTES = 5;
-const OTP_MAX_ATTEMPTS = 5;
+const OTP_MAX_ATTEMPTS = 3;
 const RESEND_SECONDS = 30;
 const RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000;
 const RATE_LIMIT_MAX = 3;
@@ -366,17 +366,29 @@ const verifyCurrent = async (req, res, kind) => {
       code,
     });
     if (!constantTimeHashEqual(challenge.codeHash, submitted)) {
-      await Otp.updateOne(
+      const updatedOtp = await Otp.findOneAndUpdate(
         {
           _id: challenge._id,
           active: true,
           attempts: { $lt: OTP_MAX_ATTEMPTS },
         },
         { $inc: { attempts: 1 } },
+        { new: true },
       );
-      return res
-        .status(400)
-        .json({ success: false, message: "Invalid verification code." });
+      const remaining = Math.max(0, OTP_MAX_ATTEMPTS - (updatedOtp?.attempts || OTP_MAX_ATTEMPTS));
+      if (remaining === 0) {
+        await Otp.updateOne({ _id: challenge._id }, { $set: { active: false } });
+        return res.status(400).json({
+          success: false,
+          message: "Too many invalid attempts. Please request a new code.",
+          attemptsLeft: 0,
+        });
+      }
+      return res.status(400).json({
+        success: false,
+        message: `Invalid verification code. ${remaining} attempt${remaining === 1 ? "" : "s"} left.`,
+        attemptsLeft: remaining,
+      });
     }
 
     const changeToken = crypto.randomUUID();
@@ -570,17 +582,29 @@ const confirmChange = async (req, res, kind) => {
       code,
     });
     if (!constantTimeHashEqual(challenge.codeHash, submitted)) {
-      await Otp.updateOne(
+      const updatedOtp = await Otp.findOneAndUpdate(
         {
           _id: challenge._id,
           active: true,
           attempts: { $lt: OTP_MAX_ATTEMPTS },
         },
         { $inc: { attempts: 1 } },
+        { new: true },
       );
-      return res
-        .status(400)
-        .json({ success: false, message: "Invalid verification code." });
+      const remaining = Math.max(0, OTP_MAX_ATTEMPTS - (updatedOtp?.attempts || OTP_MAX_ATTEMPTS));
+      if (remaining === 0) {
+        await Otp.updateOne({ _id: challenge._id }, { $set: { active: false } });
+        return res.status(400).json({
+          success: false,
+          message: "Too many invalid attempts. Please request a new code.",
+          attemptsLeft: 0,
+        });
+      }
+      return res.status(400).json({
+        success: false,
+        message: `Invalid verification code. ${remaining} attempt${remaining === 1 ? "" : "s"} left.`,
+        attemptsLeft: remaining,
+      });
     }
 
     // Re-check ownership at commit time — someone may have taken it meanwhile.

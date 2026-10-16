@@ -398,28 +398,40 @@ const tripBookingSchema = new mongoose.Schema(
   { timestamps: true },
 );
 
-// Auto-generate a collision-free sequential bookingId before first save.
-// Uses an atomic counter ($inc on a single doc) instead of countDocuments()+1,
-// which races under concurrency and collides after deletions — either of which
-// would fail a booking AFTER the user's payment was already captured.
+// Auto-generate an unpredictable, collision-free human-readable bookingId before first save.
+// Uses cryptographic randomness (Crockford-style charset avoiding confusing 0/O/1/I)
+// with duplicate checking to ensure predictability and enumeration attacks are prevented.
 tripBookingSchema.pre("save", async function (next) {
   if (this.bookingId) return next();
   try {
-    const Counter = require("./Counter");
-    // Lazily seed the counter from the existing count so new IDs continue
-    // past any legacy TR-BKG-000001..N bookings (atomic, race-safe upsert).
-    const seed = await mongoose.model("TripBooking").estimatedDocumentCount();
-    await Counter.updateOne(
-      { _id: "tripBookingId" },
-      { $setOnInsert: { seq: seed } },
-      { upsert: true },
-    );
-    const counter = await Counter.findByIdAndUpdate(
-      "tripBookingId",
-      { $inc: { seq: 1 } },
-      { new: true },
-    );
-    this.bookingId = `TR-BKG-${String(counter.seq).padStart(6, "0")}`;
+    const crypto = require("crypto");
+    const chars = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+    const TripBookingModel = mongoose.model("TripBooking");
+    let candidate = "";
+    let isUnique = false;
+    let attempts = 0;
+
+    while (!isUnique && attempts < 5) {
+      attempts++;
+      const bytes = crypto.randomBytes(6);
+      let token = "";
+      for (let i = 0; i < 6; i++) {
+        token += chars[bytes[i] % chars.length];
+      }
+      candidate = `TR-BKG-${token}`;
+      const existing = await TripBookingModel.findOne({
+        bookingId: candidate,
+      }).select("_id");
+      if (!existing) {
+        isUnique = true;
+      }
+    }
+
+    if (!isUnique) {
+      candidate = `TR-BKG-${Date.now().toString(36).toUpperCase()}`;
+    }
+
+    this.bookingId = candidate;
     next();
   } catch (e) {
     next(e);

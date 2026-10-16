@@ -88,7 +88,7 @@ const DEFAULTS = [
   {
     key: "default_refund_policy",
     value:
-      "Refunds are processed within 7-10 business days to the original payment method.",
+      "Refunds are processed within 2–4 business days to the original payment method.",
     label: "Default Refund Policy",
   },
   {

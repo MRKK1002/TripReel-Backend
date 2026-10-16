@@ -155,7 +155,13 @@ function initSocket(httpServer) {
         }
 
         // Emit to conversation room (both parties see it)
-        io.to(`conv_${conversationId}`).emit("new_message", message);
+        const messagePayload = message.toObject
+          ? message.toObject()
+          : { ...message._doc };
+        if (data.clientTempId) {
+          messagePayload.clientTempId = data.clientTempId;
+        }
+        io.to(`conv_${conversationId}`).emit("new_message", messagePayload);
 
         // Also emit to the other party's personal room (for notification badge)
         if (senderType === "user") {

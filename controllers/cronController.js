@@ -70,6 +70,153 @@ async function refundPercentForDate(startDate) {
   return 0;
 }
 
+const CITY_CENTROID_COORDINATES = {
+  goa: { lat: 15.4989, lng: 73.8278, city: "Goa" },
+  panaji: { lat: 15.4989, lng: 73.8278, city: "Goa" },
+  calangute: { lat: 15.5439, lng: 73.7553, city: "Goa" },
+  baga: { lat: 15.5523, lng: 73.7517, city: "Goa" },
+  anjuna: { lat: 15.5841, lng: 73.7439, city: "Goa" },
+  manali: { lat: 32.2396, lng: 77.1887, city: "Manali" },
+  rishikesh: { lat: 30.0869, lng: 78.2676, city: "Rishikesh" },
+  shimla: { lat: 31.1048, lng: 77.1734, city: "Shimla" },
+  jaipur: { lat: 26.9124, lng: 75.7873, city: "Jaipur" },
+  udaipur: { lat: 24.5854, lng: 73.7125, city: "Udaipur" },
+  jodhpur: { lat: 26.2389, lng: 73.0243, city: "Jodhpur" },
+  kerala: { lat: 9.9312, lng: 76.2673, city: "Kerala" },
+  kochi: { lat: 9.9312, lng: 76.2673, city: "Kochi" },
+  munnar: { lat: 10.0889, lng: 77.0595, city: "Munnar" },
+  ooty: { lat: 11.4102, lng: 76.695, city: "Ooty" },
+  coorg: { lat: 12.3375, lng: 75.8069, city: "Coorg" },
+  bangalore: { lat: 12.9716, lng: 77.5946, city: "Bangalore" },
+  bengaluru: { lat: 12.9716, lng: 77.5946, city: "Bangalore" },
+  mumbai: { lat: 19.076, lng: 72.8777, city: "Mumbai" },
+  delhi: { lat: 28.6139, lng: 77.209, city: "Delhi" },
+  hyderabad: { lat: 17.385, lng: 78.4867, city: "Hyderabad" },
+  chennai: { lat: 13.0827, lng: 80.2707, city: "Chennai" },
+  kolkata: { lat: 22.5726, lng: 88.3639, city: "Kolkata" },
+  agra: { lat: 27.1767, lng: 78.0081, city: "Agra" },
+  varanasi: { lat: 25.3176, lng: 82.9739, city: "Varanasi" },
+  ladakh: { lat: 34.1526, lng: 77.5771, city: "Leh" },
+  leh: { lat: 34.1526, lng: 77.5771, city: "Leh" },
+  kashmir: { lat: 34.0837, lng: 74.7973, city: "Srinagar" },
+  srinagar: { lat: 34.0837, lng: 74.7973, city: "Srinagar" },
+  pondicherry: { lat: 11.9416, lng: 79.8083, city: "Pondicherry" },
+  darjeeling: { lat: 27.041, lng: 88.2663, city: "Darjeeling" },
+  gokarna: { lat: 14.5479, lng: 74.3188, city: "Gokarna" },
+  wayanad: { lat: 11.6854, lng: 76.132, city: "Wayanad" },
+  alleppey: { lat: 9.4981, lng: 76.3388, city: "Alleppey" },
+  hampi: { lat: 15.335, lng: 76.46, city: "Hampi" },
+  kasol: { lat: 32.01, lng: 77.315, city: "Kasol" },
+  dharamshala: { lat: 32.219, lng: 76.3234, city: "Dharamshala" },
+  andaman: { lat: 11.6234, lng: 92.7265, city: "Port Blair" },
+  // ── Karnataka weekend / day-trip belt (Bangalore catchment) ────────────────
+  "nandi hills": { lat: 13.3702, lng: 77.6835, city: "Nandi Hills" },
+  nandihills: { lat: 13.3702, lng: 77.6835, city: "Nandi Hills" },
+  chikkaballapur: { lat: 13.4355, lng: 77.7315, city: "Chikkaballapur" },
+  chikballapur: { lat: 13.4355, lng: 77.7315, city: "Chikkaballapur" },
+  mysore: { lat: 12.2958, lng: 76.6394, city: "Mysore" },
+  mysuru: { lat: 12.2958, lng: 76.6394, city: "Mysore" },
+  chikmagalur: { lat: 13.3161, lng: 75.772, city: "Chikmagalur" },
+  kemmangundi: { lat: 13.55, lng: 75.75, city: "Kemmangundi" },
+  dandeli: { lat: 15.2667, lng: 74.6167, city: "Dandeli" },
+  udupi: { lat: 13.3409, lng: 74.7421, city: "Udupi" },
+  murudeshwar: { lat: 14.0944, lng: 74.4845, city: "Murudeshwar" },
+  jog: { lat: 14.2295, lng: 74.8158, city: "Jog Falls" },
+  shimoga: { lat: 13.9299, lng: 75.5681, city: "Shivamogga" },
+  shivamogga: { lat: 13.9299, lng: 75.5681, city: "Shivamogga" },
+  halebidu: { lat: 13.2159, lng: 75.9922, city: "Halebidu" },
+  belur: { lat: 13.1627, lng: 75.8655, city: "Belur" },
+  bandipur: { lat: 11.6667, lng: 76.6333, city: "Bandipur" },
+  nagarhole: { lat: 11.9843, lng: 76.3543, city: "Nagarhole" },
+  kabini: { lat: 11.9843, lng: 76.3543, city: "Kabini" },
+  coonoor: { lat: 11.3531, lng: 76.7959, city: "Coonoor" },
+  kotagiri: { lat: 11.4206, lng: 76.8655, city: "Kotagiri" },
+  kodaikanal: { lat: 10.2381, lng: 77.4892, city: "Kodaikanal" },
+  yercaud: { lat: 11.7753, lng: 78.2096, city: "Yercaud" },
+  yelagiri: { lat: 12.5844, lng: 78.6408, city: "Yelagiri" },
+  horsley: { lat: 13.6677, lng: 78.3852, city: "Horsley Hills" },
+  araku: { lat: 18.3276, lng: 82.8772, city: "Araku" },
+  visakhapatnam: { lat: 17.6868, lng: 83.2185, city: "Visakhapatnam" },
+  vizag: { lat: 17.6868, lng: 83.2185, city: "Visakhapatnam" },
+  tirupati: { lat: 13.6288, lng: 79.4192, city: "Tirupati" },
+  srisailam: { lat: 16.0744, lng: 78.8685, city: "Srisailam" },
+  // ── Kerala / Tamil Nadu ───────────────────────────────────────────────────
+  thekkady: { lat: 9.5866, lng: 77.1573, city: "Thekkady" },
+  vagamon: { lat: 9.6879, lng: 76.9067, city: "Vagamon" },
+  kumarakom: { lat: 9.6177, lng: 76.4275, city: "Kumarakom" },
+  varkala: { lat: 8.7379, lng: 76.7163, city: "Varkala" },
+  kovalam: { lat: 8.4004, lng: 76.9787, city: "Kovalam" },
+  athirappilly: { lat: 10.2863, lng: 76.5697, city: "Athirappilly" },
+  thenmala: { lat: 8.9506, lng: 77.0653, city: "Thenmala" },
+  rameswaram: { lat: 9.2876, lng: 79.3129, city: "Rameswaram" },
+  kanyakumari: { lat: 8.0883, lng: 77.5385, city: "Kanyakumari" },
+  mahabalipuram: { lat: 12.6208, lng: 80.1945, city: "Mahabalipuram" },
+  thanjavur: { lat: 10.787, lng: 79.1378, city: "Thanjavur" },
+  tiruvannamalai: { lat: 12.2253, lng: 79.0747, city: "Tiruvannamalai" },
+  // ── Himalaya / North ──────────────────────────────────────────────────────
+  mussoorie: { lat: 30.4599, lng: 78.0664, city: "Mussoorie" },
+  auli: { lat: 30.5282, lng: 79.5684, city: "Auli" },
+  corbett: { lat: 29.53, lng: 78.7747, city: "Jim Corbett" },
+  nainital: { lat: 29.3803, lng: 79.4636, city: "Nainital" },
+  ranthambore: { lat: 26.0173, lng: 76.5026, city: "Ranthambore" },
+  pushkar: { lat: 26.4899, lng: 74.5511, city: "Pushkar" },
+  "mount abu": { lat: 24.5926, lng: 72.7156, city: "Mount Abu" },
+  spiti: { lat: 32.2464, lng: 78.0716, city: "Spiti" },
+  kaza: { lat: 32.2464, lng: 78.0716, city: "Kaza" },
+  bir: { lat: 32.0333, lng: 76.7167, city: "Bir Billing" },
+  palampur: { lat: 32.1109, lng: 76.5363, city: "Palampur" },
+  kufri: { lat: 31.0977, lng: 77.2674, city: "Kufri" },
+  chail: { lat: 30.9869, lng: 77.1876, city: "Chail" },
+  // ── North-East ────────────────────────────────────────────────────────────
+  tawang: { lat: 27.5859, lng: 91.8594, city: "Tawang" },
+  shillong: { lat: 25.5788, lng: 91.8933, city: "Shillong" },
+  cherrapunji: { lat: 25.2841, lng: 91.7231, city: "Cherrapunji" },
+  kaziranga: { lat: 26.5775, lng: 93.1711, city: "Kaziranga" },
+  gangtok: { lat: 27.3389, lng: 88.6065, city: "Gangtok" },
+  pelling: { lat: 27.3, lng: 88.2333, city: "Pelling" },
+  lachung: { lat: 27.6, lng: 88.65, city: "Lachung" },
+  ziro: { lat: 27.5, lng: 93.8333, city: "Ziro" },
+};
+
+function resolveFallbackCoordinates(placeNameOrCity, pkg = {}) {
+  const haystack = `${placeNameOrCity || ""} ${pkg.location || ""} ${pkg.destination || ""} ${pkg.state || ""} ${pkg.city || ""} ${pkg.title || ""}`.toLowerCase();
+  for (const [key, coords] of Object.entries(CITY_CENTROID_COORDINATES)) {
+    if (haystack.includes(key)) {
+      return {
+        lat: coords.lat,
+        lng: coords.lng,
+        placeName: placeNameOrCity || coords.city || pkg.location || "India",
+      };
+    }
+  }
+
+  // Nothing matched. Prefer the package's own coordinates if it carries any,
+  // otherwise warn loudly before falling back to a neutral centroid — a
+  // mis-targeted creator search is far harder to notice than a log line.
+  const isUsableCoord = v => {
+    const n = Number(v);
+    return Number.isFinite(n) && n !== 0;
+  };
+  const pkgLat = pkg.lat ?? pkg.latitude ?? pkg.location?.lat;
+  const pkgLng = pkg.lng ?? pkg.longitude ?? pkg.location?.lng;
+  if (isUsableCoord(pkgLat) && isUsableCoord(pkgLng)) {
+    return {
+      lat: Number(pkgLat),
+      lng: Number(pkgLng),
+      placeName: placeNameOrCity || pkg.location || "India",
+    };
+  }
+
+  console.warn(
+    `[SNAPJA DISPATCH] No coordinates found for "${placeNameOrCity || pkg.title || "unknown"}" — using default centroid. Add this place to CITY_CENTROID_COORDINATES.`,
+  );
+  return {
+    lat: 15.4989,
+    lng: 73.8278,
+    placeName: placeNameOrCity || pkg.location || "Goa, India",
+  };
+}
+
 async function dispatchCanonicalEntries({ booking, pkg, user, results }) {
   const {
     parseStrictTime,
@@ -84,6 +231,20 @@ async function dispatchCanonicalEntries({ booking, pkg, user, results }) {
     const key = entry?.key;
     const location = entry?.location || {};
     if (!key || snapjaBookings[key]?.bookingId) continue;
+
+    // Fallback coordinates if package lacks exact coordinates
+    if (!validCoordinates(location.lat, location.lng)) {
+      const fallback = resolveFallbackCoordinates(location.placeName, pkg);
+      location.lat = fallback.lat;
+      location.lng = fallback.lng;
+      if (!String(location.placeName || "").trim()) {
+        location.placeName = fallback.placeName;
+      }
+    }
+    if (!parseStrictTime(entry.time)) {
+      entry.time = "10:00";
+    }
+
     if (
       !entry.date ||
       !parseStrictTime(entry.time) ||
@@ -546,17 +707,22 @@ async function runSnapjaDispatch(bookingId = null) {
                   service_type: serviceType,
                   // Send location as an object so lat/lng survive — Snapja only
                   // reads location.lat/lng and ignores top-level latitude/longitude.
-                  location: {
-                    address: location,
-                    lat:
+                  location: (() => {
+                    const fallback = resolveFallbackCoordinates(location, pkg);
+                    const rawLat =
                       bookingType === "instant"
                         ? Number(sched.lat)
-                        : Number(sched.lat ?? dayInfo?.pickupLat ?? 0),
-                    lng:
+                        : Number(sched.lat ?? dayInfo?.pickupLat ?? 0);
+                    const rawLng =
                       bookingType === "instant"
                         ? Number(sched.lng)
-                        : Number(sched.lng ?? dayInfo?.pickupLng ?? 0),
-                  },
+                        : Number(sched.lng ?? dayInfo?.pickupLng ?? 0);
+                    return {
+                      address: location || fallback.placeName,
+                      lat: rawLat !== 0 && Number.isFinite(rawLat) ? rawLat : fallback.lat,
+                      lng: rawLng !== 0 && Number.isFinite(rawLng) ? rawLng : fallback.lng,
+                    };
+                  })(),
                   price: addonPrice,
                   duration: 1,
                   date: actualDate,

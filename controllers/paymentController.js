@@ -20,6 +20,7 @@ function getRazorpay() {
   }
   return razorpay;
 }
+exports.getRazorpay = getRazorpay;
 
 const RELEASE_OUTCOMES = new Set(["user_closed", "definitive_decline"]);
 const PROTECTED_PAYMENT_STATUSES = new Set([
@@ -396,12 +397,62 @@ exports.createOrder = async (req, res) => {
         createdAt: { $gte: new Date(Date.now() - GUARD_WINDOW_MS) },
       });
       if (existing) {
-        return res.status(409).json({
-          success: false,
-          message:
-            "A payment is already in progress for this trip. Please complete or wait a moment before trying again.",
-          existingOrderId: existing.razorpayOrderId,
-        });
+        // Inspect provider order status to verify if payment was actually collected or abandoned
+        try {
+          const rzp = getRazorpay();
+          const rzpOrder = await rzp.orders.fetch(existing.razorpayOrderId);
+          if (rzpOrder && rzpOrder.status === "paid") {
+            const paymentList = await rzp.orders.fetchPayments(
+              existing.razorpayOrderId,
+            );
+            const captured = (paymentList?.items || []).find(
+              (p) => p.status === "captured" || p.status === "authorized",
+            );
+            if (captured) {
+              await recordCapturedPayment({
+                order: rzpOrder,
+                payment: captured,
+              });
+              const finalized = await finalizeBookingFromOrder({
+                order: rzpOrder,
+                paymentId: captured.id,
+              });
+              if (finalized.booking) {
+                return res.status(200).json({
+                  success: true,
+                  bookingRecovered: true,
+                  bookingConfirmed: true,
+                  bookingId: finalized.booking._id,
+                  message:
+                    "Your previous payment was successful! Your booking is confirmed.",
+                });
+              }
+            }
+          }
+          // The order was not paid (or was abandoned / cancelled by user).
+          // Mark it expired immediately so the user is not locked out from trying again.
+          await PendingOrder.updateOne(
+            { _id: existing._id },
+            {
+              $set: {
+                status: "expired",
+                expirationReason: "abandoned_or_retry",
+                expiredAt: new Date(),
+              },
+            },
+          );
+        } catch (rzpErr) {
+          console.warn(
+            "[createOrder] Provider check on existing order failed:",
+            rzpErr.message,
+          );
+          return res.status(409).json({
+            success: false,
+            message:
+              "A payment is already in progress for this trip. Please wait a moment before trying again.",
+            existingOrderId: existing.razorpayOrderId,
+          });
+        }
       }
     } catch (e) {
       // Non-blocking — if this check fails we still allow the order (safer than blocking)

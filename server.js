@@ -150,6 +150,15 @@ app.use(mongoSanitize());
 // Apply general limiter to all /api routes
 app.use("/api", generalLimiter);
 
+// ── Liveness probe ───────────────────────────────────────────────────────────
+// Tiny, dependency-free endpoint the mobile app pings to distinguish "no
+// internet" from "backend unreachable". Must stay above the auth-heavy routes
+// and must never touch the database.
+app.get("/api/health", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.json({ success: true, status: "ok", time: Date.now() });
+});
+
 // ── Private KYC document serving (signed URLs only) ──────────────────────────
 // Operator KYC docs (government ID, PAN, selfie, trade license) are private.
 // They are served ONLY through /api/secure-docs with a valid HMAC signature.

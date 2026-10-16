@@ -13,7 +13,7 @@ const signToken = (id) =>
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 const OTP_TTL_MINUTES = 5;
-const OTP_MAX_ATTEMPTS = 5;
+const OTP_MAX_ATTEMPTS = 3;
 const OTP_RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
 const OTP_RATE_LIMIT_MAX = 3; // max OTP requests per phone per window
 const PHONE_LINK_RESEND_SECONDS = 30;
@@ -440,8 +440,21 @@ exports.signupVerifyOtp = async (req, res) => {
     const masterOtpUsed = isMasterOtp(code);
     if (record.code !== code && !masterOtpUsed) {
       record.attempts += 1;
+      const attemptsLeft = Math.max(0, OTP_MAX_ATTEMPTS - record.attempts);
+      if (attemptsLeft === 0) {
+        await record.deleteOne();
+        return res.status(400).json({
+          success: false,
+          message: "Too many invalid attempts. Please request a new OTP.",
+          attemptsLeft: 0,
+        });
+      }
       await record.save();
-      return res.status(400).json({ success: false, message: "Invalid OTP" });
+      return res.status(400).json({
+        success: false,
+        message: `Invalid OTP. ${attemptsLeft} attempt${attemptsLeft === 1 ? "" : "s"} left.`,
+        attemptsLeft,
+      });
     }
     if (masterOtpUsed) logMasterOtpUse("signup", phone);
 
@@ -604,8 +617,21 @@ exports.loginVerifyOtp = async (req, res) => {
     const masterOtpUsed = isMasterOtp(code);
     if (record.code !== code && !masterOtpUsed) {
       record.attempts += 1;
+      const attemptsLeft = Math.max(0, OTP_MAX_ATTEMPTS - record.attempts);
+      if (attemptsLeft === 0) {
+        await record.deleteOne();
+        return res.status(400).json({
+          success: false,
+          message: "Too many invalid attempts. Please request a new OTP.",
+          attemptsLeft: 0,
+        });
+      }
       await record.save();
-      return res.status(400).json({ success: false, message: "Invalid OTP" });
+      return res.status(400).json({
+        success: false,
+        message: `Invalid OTP. ${attemptsLeft} attempt${attemptsLeft === 1 ? "" : "s"} left.`,
+        attemptsLeft,
+      });
     }
     if (masterOtpUsed) logMasterOtpUse("login", phone);
 
@@ -1219,10 +1245,21 @@ exports.confirmDeleteAccount = async (req, res) => {
     }
     if (record.code !== code) {
       record.attempts += 1;
+      const attemptsLeft = Math.max(0, OTP_MAX_ATTEMPTS - record.attempts);
+      if (attemptsLeft === 0) {
+        await record.deleteOne();
+        return res.status(400).json({
+          success: false,
+          message: "Too many invalid attempts. Please request a new code.",
+          attemptsLeft: 0,
+        });
+      }
       await record.save();
-      return res
-        .status(400)
-        .json({ success: false, message: "Invalid code. Please try again." });
+      return res.status(400).json({
+        success: false,
+        message: `Invalid code. ${attemptsLeft} attempt${attemptsLeft === 1 ? "" : "s"} left.`,
+        attemptsLeft,
+      });
     }
     await record.deleteOne();
 

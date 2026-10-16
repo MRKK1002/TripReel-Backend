@@ -611,9 +611,9 @@ async function processCancellationRefund(
         : current.financialSettlementState === "RECONCILIATION_REQUIRED"
           ? "Cancellation completed, but the refund requires manual attention."
           : current.refundStatus === "REFUNDED"
-            ? "Refund processed by the payment provider."
+            ? "Refund processed. It will reflect in your account within 2–4 business days."
             : current.refundStatus === "PROCESSING"
-              ? "Refund was accepted and is still pending with the payment provider."
+              ? "Refund initiated. It will reflect in your account within 2–4 business days."
               : ["FAILED", "MANUAL"].includes(current.refundStatus)
                 ? "Cancellation completed, but the refund requires manual attention."
                 : "Refund status is pending review.",
@@ -1173,6 +1173,60 @@ async function processCancellationRefund(
         },
       });
     } catch {}
+
+    // Cancel any dispatched Snapja bookings so assigned creators are notified and released
+    if (booking.snapjaBookings || booking.addonDispatched) {
+      try {
+        // Same env var the dispatch path uses (SNAPJA_API_URL). The old
+        // SNAPJA_API name was never set, so this silently hit the hardcoded
+        // fallback host instead of the configured Snapja instance.
+        const SNAPJA_API =
+          process.env.SNAPJA_API_URL ||
+          process.env.SNAPJA_API ||
+          "https://api.snapja.com/api/tripreel/bookings";
+        const SNAPJA_API_KEY = process.env.SNAPJA_API_KEY;
+        const rawSnapja = booking.snapjaBookings || {};
+        const snapjaEntries =
+          rawSnapja instanceof Map
+            ? Array.from(rawSnapja.entries())
+            : Object.entries(rawSnapja);
+
+        for (const [key, snap] of snapjaEntries) {
+          const snapId = snap?.bookingId || snap?.snapjaId || snap?.id;
+          if (!snapId || snap?.status === "cancelled") continue;
+          try {
+            const cancelRes = await fetch(`${SNAPJA_API}/${snapId}/cancel`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                ...(SNAPJA_API_KEY ? { "X-API-Key": SNAPJA_API_KEY } : {}),
+              },
+              body: JSON.stringify({
+                reason: `TripReel booking ${booking.bookingId} cancelled: ${cancellationReason}`,
+              }),
+            });
+            if (cancelRes.ok) {
+              console.log(
+                `[SNAPJA CANCEL] Cancelled Snapja booking ${snapId} (${key}) for ${booking.bookingId}`,
+              );
+            } else {
+              // fetch() does not throw on 4xx/5xx — without this the failure was
+              // reported as success and the admin timer kept running.
+              console.warn(
+                `[SNAPJA CANCEL] Snapja rejected cancel for ${snapId} (${key}) — HTTP ${cancelRes.status}. The Snapja API must expose POST ${SNAPJA_API}/:id/cancel.`,
+              );
+            }
+          } catch (e) {
+            console.warn(
+              `[SNAPJA CANCEL] Failed to cancel Snapja booking ${snapId}:`,
+              e.message,
+            );
+          }
+        }
+      } catch (err) {
+        console.warn("[SNAPJA CANCEL] Error iterating snapjaBookings:", err.message);
+      }
+    }
 
     if (booking.addonDispatched && addonRefund > 0) {
       try {
@@ -2691,6 +2745,72 @@ exports.createBooking = async (req, res) => {
 // GET /api/trip-bookings/my  — user's own bookings
 exports.getMyBookings = async (req, res) => {
   try {
+    // Proactively recover any booking where payment succeeded but app was killed before verify
+    try {
+      const PendingOrder = require("../models/PendingOrder");
+      const pendingOrders = await PendingOrder.find({
+        userId: req.user._id,
+        status: "pending",
+        createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
+      });
+      if (pendingOrders.length > 0) {
+        const {
+          getRazorpay,
+          recordCapturedPayment,
+          finalizeBookingFromOrder,
+        } = require("./paymentController");
+        const rzp = getRazorpay();
+        for (const po of pendingOrders) {
+          try {
+            const rzpOrder = await rzp.orders.fetch(po.razorpayOrderId);
+            if (rzpOrder && rzpOrder.status === "paid") {
+              const paymentList = await rzp.orders.fetchPayments(
+                po.razorpayOrderId,
+              );
+              const captured = (paymentList?.items || []).find(
+                (p) => p.status === "captured" || p.status === "authorized",
+              );
+              if (captured) {
+                await recordCapturedPayment({
+                  order: rzpOrder,
+                  payment: captured,
+                });
+                await finalizeBookingFromOrder({
+                  order: rzpOrder,
+                  paymentId: captured.id,
+                });
+              }
+            } else if (
+              Date.now() - new Date(po.createdAt).getTime() >
+              10 * 60 * 1000
+            ) {
+              await PendingOrder.updateOne(
+                { _id: po._id },
+                {
+                  $set: {
+                    status: "expired",
+                    expirationReason: "timeout",
+                    expiredAt: new Date(),
+                  },
+                },
+              );
+            }
+          } catch (poErr) {
+            console.warn(
+              "[getMyBookings] recovery check error for order",
+              po.razorpayOrderId,
+              poErr.message,
+            );
+          }
+        }
+      }
+    } catch (scanErr) {
+      console.warn(
+        "[getMyBookings] pending orders recovery check failed:",
+        scanErr.message,
+      );
+    }
+
     const bookings = await TripBooking.find({ userId: req.user._id })
       .populate(
         "packageId",
@@ -3327,12 +3447,25 @@ exports.cancelBooking = async (req, res) => {
 
     const snap = booking.snapshot || {};
 
+    const totalRefund = Number(summary.refundAmount) || 0;
+    const breakdown = summary.breakdown || {};
+    let refundDetailText = "";
+    if (totalRefund > 0) {
+      const parts = [];
+      if (summary.refundPercent > 0) parts.push(`${summary.refundPercent}% package fare`);
+      if ((breakdown.addonRefund || 0) > 0 || (Number(summary.addonPurchaseRefundAmount) || 0) > 0) {
+        parts.push("100% add-ons");
+      }
+      const breakdownDesc = parts.length > 0 ? ` (${parts.join(" + ")})` : "";
+      refundDetailText = `Refund of ₹${totalRefund.toLocaleString("en-IN")}${breakdownDesc} initiated. Reflections typically take 2–4 business days.`;
+    }
+
     // Notify user
     notifyUser(
       booking.userId,
       "Booking Cancelled",
-      summary.refundAmount > 0
-        ? `Your booking for ${snap.packageTitle || "trip"} is cancelled. ${summary.refundMessage}`
+      totalRefund > 0
+        ? `Your booking for ${snap.packageTitle || "trip"} is cancelled. ${refundDetailText}`
         : `Your booking for ${snap.packageTitle || "trip"} has been cancelled. As per the cancellation policy, no refund is applicable.`,
       { type: "booking_cancelled", bookingId: booking._id.toString() },
     );
@@ -3350,7 +3483,7 @@ exports.cancelBooking = async (req, res) => {
     const { notifyAdmin } = require("./notificationController");
     notifyAdmin(
       "User Cancelled a Booking",
-      `${snap.packageTitle || "Trip"} — Booking ${booking.bookingId} cancelled by user. Refund: ₹${summary.refundAmount.toLocaleString("en-IN")} (${summary.refundPercent}%).`,
+      `${snap.packageTitle || "Trip"} — Booking ${booking.bookingId} cancelled by user. Refund: ₹${totalRefund.toLocaleString("en-IN")} (${summary.refundPercent}%).`,
       { type: "booking_cancelled", bookingId: booking._id.toString() },
     );
 
@@ -3363,8 +3496,8 @@ exports.cancelBooking = async (req, res) => {
         sendMail({
           to: user.email,
           subject: `Booking Cancelled - ${snap.packageTitle || "Trip"}`,
-          text: `Hi ${user.name}, your booking ${booking.bookingId} has been cancelled.${summary.refundAmount > 0 ? ` Refund amount: Rs.${summary.refundAmount} (${summary.refundPercent}%). ${summary.refundMessage}` : ""}`,
-          html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;"><h2 style="color:#EF4444;">Booking Cancelled</h2><p>Hi <strong>${user.name}</strong>,</p><p>Your booking <strong>${booking.bookingId}</strong> for <strong>${snap.packageTitle || "trip"}</strong> has been cancelled.</p>${summary.refundAmount > 0 ? `<p style="background:#F0FDF4;padding:12px;border-radius:8px;color:#065F46;"><strong>Refund amount:</strong> Rs.${summary.refundAmount.toLocaleString("en-IN")} (${summary.refundPercent}%). ${summary.refundMessage}</p>` : ""}<p style="color:#6B7280;font-size:13px;">If you have questions, contact us via the app.</p><p>Team Trip Reel</p></div>`,
+          text: `Hi ${user.name}, your booking ${booking.bookingId} has been cancelled.${totalRefund > 0 ? ` ${refundDetailText}` : ""}`,
+          html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;"><h2 style="color:#EF4444;">Booking Cancelled</h2><p>Hi <strong>${user.name}</strong>,</p><p>Your booking <strong>${booking.bookingId}</strong> for <strong>${snap.packageTitle || "trip"}</strong> has been cancelled.</p>${totalRefund > 0 ? `<p style="background:#F0FDF4;padding:12px;border-radius:8px;color:#065F46;"><strong>Refund breakdown:</strong> ${refundDetailText}</p>` : ""}<p style="color:#6B7280;font-size:13px;">If you have questions, contact us via the app.</p><p>Team Trip Reel</p></div>`,
         });
       }
     } catch {}

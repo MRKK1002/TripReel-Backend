@@ -432,15 +432,19 @@ exports.getAllPackages = async (req, res) => {
 
     if (search) {
       const escapeRegex = require("../utils/escapeRegex");
-      const safe = escapeRegex(String(search));
+      const safe = escapeRegex(String(search).trim());
       query.$or = [
         { title: { $regex: safe, $options: "i" } },
         { location: { $regex: safe, $options: "i" } },
         { city: { $regex: safe, $options: "i" } },
         { state: { $regex: safe, $options: "i" } },
         { country: { $regex: safe, $options: "i" } },
-        { departureCity: { $regex: safe, $options: "i" } },
       ];
+    }
+    if (req.query.departureCity) {
+      const escapeRegex = require("../utils/escapeRegex");
+      const safeDep = escapeRegex(String(req.query.departureCity).trim());
+      query.departureCity = { $regex: safeDep, $options: "i" };
     }
     if (category) {
       const escapeRegex = require("../utils/escapeRegex");
