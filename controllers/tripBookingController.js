@@ -3103,6 +3103,9 @@ async function operatorCancellationLifecycleConflict(
 
 function bookingHistoryState(booking, now = new Date()) {
   if (["COMPLETED", "CANCELLED"].includes(booking.status)) return true;
+  const start = effectiveBookingStart(booking);
+  // An active upcoming booking whose start date is in the future belongs in Current
+  if (start && !isDateKeyStarted(start, now)) return false;
   const end = effectiveBookingEnd(booking);
   // Missing authoritative end dates are unsafe for operational actions. Keep
   // malformed legacy bookings in read-only History until repaired.
@@ -3762,6 +3765,41 @@ exports.operatorCancelBooking = async (req, res) => {
       `Your booking for ${snap.packageTitle || "trip"} was cancelled by the operator. ${summary.refundMessage}`,
       { type: "booking_cancelled", bookingId: booking._id.toString() },
     );
+    // Send cancellation email to user with operator's reason
+    try {
+      const User = require("../models/User");
+      const user = await User.findById(booking.userId).select("name email");
+      if (user && user.email) {
+        const { sendBookingCancelledByOperator } = require("../utils/sendMail");
+        const batchDateStr = snap.startDate
+          ? new Date(snap.startDate).toLocaleDateString("en-IN", {
+              day: "2-digit",
+              month: "short",
+              year: "numeric",
+            })
+          : "";
+        sendBookingCancelledByOperator({
+          to: user.email,
+          userName: user.name || "Traveler",
+          cancellationDetails: {
+            bookingId: booking.bookingId,
+            packageName: snap.packageTitle || "Trip",
+            batchDate: batchDateStr,
+            operatorName:
+              req.operator?.businessName ||
+              req.operator?.contactName ||
+              "Trip Operator",
+            operatorPhone: req.operator?.phone || "",
+            reason,
+            refundAmount: summary.refundAmount,
+          },
+        }).catch((err) =>
+          console.warn("Failed to send operator cancel email:", err.message),
+        );
+      }
+    } catch (mailErr) {
+      console.warn("Operator cancel mail error:", mailErr.message);
+    }
     // Notify admin (visibility + who cancelled)
     const { notifyAdmin } = require("./notificationController");
     notifyAdmin(

@@ -78,7 +78,7 @@ exports.getOperatorConversations = async (req, res) => {
       isActive: true,
       expiresAt: { $gt: now },
     })
-      .populate("userId", "name avatar phone")
+      .populate("userId", "name avatar profileImage phone")
       .sort({ lastMessageAt: -1, createdAt: -1 });
 
     res.json({ success: true, conversations });
@@ -91,7 +91,7 @@ exports.getOperatorConversations = async (req, res) => {
 exports.getAdminConversations = async (req, res) => {
   try {
     const conversations = await Conversation.find({ isActive: true })
-      .populate("userId", "name avatar")
+      .populate("userId", "name avatar profileImage")
       .populate("operatorId", "contactName businessName")
       .sort({ lastMessageAt: -1 });
 

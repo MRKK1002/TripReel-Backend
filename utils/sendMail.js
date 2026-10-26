@@ -344,10 +344,77 @@ const sendReviewRequest = async ({ to, userName, tripDetails }) => {
   });
 };
 
+/**
+ * Booking Cancelled by Operator email
+ */
+const sendBookingCancelledByOperator = async ({
+  to,
+  userName,
+  cancellationDetails,
+}) => {
+  const {
+    bookingId,
+    packageName,
+    batchDate,
+    operatorName,
+    operatorPhone,
+    reason,
+    refundAmount,
+  } = cancellationDetails;
+
+  const content = `
+    <h2 style="color:#DC2626;margin:0 0 8px;font-size:20px;">Trip Cancelled by Operator</h2>
+    <p style="font-size:15px;color:#4B5563;margin:0 0 16px;">Hi <strong>${userName}</strong>, we regret to inform you that your upcoming trip has been cancelled by the operator.</p>
+
+    <div style="background:#FEF2F2;border-radius:10px;padding:16px 20px;margin-bottom:20px;border:1px solid #FCA5A5;">
+      <p style="margin:0 0 4px;font-size:11px;font-weight:700;color:#991B1B;text-transform:uppercase;letter-spacing:0.5px;">Cancellation Reason</p>
+      <p style="margin:0;font-size:14px;color:#7F1D1D;font-style:italic;">"${reason || "Operational or logistical constraints"}"</p>
+    </div>
+
+    <!-- Booking Summary Card -->
+    <div style="background:#F9FAFB;border-radius:10px;padding:20px;margin-bottom:20px;border:1px solid #E5E7EB;">
+      <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+        <tr><td style="padding:6px 0;color:#6B7280;font-size:13px;">Booking ID</td><td style="padding:6px 0;color:#111827;font-size:13px;font-weight:600;text-align:right;">${bookingId || "-"}</td></tr>
+        <tr><td style="padding:6px 0;color:#6B7280;font-size:13px;">Package</td><td style="padding:6px 0;color:#111827;font-size:14px;font-weight:700;text-align:right;">${packageName}</td></tr>
+        <tr><td style="padding:6px 0;color:#6B7280;font-size:13px;">Travel Dates</td><td style="padding:6px 0;color:#111827;font-size:13px;font-weight:600;text-align:right;">${batchDate || "-"}</td></tr>
+        <tr><td style="padding:6px 0;color:#6B7280;font-size:13px;">Operator</td><td style="padding:6px 0;color:#111827;font-size:13px;font-weight:600;text-align:right;">${operatorName || "Trip Operator"}</td></tr>
+      </table>
+    </div>
+
+    <!-- Refund Info Box -->
+    <div style="background:#ECFDF5;border-radius:10px;padding:18px 20px;margin-bottom:20px;border:1px solid #A7F3D0;">
+      <p style="margin:0 0 4px;font-size:11px;font-weight:700;color:#065F46;text-transform:uppercase;letter-spacing:0.5px;">100% Full Refund Initiated</p>
+      <p style="margin:0 0 6px;font-size:22px;font-weight:800;color:#047857;">Rs.${Number(refundAmount || 0).toLocaleString("en-IN")}</p>
+      <p style="margin:0;font-size:12px;color:#065F46;">Because the operator cancelled the trip, a full 100% refund has been processed. The amount will reflect in your original payment account within 2–4 business days.</p>
+    </div>
+
+    ${
+      operatorName
+        ? `
+    <div style="background:#EFF6FF;border-radius:8px;padding:14px;margin-bottom:20px;">
+      <p style="margin:0;font-size:13px;color:#1E40AF;"><strong>Operator Contact:</strong> ${operatorName}</p>
+      ${operatorPhone ? `<p style="margin:4px 0 0;font-size:12px;color:#3B82F6;">Phone: ${operatorPhone}</p>` : ""}
+    </div>`
+        : ""
+    }
+
+    <p style="font-size:14px;color:#4B5563;">If you have any questions or need help finding an alternative trip, reach out to our team at <a href="mailto:support@tripreel.in" style="color:#1F8A70;font-weight:600;">support@tripreel.in</a>.</p>
+    <p style="font-size:14px;color:#4B5563;margin-top:16px;">Warm regards,<br/><strong>Team Trip Reel</strong></p>
+  `;
+
+  return sendMail({
+    to,
+    subject: `Trip Cancelled: ${packageName} | Booking ${bookingId || ""}`,
+    html: wrapInTemplate(content),
+    text: `Hi ${userName}, your trip for ${packageName} (${batchDate}) was cancelled by operator ${operatorName || ""}. Reason: ${reason}. A 100% full refund of Rs.${refundAmount} has been initiated to your original payment method.`,
+  });
+};
+
 module.exports = {
   sendMail,
   sendBookingConfirmation,
   sendPaymentReceipt,
   sendTripReminder,
   sendReviewRequest,
+  sendBookingCancelledByOperator,
 };
