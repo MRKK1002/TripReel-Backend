@@ -4314,7 +4314,7 @@ exports.syncSnapjaStatus = async (req, res) => {
       });
     }
 
-    const SNAPJA_API = "https://api.snapja.com/api/tripreel/bookings";
+    const SNAPJA_API = process.env.SNAPJA_API_URL || process.env.SNAPJA_API || "https://api.snapja.com/api/tripreel/bookings";
     const SNAPJA_API_KEY = process.env.SNAPJA_API_KEY;
 
     let updated = false;
@@ -4394,6 +4394,50 @@ exports.syncSnapjaStatus = async (req, res) => {
             updated = true;
           }
         }
+        // Sync timer and overtime details
+        if (b.work_start_time && b.work_start_time !== snap.workStartTime) {
+          snapjaBookings[key].workStartTime = b.work_start_time;
+          updated = true;
+        }
+        if (b.duration !== undefined && b.duration !== snap.duration) {
+          snapjaBookings[key].duration = b.duration;
+          updated = true;
+        }
+        if (b.duration_ended_at && b.duration_ended_at !== snap.durationEndedAt) {
+          snapjaBookings[key].durationEndedAt = b.duration_ended_at;
+          updated = true;
+        }
+        if (b.overtime_minutes !== undefined && b.overtime_minutes !== snap.overtimeMinutes) {
+          snapjaBookings[key].overtimeMinutes = b.overtime_minutes;
+          updated = true;
+        }
+        if (b.overtime_charge !== undefined && b.overtime_charge !== snap.overtimeCharge) {
+          snapjaBookings[key].overtimeCharge = b.overtime_charge;
+          updated = true;
+        }
+        if (b.overtime_paid !== undefined && b.overtime_paid !== snap.overtimePaid) {
+          snapjaBookings[key].overtimePaid = b.overtime_paid;
+          updated = true;
+        }
+        if (b.overtime_per_minute_fee !== undefined) {
+          snapjaBookings[key].overtimePerMinuteFee = b.overtime_per_minute_fee;
+        }
+        if (b.overtime_grace_seconds !== undefined) {
+          snapjaBookings[key].overtimeGraceSeconds = b.overtime_grace_seconds;
+        }
+        if (b.customer_confirmed !== undefined && b.customer_confirmed !== snap.customerConfirmed) {
+          snapjaBookings[key].customerConfirmed = b.customer_confirmed;
+          updated = true;
+        }
+        if (b.rating && b.rating !== snap.rating) {
+          snapjaBookings[key].rating = b.rating;
+          updated = true;
+        }
+        if (b.review_comment && b.review_comment !== snap.reviewComment) {
+          snapjaBookings[key].reviewComment = b.review_comment;
+          updated = true;
+        }
+
         // Update OTP if refreshed
         if (b.otp && b.otp !== snap.otp) {
           snapjaBookings[key].otp = b.otp;
@@ -4525,16 +4569,15 @@ exports.confirmSnapjaDelivery = async (req, res) => {
     );
     const snapjaData = await snapjaRes.json().catch(() => ({}));
     if (!snapjaRes.ok || snapjaData.success === false) {
-      const unavailable = snapjaRes.status === 404;
-      return res.status(502).json({
-        success: false,
-        code: unavailable
-          ? "SNAPJA_CONFIRMATION_ENDPOINT_UNAVAILABLE"
-          : "SNAPJA_CONFIRMATION_FAILED",
-        message: unavailable
-          ? "Snapja delivery confirmation is not available on the connected API."
-          : snapjaData.message || "Snapja could not confirm delivery",
-      });
+      if (snapjaRes.status === 404) {
+        console.warn("[confirmSnapjaDelivery] Snapja confirm endpoint 404 - continuing with local confirmation");
+      } else {
+        return res.status(502).json({
+          success: false,
+          code: "SNAPJA_CONFIRMATION_FAILED",
+          message: snapjaData.message || "Snapja could not confirm delivery",
+        });
+      }
     }
 
     const now = new Date().toISOString();
@@ -4561,5 +4604,212 @@ exports.confirmSnapjaDelivery = async (req, res) => {
       success: false,
       message: err.message || "Could not confirm delivery",
     });
+  }
+};
+
+
+// ── Create Overtime Razorpay Order ──────────────────────────────────────────
+// POST /api/trip-bookings/:id/snapja/:entryKey/create-overtime-order
+exports.createAddonOvertimeOrder = async (req, res) => {
+  try {
+    const { id, entryKey } = req.params;
+    const booking = await TripBooking.findById(id);
+    if (!booking) {
+      return res.status(404).json({ success: false, message: "Booking not found" });
+    }
+    if (String(booking.userId) !== String(req.user._id)) {
+      return res.status(403).json({ success: false, message: "Unauthorized" });
+    }
+    const snap = (booking.snapjaBookings || {})[entryKey];
+    if (!snap) {
+      return res.status(404).json({ success: false, message: "Add-on not found" });
+    }
+    let charge = Number(snap.overtimeCharge) || 0;
+    if (charge <= 0 && snap.workStartTime && snap.durationEndedAt) {
+      const startMs = new Date(snap.workStartTime).getTime();
+      const endMs = new Date(snap.durationEndedAt).getTime();
+      const durationHours = typeof snap.duration === "number" && snap.duration > 0 ? snap.duration : 1;
+      const bookedSeconds = durationHours * 3600;
+      const elapsedSeconds = Math.max(0, Math.floor((endMs - startMs) / 1000));
+      const overtimeSeconds = Math.max(0, elapsedSeconds - bookedSeconds);
+      const graceSeconds = snap.overtimeGraceSeconds || 300;
+      const billableSeconds = Math.max(0, overtimeSeconds - graceSeconds);
+      const billableMinutes = snap.overtimeMinutes || Math.ceil(billableSeconds / 60);
+      charge = billableMinutes * (snap.overtimePerMinuteFee || 10);
+      snap.overtimeMinutes = billableMinutes;
+      snap.overtimeCharge = charge;
+      booking.markModified("snapjaBookings");
+      await booking.save();
+    }
+    if (charge <= 0) {
+      return res.status(400).json({ success: false, message: "No overtime charge pending" });
+    }
+    if (snap.overtimePaid) {
+      return res.status(400).json({ success: false, message: "Overtime is already paid" });
+    }
+
+    const { getRazorpay } = require("./paymentController");
+    const order = await getRazorpay().orders.create({
+      amount: Math.round(charge * 100),
+      currency: "INR",
+      receipt: "ot_" + Date.now(),
+      notes: {
+        purpose: "addon_overtime",
+        bookingId: String(booking._id),
+        entryKey,
+        userId: String(req.user._id),
+      },
+    });
+
+    res.json({
+      success: true,
+      orderId: order.id,
+      amount: charge,
+      currency: order.currency || "INR",
+      keyId: process.env.RAZORPAY_KEY_ID,
+    });
+  } catch (err) {
+    console.error("[createAddonOvertimeOrder] Error:", err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// ── Verify Overtime Payment ────────────────────────────────────────────────
+// POST /api/trip-bookings/:id/snapja/:entryKey/verify-overtime-payment
+exports.verifyAddonOvertimePayment = async (req, res) => {
+  try {
+    const { id, entryKey } = req.params;
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body || {};
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      return res.status(400).json({ success: false, message: "Missing payment fields" });
+    }
+
+    const booking = await TripBooking.findById(id);
+    if (!booking) {
+      return res.status(404).json({ success: false, message: "Booking not found" });
+    }
+    if (String(booking.userId) !== String(req.user._id)) {
+      return res.status(403).json({ success: false, message: "Unauthorized" });
+    }
+
+    const crypto = require("crypto");
+    const expected = crypto
+      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+      .update(razorpay_order_id + "|" + razorpay_payment_id)
+      .digest();
+    let supplied;
+    try {
+      supplied = Buffer.from(razorpay_signature, "hex");
+    } catch {
+      supplied = Buffer.alloc(0);
+    }
+    if (supplied.length !== expected.length || !crypto.timingSafeEqual(expected, supplied)) {
+      return res.status(400).json({ success: false, message: "Invalid payment signature" });
+    }
+
+    const snapjaBookings = { ...booking.snapjaBookings };
+    if (!snapjaBookings[entryKey]) {
+      return res.status(404).json({ success: false, message: "Add-on not found" });
+    }
+
+    snapjaBookings[entryKey].overtimePaid = true;
+    snapjaBookings[entryKey].overtimePaymentId = razorpay_payment_id;
+    snapjaBookings[entryKey].overtimePaidAt = new Date().toISOString();
+
+    booking.snapjaBookings = snapjaBookings;
+    booking.markModified("snapjaBookings");
+    await booking.save();
+
+    // Best-effort notify Snapja backend
+    try {
+      const snap = snapjaBookings[entryKey];
+      const snapjaApi = process.env.SNAPJA_API_URL || "https://api.snapja.com/api/tripreel/bookings";
+      await fetch(snapjaApi + "/" + encodeURIComponent(snap.bookingId) + "/pay-overtime", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-API-Key": process.env.SNAPJA_API_KEY,
+        },
+        body: JSON.stringify({
+          payment_id: razorpay_payment_id,
+          order_id: razorpay_order_id,
+          amount: snap.overtimeCharge,
+        }),
+      });
+    } catch (notifyErr) {
+      console.warn("[verifyAddonOvertimePayment] Snapja notify failed:", notifyErr.message);
+    }
+
+    res.json({
+      success: true,
+      message: "Overtime payment confirmed",
+      snapjaBookings,
+    });
+  } catch (err) {
+    console.error("[verifyAddonOvertimePayment] Error:", err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// ── Review Snapja Addon Creator ───────────────────────────────────────────
+// POST /api/trip-bookings/:id/snapja/:entryKey/review
+exports.reviewSnapjaAddon = async (req, res) => {
+  try {
+    const { id, entryKey } = req.params;
+    const { rating, comment } = req.body || {};
+    const numRating = Number(rating);
+    if (!numRating || numRating < 1 || numRating > 5) {
+      return res.status(400).json({ success: false, message: "Rating must be between 1 and 5" });
+    }
+
+    const booking = await TripBooking.findById(id);
+    if (!booking) {
+      return res.status(404).json({ success: false, message: "Booking not found" });
+    }
+    if (String(booking.userId) !== String(req.user._id)) {
+      return res.status(403).json({ success: false, message: "Unauthorized" });
+    }
+
+    const snapjaBookings = { ...(booking.snapjaBookings || {}) };
+    const snap = snapjaBookings[entryKey];
+    if (!snap?.bookingId) {
+      return res.status(404).json({ success: false, message: "Add-on not found" });
+    }
+
+    snap.rating = numRating;
+    snap.reviewComment = (comment || "").trim();
+    snap.reviewedAt = new Date().toISOString();
+    snapjaBookings[entryKey] = snap;
+
+    booking.snapjaBookings = snapjaBookings;
+    booking.markModified("snapjaBookings");
+    await booking.save();
+
+    // Forward to Snapja backend
+    try {
+      const snapjaApi = process.env.SNAPJA_API_URL || "https://api.snapja.com/api/tripreel/bookings";
+      await fetch(snapjaApi + "/" + encodeURIComponent(snap.bookingId) + "/review", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-API-Key": process.env.SNAPJA_API_KEY,
+        },
+        body: JSON.stringify({
+          rating: numRating,
+          comment: snap.reviewComment,
+        }),
+      });
+    } catch (forwardErr) {
+      console.warn("[reviewSnapjaAddon] Snapja review notify failed:", forwardErr.message);
+    }
+
+    res.json({
+      success: true,
+      message: "Creator review submitted successfully",
+      snapjaBookings,
+    });
+  } catch (err) {
+    console.error("[reviewSnapjaAddon] Error:", err.message);
+    res.status(500).json({ success: false, message: err.message });
   }
 };

@@ -14,6 +14,9 @@ const {
   adminMarkRefundDone,
   syncSnapjaStatus,
   confirmSnapjaDelivery,
+  createAddonOvertimeOrder,
+  verifyAddonOvertimePayment,
+  reviewSnapjaAddon,
 } = require("../controllers/tripBookingController");
 const {
   protect,
@@ -41,6 +44,9 @@ router.get("/:id", getBookingById);
 router.get("/:id/refund-preview", getRefundPreview);
 router.get("/:id/sync-snapja", syncSnapjaStatus);
 router.post("/:id/snapja/:entryKey/confirm-delivery", confirmSnapjaDelivery);
+router.post("/:id/snapja/:entryKey/create-overtime-order", createAddonOvertimeOrder);
+router.post("/:id/snapja/:entryKey/verify-overtime-payment", verifyAddonOvertimePayment);
+router.post("/:id/snapja/:entryKey/review", reviewSnapjaAddon);
 router.post("/:id/cancel", cancelBooking);
 
 // ── Admin ─────────────────────────────────────────────────────────────────────
